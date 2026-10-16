@@ -1,0 +1,54 @@
+name: Bug report
+description: Report a reproducible problem in DB-Sankhya
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Do not include credentials, tokens, private URLs, production data, customer/company information, dumps, or sensitive screenshots.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the problem and the expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Provide the smallest safe reproduction you can.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Release version or commit SHA, if known.
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Environment type
+      options:
+        - Local development
+        - Demo / mock
+        - Homologation / staging
+        - Production
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: Optional. Remove all secrets and private/company-specific information first.
+      render: text
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: I removed credentials, tokens, production data, private infrastructure details, and company/customer identifiers from this report.
+          required: true
