@@ -1,0 +1,29 @@
+name: Feature request
+description: Suggest a generic improvement for DB-Sankhya
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Keep requests generic. Do not include customer/company data, production credentials, private infrastructure, or sensitive screenshots.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem would this feature solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the desired behavior and how it should fit the safety model.
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security / permissions considerations
+      description: Mention any effect on authentication, authorization, Sankhya writes, approvals, exports, or secrets.
