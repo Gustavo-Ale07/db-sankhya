@@ -1,0 +1,126 @@
+# DB-Sankhya - production example (hardened). Copy and adapt; do not edit in place.
+#
+#   cp .env.example .env.production && chmod 600 .env.production   # fill in real secrets
+#   docker compose --env-file .env.production -f docker-compose.production.example.yml up -d --build
+#
+# --env-file feeds the ${...} interpolation below; env_file feeds the container. .env.production is
+# git-ignored and must never be committed. See docs/deploy.md.
+# The API listens on 127.0.0.1 only: put a TLS reverse proxy (Nginx/Caddy) in front of it.
+
+name: db-sankhya-prod
+
+services:
+  api:
+    build:
+      context: .
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-}
+    # Pin the tag you deploy (bump on every release) instead of "latest".
+    image: db-sankhya:1.0.0
+    restart: unless-stopped
+    env_file: .env.production
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-dbsankhya}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.production}@db:5432/${POSTGRES_DB:-dbsankhya}}
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3001
+    ports:
+      # Loopback only: reachable by the reverse proxy on this host, never from the network.
+      - '127.0.0.1:${APP_PORT:-3001}:3001'
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - internal
+      - egress
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777,noexec,nosuid
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    init: true
+    pids_limit: 256
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3001/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1g
+        reservations:
+          memory: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '5'
+
+  db:
+    # Pinned minor (verified on Docker Hub); bump deliberately after reading the release notes.
+    image: postgres:17.11-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-dbsankhya}
+      POSTGRES_USER: ${POSTGRES_USER:-dbsankhya}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.production}
+    # No "ports:" - the database is never published; only the api reaches it, on "internal".
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    networks:
+      - internal
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run/postgresql
+    cap_drop:
+      - ALL
+    cap_add:
+      # The official image entrypoint starts as root, fixes ownership and drops to "postgres".
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    pids_limit: 256
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1g
+        reservations:
+          memory: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '5'
+
+networks:
+  # No route to the outside world: only the api talks to the database.
+  internal:
+    internal: true
+  # Outbound access for the api (Sankhya gateway).
+  egress: {}
+
+volumes:
+  db-data:

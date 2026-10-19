@@ -25,3 +25,11 @@ logs
 credentials
 credentials.*
 secrets
+*.dump
+*.bak
+*.backup
+*.sql.gz
+backups
+.superpowers
+.claude
+.env.production
