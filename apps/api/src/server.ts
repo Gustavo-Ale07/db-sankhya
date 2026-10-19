@@ -4,6 +4,7 @@ import { createDatabase } from '@dbx/database';
 import { ConfigError, loadConfig } from './config';
 import { buildApp } from './app';
 import { announceBootstrap } from './services/bootstrap';
+import { createShutdown } from './shutdown';
 
 async function main(): Promise<void> {
   let config;
@@ -36,18 +37,16 @@ async function main(): Promise<void> {
   }, 3600_000);
   housekeeping.unref();
 
-  let closing = false;
-  const shutdown = async (signal: string) => {
-    if (closing) return;
-    closing = true;
-    app.log.info({ signal }, 'shutting down');
+  const drain = createShutdown({
+    app: { close: () => app.close(), forceClose: () => app.server.closeAllConnections() },
+    closeDatabase: () => database.close(),
+    timeoutMs: 15_000,
+    log: app.log,
+    exit: (code) => process.exit(code),
+  });
+  const shutdown = (signal: string) => {
     clearInterval(housekeeping);
-    try {
-      await app.close();
-      await database.close();
-    } finally {
-      process.exit(0);
-    }
+    return drain(signal);
   };
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
   process.on('SIGINT', () => void shutdown('SIGINT'));

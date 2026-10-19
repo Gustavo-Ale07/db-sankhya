@@ -217,6 +217,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
 
   app.addHook('onClose', async () => {
     services.executions.abortAll();
+    await services.scratch?.closeAll();
     await services.connections.close();
   });
   return app;

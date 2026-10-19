@@ -7,8 +7,16 @@ const ARGON2ID = 2;
 /** OWASP-recommended Argon2id parameters (19 MiB, 2 iterations, 1 lane). */
 const ARGON2_OPTIONS = { algorithm: ARGON2ID, memoryCost: 19_456, timeCost: 2, parallelism: 1 };
 
+/**
+ * Minimal cost for unit/integration tests only (requires both NODE_ENV=test and the Vitest runner).
+ * Hashes carry their own parameters, so verification works for either; production never takes this branch.
+ */
+const TEST_ARGON2_OPTIONS = { ...ARGON2_OPTIONS, memoryCost: 8, timeCost: 1 };
+const underTest = (): boolean =>
+  process.env.NODE_ENV === 'test' && process.env.VITEST !== undefined;
+
 export function hashPassword(password: string): Promise<string> {
-  return hash(password, ARGON2_OPTIONS);
+  return hash(password, underTest() ? TEST_ARGON2_OPTIONS : ARGON2_OPTIONS);
 }
 
 export async function verifyPassword(hashed: string, password: string): Promise<boolean> {
