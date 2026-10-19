@@ -49,6 +49,36 @@ describe('surrogate-safe clipping', () => {
   });
 });
 
+describe('jsonb-safe audit strings and keys', () => {
+  it('strips NUL from string values, with and without clipping', () => {
+    expect(redactBroad({ OBS: 'a\u0000b\u0000' })).toEqual({ OBS: 'ab' });
+    expect(redactBroad(['x\u0000y'], { clipStrings: true })).toEqual(['xy']);
+    const snap = redactSnapshot([{ OBS: '\u0000start' }]);
+    expect(snap.rows).toEqual([{ OBS: 'start' }]);
+  });
+
+  it('strips NUL from object keys and replaces lone surrogates in keys, at any depth', () => {
+    const out = redactBroad({
+      'CO\u0000DPARC': 1,
+      nested: { [`bad\uD800key`]: 'v', list: [{ [`x\uDC00\u0000y`]: 2 }] },
+    });
+    expect(out).toEqual({
+      CODPARC: 1,
+      nested: { 'bad�key': 'v', list: [{ 'x�y': 2 }] },
+    });
+    expect(JSON.stringify(out)).not.toMatch(/\\u0000|\\ud[89a-f]/i);
+  });
+
+  it('masks a sensitive key whose name is split by NUL', () => {
+    expect(redactBroad({ 'AD_SEN\u0000HA': 'v1' })).toEqual({ AD_SENHA: REDACTED });
+    expect(redactSnapshot([{ 'pass\u0000word': 'v2' }]).rows).toEqual([{ password: REDACTED }]);
+  });
+
+  it('leaves keys of the log redactor untouched', () => {
+    expect(Object.keys(redact({ 'a\u0000b': 1 }) as object)).toEqual(['a\u0000b']);
+  });
+});
+
 describe('redactSnapshotPair', () => {
   const big = () =>
     Array.from({ length: 50 }, (_, i) => ({

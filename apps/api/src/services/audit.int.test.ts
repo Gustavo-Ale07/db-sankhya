@@ -283,6 +283,35 @@ describe('AuditService lifecycle events', () => {
     expect(rows.find((r) => r.action === 'x')?.after).toEqual({ OBS: `${'a'.repeat(1999)}…` });
   });
 
+  it('stores a row whose values and keys contain NUL (jsonb rejects \\u0000)', async () => {
+    const { handle, audit } = await setup();
+    await audit.recordPlanExecuted(ctx(), {
+      outcome: 'success',
+      before: [{ 'OB\u0000S': 'erp\u0000text' }],
+      after: [{ OBS: 'ok\u0000' }],
+      details: { 'no\u0000te': 'n\u0000ul' },
+    });
+    await audit.record({
+      action: 'x',
+      status: 'info',
+      before: { 'K\u0000EY': 'v\u0000al' },
+      targetIds: ['id\u0000'],
+    });
+    const rows = await allRows(handle);
+    expect(rows).toHaveLength(2);
+    const planRow = rows.find((r) => r.action === 'PLAN_EXECUTED')!;
+    const snap = planRow.snapshot as {
+      before: { rows: unknown[] };
+      after: { rows: unknown[] };
+    };
+    expect(snap.before.rows).toEqual([{ OBS: 'erptext' }]);
+    expect(snap.after.rows).toEqual([{ OBS: 'ok' }]);
+    expect(planRow.details).toEqual({ note: 'nul' });
+    const direct = rows.find((r) => r.action === 'x')!;
+    expect(direct.before).toEqual({ KEY: 'val' });
+    expect(direct.targetIds).toEqual(['id']);
+  });
+
   it('applies the broad matcher and clipping to before, after, targetIds and gatewayCalls', async () => {
     const { handle, audit } = await setup();
     await audit.record({

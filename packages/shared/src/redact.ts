@@ -67,12 +67,16 @@ function scrubPatterns(s: string): string {
 }
 
 type KeyMatcher = (key: string) => boolean;
+type KeyScrubber = (key: string) => string;
+
+const keepKey: KeyScrubber = (key) => key;
 
 function walk(
   value: unknown,
   scrub: StringScrubber,
   seen: WeakSet<object>,
   sensitive: KeyMatcher = isSensitiveKey,
+  scrubKey: KeyScrubber = keepKey,
 ): unknown {
   if (typeof value === 'string') return scrub(value);
   if (value === null || typeof value !== 'object') return value;
@@ -80,23 +84,29 @@ function walk(
   if (seen.has(value)) return '[Circular]';
   seen.add(value);
 
-  if (Array.isArray(value)) return value.map((item) => walk(item, scrub, seen, sensitive));
+  if (Array.isArray(value)) {
+    return value.map((item) => walk(item, scrub, seen, sensitive, scrubKey));
+  }
+  const copyEntries = (target: Record<string, unknown>, source: object): void => {
+    for (const [rawKey, child] of Object.entries(source)) {
+      const key = scrubKey(rawKey);
+      if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
+      target[key] =
+        sensitive(key) || sensitive(rawKey)
+          ? REDACTED
+          : walk(child, scrub, seen, sensitive, scrubKey);
+    }
+  };
   if (value instanceof Error) {
     // Own enumerable props miss message/stack; keep them (scrubbed).
     const err: Record<string, unknown> = { name: value.name, message: scrub(value.message) };
     if (value.stack) err.stack = scrub(value.stack);
-    for (const [key, child] of Object.entries(value)) {
-      if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
-      err[key] = sensitive(key) ? REDACTED : walk(child, scrub, seen, sensitive);
-    }
+    copyEntries(err, value);
     return err;
   }
 
   const out: Record<string, unknown> = {};
-  for (const [key, child] of Object.entries(value)) {
-    if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
-    out[key] = sensitive(key) ? REDACTED : walk(child, scrub, seen, sensitive);
-  }
+  copyEntries(out, value);
   return out;
 }
 
@@ -174,8 +184,9 @@ export interface RedactBroadOptions {
 
 /**
  * Like {@link redact}, but masks every key that merely contains a sensitive word, at any depth.
- * Used for audit JSON (snapshots, details, policy decisions, verification results). Lone UTF-16
- * surrogates are replaced with U+FFFD, since PostgreSQL jsonb rejects them.
+ * Used for audit JSON (snapshots, details, policy decisions, verification results). In string
+ * values and object keys, lone UTF-16 surrogates become U+FFFD and NUL is stripped, since
+ * PostgreSQL jsonb rejects both.
  */
 export function redactBroad<T>(value: T, options: RedactBroadOptions = {}): unknown {
   return walk(
@@ -183,6 +194,7 @@ export function redactBroad<T>(value: T, options: RedactBroadOptions = {}): unkn
     options.clipStrings ? clipString : scrubAuditString,
     new WeakSet(),
     isSensitiveColumn,
+    jsonbSafe,
   );
 }
 
@@ -198,8 +210,16 @@ export interface RedactedSnapshot {
 
 const LONE_SURROGATES = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
 
-/** Scrubs credentials and replaces lone surrogates (jsonb cannot store them). */
-const scrubAuditString: StringScrubber = (s) => scrubPatterns(s).replace(LONE_SURROGATES, '�');
+// eslint-disable-next-line no-control-regex -- NUL is exactly what must be removed.
+const NUL = /\u0000/g;
+
+/** Replaces lone surrogates with U+FFFD and strips NUL (jsonb cannot store either). */
+function jsonbSafe(s: string): string {
+  return s.replace(LONE_SURROGATES, '�').replace(NUL, '');
+}
+
+/** Scrubs credentials, then makes the string storable in jsonb. */
+const scrubAuditString: StringScrubber = (s) => jsonbSafe(scrubPatterns(s));
 
 const clipString: StringScrubber = (s) => {
   const scrubbed = scrubAuditString(s);
@@ -251,7 +271,7 @@ export function redactSnapshot(
     const copy =
       row === null || typeof row !== 'object' || Array.isArray(row)
         ? REDACTED
-        : walk(row, clipString, new WeakSet(), isSensitiveColumn);
+        : walk(row, clipString, new WeakSet(), isSensitiveColumn, jsonbSafe);
     const size = byteLength(copy) + (kept.length ? 1 : 0); // comma separator
     if (truncatedBytes > 0 || used + size > budget) {
       truncatedBytes += size;
