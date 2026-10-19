@@ -74,6 +74,29 @@ describe('jsonb-safe audit strings and keys', () => {
     expect(redactSnapshot([{ 'pass\u0000word': 'v2' }]).rows).toEqual([{ password: REDACTED }]);
   });
 
+  it('normalizes before scrubbing, so NUL cannot hide a credential that the strip rebuilds', () => {
+    const out = JSON.stringify([
+      redactBroad({ msg: 'Bear\u0000er abc.DEF123' }),
+      redactBroad({ msg: 'pass\u0000word=hunter2X' }, { clipStrings: true }),
+      redactSnapshot([{ OBS: 'Bearer\u0000 abc.DEF123' }]),
+    ]);
+    expect(out).not.toContain('abc.DEF123');
+    expect(out).not.toContain('hunter2X');
+    expect(out).not.toContain('\\u0000');
+    expect((redactBroad({ msg: 'pass\u0000word=hunter2X' }) as { msg: string }).msg).toBe(
+      `password=${REDACTED}`,
+    );
+  });
+
+  it('redacts sensitive key=value pairs inside free text', () => {
+    expect(redact('login failed: password=hunter2X&user=a')).toBe(
+      `login failed: password=${REDACTED}&user=a`,
+    );
+    expect(redact('{"senha": "abc123"}')).toBe(`{"senha": "${REDACTED}"}`);
+    expect(redact('client_secret:xyz789 ok')).toBe(`client_secret:${REDACTED} ok`);
+    expect(redact('the token expired')).toBe('the token expired');
+  });
+
   it('leaves keys of the log redactor untouched', () => {
     expect(Object.keys(redact({ 'a\u0000b': 1 }) as object)).toEqual(['a\u0000b']);
   });

@@ -56,6 +56,10 @@ type StringScrubber = (s: string) => string;
 const BEARER_PATTERN = /\b(bearer)\s+([A-Za-z0-9._~+/-]+=*)/gi;
 // Compact JWS/JWT: three base64url segments, the first starting with `{"` encoded as `eyJ`.
 const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g;
+// `password=x`, `senha: x`, `"client_secret":"x"` in free text (query strings, upstream bodies).
+// A separator (= or :) is required, so prose such as "the token expired" is kept.
+const KEY_VALUE_PATTERN =
+  /\b((?:[a-z0-9]+[_-]?)?(?:password|passwd|senha|secret|token|api[_-]?key))("?\s*[=:]\s*"?)([^\s&;,"']+)/gi;
 
 /** Scrubs credential-shaped substrings that no key name or configured value would catch. */
 function scrubPatterns(s: string): string {
@@ -63,7 +67,10 @@ function scrubPatterns(s: string): string {
     .replace(BEARER_PATTERN, (match, word: string, credential: string) =>
       /^[a-z]+$/.test(credential) ? match : `${word} ${REDACTED}`,
     )
-    .replace(JWT_PATTERN, REDACTED);
+    .replace(JWT_PATTERN, REDACTED)
+    .replace(KEY_VALUE_PATTERN, (match, key: string, sep: string, value: string) =>
+      value === REDACTED ? match : `${key}${sep}${REDACTED}`,
+    );
 }
 
 type KeyMatcher = (key: string) => boolean;
@@ -213,13 +220,19 @@ const LONE_SURROGATES = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])
 // eslint-disable-next-line no-control-regex -- NUL is exactly what must be removed.
 const NUL = /\u0000/g;
 
-/** Replaces lone surrogates with U+FFFD and strips NUL (jsonb cannot store either). */
-function jsonbSafe(s: string): string {
+/**
+ * Replaces lone surrogates with U+FFFD and strips NUL. PostgreSQL rejects both, in jsonb and
+ * in text columns alike.
+ */
+export function jsonbSafe(s: string): string {
   return s.replace(LONE_SURROGATES, '�').replace(NUL, '');
 }
 
-/** Scrubs credentials, then makes the string storable in jsonb. */
-const scrubAuditString: StringScrubber = (s) => jsonbSafe(scrubPatterns(s));
+/**
+ * Normalizes first, then scrubs: stripping NUL after scrubbing could rebuild a credential that
+ * NUL had split (`Bear\0er x`, `pass\0word=x`) and store it in clear.
+ */
+const scrubAuditString: StringScrubber = (s) => scrubPatterns(jsonbSafe(s));
 
 const clipString: StringScrubber = (s) => {
   const scrubbed = scrubAuditString(s);

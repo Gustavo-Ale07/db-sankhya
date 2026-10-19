@@ -8,7 +8,7 @@ import type {
   QueryHistoryRow,
   SavedQueryRow,
 } from '@dbx/database';
-import { AppError, redactBroad, redactSnapshotPair } from '@dbx/shared';
+import { AppError, jsonbSafe, redactBroad, redactSnapshotPair } from '@dbx/shared';
 import type { Environment } from '@dbx/shared';
 
 type Redactor = (value: unknown) => unknown;
@@ -21,8 +21,14 @@ function broad<T>(value: T, clipStrings = false): T {
   return value === undefined || value === null ? value : (redactBroad(value, { clipStrings }) as T);
 }
 
-function clip(value: string | null | undefined, max: number): string | null {
-  if (value === null || value === undefined) return null;
+function normalize(value: string | null | undefined): string | null | undefined {
+  return typeof value === 'string' ? jsonbSafe(value) : value;
+}
+
+/** Makes text storable (no NUL, no lone surrogate) and clips it to `max` characters. */
+function clip(raw: string | null | undefined, max: number): string | null {
+  if (raw === null || raw === undefined) return null;
+  const value = jsonbSafe(raw);
   if (value.length <= max) return value;
   let head = value.slice(0, max);
   // Never leave half of a surrogate pair at the cut.
@@ -100,8 +106,10 @@ export class AuditService {
     const r = <T>(v: T): T => (v === undefined || v === null ? v : (this.redactor(v) as T));
     await this.db.insert(auditEvents).values({
       ...event,
-      statement: clip(r(event.statement) ?? null, MAX_STATEMENT_CHARS),
-      errorMessage: clip(r(event.errorMessage) ?? null, MAX_ERROR_CHARS),
+      // Normalize (NUL, lone surrogates) before the redactor, so NUL cannot split a secret
+      // past it; clip() normalizes again, which is a no-op by then.
+      statement: clip(r(normalize(event.statement)) ?? null, MAX_STATEMENT_CHARS),
+      errorMessage: clip(r(normalize(event.errorMessage)) ?? null, MAX_ERROR_CHARS),
       // Audit JSON gets the broad matcher: any key containing a sensitive word, at any depth.
       // Row-shaped columns also get their strings clipped (2000 chars).
       targetIds: r(broad(event.targetIds, true)),

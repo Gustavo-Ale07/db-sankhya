@@ -312,6 +312,32 @@ describe('AuditService lifecycle events', () => {
     expect(direct.targetIds).toEqual(['id']);
   });
 
+  it('stores an errorMessage and statement containing NUL and lone surrogates', async () => {
+    const { handle, audit } = await setup();
+    await audit.record({
+      action: 'write.execute',
+      status: 'failed',
+      statement: 'SELECT 1\u0000',
+      errorMessage: 'ERP\u0000 said \uD800no',
+    });
+    const [row] = await allRows(handle);
+    expect(row?.statement).toBe('SELECT 1');
+    expect(row?.errorMessage).toBe('ERP said �no');
+  });
+
+  it('redacts a credential split by NUL in errorMessage and statement before storing', async () => {
+    const { handle, audit } = await setup();
+    await audit.record({
+      action: 'write.execute',
+      status: 'failed',
+      statement: `-- pass\u0000word=hunter2X`,
+      errorMessage: `Bear\u0000er abc.DEF123 / configured-secret\u0000-value-1234`,
+    });
+    const [row] = await allRows(handle);
+    expect(JSON.stringify(row)).not.toMatch(/hunter2X|abc\.DEF123|configured-secret-value/);
+    expect(row?.statement).toBe(`-- password=${REDACTED}`);
+  });
+
   it('applies the broad matcher and clipping to before, after, targetIds and gatewayCalls', async () => {
     const { handle, audit } = await setup();
     await audit.record({
