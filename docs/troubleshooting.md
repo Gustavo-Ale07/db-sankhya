@@ -12,15 +12,15 @@ docker compose logs app | grep '<request id>'
 **`Invalid configuration:` followed by a list** — the environment failed validation. Each line
 names the variable and the problem. Common ones:
 
-| Message                                                         | Fix                                                    |
-| --------------------------------------------------------------- | ------------------------------------------------------ |
-| `SESSION_SECRET is missing, a placeholder or too weak`          | `openssl rand -base64 48` and paste it into `.env`     |
-| `BOOTSTRAP_ADMIN_PASSWORD is a placeholder or too weak`         | 12+ characters mixing upper, lower, digits and symbols |
-| `DATABASE_URL still contains the placeholder database password` | change `POSTGRES_PASSWORD` in `.env`                   |
-| `APP_URL must use https:// in production`                       | use the public HTTPS URL served by your proxy          |
-| `SANKHYA_MODE (live or mock) is required in production`         | set `SANKHYA_MODE=live`                                |
-| `SANKHYA_BASE_URL host is not in SANKHYA_ALLOWED_HOSTS`         | add the gateway host to `SANKHYA_ALLOWED_HOSTS`        |
-| `LOG_LEVEL debug/trace is not allowed in production`            | use `info`                                             |
+| Message                                                         | Fix                                                 |
+| --------------------------------------------------------------- | --------------------------------------------------- |
+| `SESSION_SECRET is missing, a placeholder or too weak`          | `openssl rand -base64 48` and paste it into `.env`  |
+| `BOOTSTRAP_ADMIN_PASSWORD is no longer supported`               | remove it; use the bootstrap token or the admin CLI |
+| `DATABASE_URL still contains the placeholder database password` | change `POSTGRES_PASSWORD` in `.env`                |
+| `APP_URL must use https:// in production`                       | use the public HTTPS URL served by your proxy       |
+| `SANKHYA_MODE (live or mock) is required in production`         | set `SANKHYA_MODE=live`                             |
+| `SANKHYA_BASE_URL host is not in SANKHYA_ALLOWED_HOSTS`         | add the gateway host to `SANKHYA_ALLOWED_HOSTS`     |
+| `LOG_LEVEL debug/trace is not allowed in production`            | use `info`                                          |
 
 **`set POSTGRES_PASSWORD in .env`** from `docker compose` — the variable is empty.
 
@@ -43,15 +43,13 @@ Special characters such as `@`, `/`, `:` or `#` in `POSTGRES_PASSWORD` break the
 | Login succeeds but you are sent back to the login page | The session cookie is `Secure`: open the app over HTTPS.                                                                                               |
 | `INVALID_CREDENTIALS` with the right password          | The account is locked after repeated failures. Wait `LOGIN_LOCK_MINUTES` or ask an admin to reset the password (the audit log shows `ACCOUNT_LOCKED`). |
 | `RATE_LIMITED`                                         | Too many requests from one IP. Behind a proxy, check `TRUST_PROXY`.                                                                                    |
-| Bootstrap admin credentials are ignored                | The admin is created only when the database has no users. Change it in the UI.                                                                         |
+| No `bootstrap token` in the logs                       | Users already exist, `BOOTSTRAP_ADMIN_EMAIL` selects the admin CLI, or a token is pending from an earlier boot (it is shown only once).                |
 
-**All administrators locked out.** Reset one password directly in the database. Generate an
-Argon2id hash with the bundled library and update the row:
+**All administrators locked out.** Reset one password with the admin CLI. It prints a one-time
+password, unlocks the account and revokes its sessions:
 
 ```bash
-docker compose exec app node -e "import('@node-rs/argon2').then(a=>a.hash(process.argv[1]).then(console.log))" 'New-Strong#Pass2026'
-docker compose exec db psql -U dbsankhya -d dbsankhya \
-  -c "UPDATE users SET password_hash = '<hash>', must_change_password = true, failed_logins = 0, locked_until = NULL WHERE email = 'admin@example.com'"
+docker compose exec app node dist/admin.mjs reset-password --email admin@example.com
 ```
 
 ## Queries

@@ -75,16 +75,13 @@ describe('loadConfig', () => {
     );
   });
 
-  it('refuses the placeholder bootstrap password, pglite, http APP_URL and debug logs in production', () => {
+  it('refuses pglite, http APP_URL and debug logs in production', () => {
     const p = problemsOf({
       ...PROD,
-      BOOTSTRAP_ADMIN_EMAIL: 'admin@example.com',
-      BOOTSTRAP_ADMIN_PASSWORD: 'ChangeMe!2026',
       DATABASE_URL: 'pglite:memory',
       APP_URL: 'http://sql.example.com',
       LOG_LEVEL: 'debug',
     }).join('\n');
-    expect(p).toMatch(/BOOTSTRAP_ADMIN_PASSWORD/);
     expect(p).toMatch(/DATABASE_URL/);
     expect(p).toMatch(/APP_URL/);
     expect(p).toMatch(/LOG_LEVEL/);
@@ -119,22 +116,28 @@ describe('loadConfig', () => {
   });
 
   it('parses the bootstrap role keys and defaults to ADMIN only', () => {
-    const boot = {
-      BOOTSTRAP_ADMIN_EMAIL: 'a@example.com',
-      BOOTSTRAP_ADMIN_PASSWORD: 'Boot!Strong#Pass9',
-    };
-    expect(loadConfig(boot).bootstrapAdmin?.roles).toEqual(['ADMIN']);
+    const boot = { BOOTSTRAP_ADMIN_EMAIL: 'A@example.com' };
+    expect(loadConfig(boot).bootstrapAdmin).toEqual({
+      email: 'a@example.com',
+      name: 'Administrador',
+      roles: ['ADMIN'],
+    });
+    expect(loadConfig({}).bootstrapAdmin.email).toBeUndefined();
     expect(
-      loadConfig({ ...boot, BOOTSTRAP_ADMIN_ROLES: ' admin, operator,ADMIN' }).bootstrapAdmin
-        ?.roles,
+      loadConfig({ ...boot, BOOTSTRAP_ADMIN_ROLES: ' admin, operator,ADMIN' }).bootstrapAdmin.roles,
     ).toEqual(['ADMIN', 'OPERATOR']);
     expect(problemsOf({ ...boot, BOOTSTRAP_ADMIN_ROLES: 'ADMIN;DROP' }).join()).toMatch(
       /BOOTSTRAP_ADMIN_ROLES/,
     );
   });
 
-  it('requires bootstrap email+password together', () => {
-    expect(problemsOf({ BOOTSTRAP_ADMIN_EMAIL: 'a@example.com' }).join()).toMatch(/together/);
+  it('refuses the removed BOOTSTRAP_ADMIN_PASSWORD without echoing it', () => {
+    const p = problemsOf({ BOOTSTRAP_ADMIN_PASSWORD: 'Boot!Strong#Pass9' }).join();
+    expect(p).toMatch(/BOOTSTRAP_ADMIN_PASSWORD is no longer supported/);
+    expect(p).not.toContain('Boot!Strong#Pass9');
+    expect(problemsOf({ BOOTSTRAP_ADMIN_EMAIL: 'not-an-email' }).join()).toMatch(
+      /BOOTSTRAP_ADMIN_EMAIL/,
+    );
   });
 
   it('reports invalid values by variable name without echoing secrets', () => {

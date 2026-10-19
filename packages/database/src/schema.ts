@@ -371,6 +371,21 @@ export const policies = pgTable(
   ],
 );
 
+/**
+ * One-time token that lets the first administrator be created through the API while the users
+ * table is empty. Only the SHA-256 of the token is stored; the row is deleted when it is used.
+ */
+export const bootstrapTokens = pgTable(
+  'bootstrap_tokens',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tokenHash: text('token_hash').notNull(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [uniqueIndex('bootstrap_tokens_token_hash_key').on(t.tokenHash)],
+);
+
 export type UserRow = typeof users.$inferSelect;
 export type SessionRow = typeof sessions.$inferSelect;
 export type RoleRow = typeof roles.$inferSelect;
@@ -386,3 +401,4 @@ export type ConnectionRow = typeof connections.$inferSelect;
 export type NewConnection = typeof connections.$inferInsert;
 export type PolicyRow = typeof policies.$inferSelect;
 export type NewPolicy = typeof policies.$inferInsert;
+export type BootstrapTokenRow = typeof bootstrapTokens.$inferSelect;

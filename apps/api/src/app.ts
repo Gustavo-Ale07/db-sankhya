@@ -22,6 +22,7 @@ import { AuditService, HistoryService, SavedQueriesService } from './services/re
 import { SessionsService } from './services/sessions';
 import { UsersService } from './services/users';
 import { AuthzService } from './services/authz';
+import { createBootstrapService } from './services/bootstrap';
 import { adminRoutes } from './routes/admin';
 import { authRoutes } from './routes/auth';
 import { dataRoutes } from './routes/data';
@@ -67,6 +68,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     database,
     users: new UsersService(database.db, authz),
     authz,
+    bootstrap: createBootstrapService(database.db, authz, config),
     sessions: new SessionsService(database.db, config.session.hours),
     audit: new AuditService(database.db, redactor),
     history: new HistoryService(database.db),

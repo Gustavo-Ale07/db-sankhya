@@ -1,5 +1,5 @@
-// Bundles the API (and the workspace packages it uses) into dist/server.mjs and
-// dist/scratch-worker.mjs.
+// Bundles the API (and the workspace packages it uses) into dist/server.mjs,
+// dist/scratch-worker.mjs and the admin CLI dist/admin.mjs.
 // Third-party dependencies stay external and are installed in production node_modules.
 import { cp, rm } from 'node:fs/promises';
 import { dirname, isAbsolute, resolve } from 'node:path';
@@ -16,6 +16,7 @@ await build({
   entryPoints: {
     server: resolve(root, 'src/server.ts'),
     'scratch-worker': resolve(root, 'src/services/scratch-worker.ts'),
+    admin: resolve(root, 'src/cli/admin.ts'),
   },
   outdir: dist,
   outExtension: { '.js': '.mjs' },

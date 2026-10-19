@@ -14,6 +14,17 @@ const loginBody = z
   })
   .strict();
 
+const bootstrapBody = z
+  .object({
+    token: z.string().min(1).max(256),
+    email: z.email().max(254),
+    password: z.string().min(1).max(512),
+  })
+  .strict();
+
+/** Login and the other unauthenticated credential endpoints share this limit. */
+const LOGIN_RATE_LIMIT = { rateLimit: { max: 10, timeWindow: '1 minute' } };
+
 const changePasswordBody = z
   .object({
     currentPassword: z.string().min(1).max(512),
@@ -34,7 +45,7 @@ export function passwordPolicyError(password: string): AppError | null {
 }
 
 export async function authRoutes(app: FastifyInstance): Promise<void> {
-  const { users, sessions, audit, config, authz } = app.services;
+  const { users, sessions, audit, config, authz, bootstrap } = app.services;
 
   const setSessionCookie = (reply: FastifyReply, token: string, expiresAt: Date) => {
     void reply.setCookie(config.session.cookieName, token, {
@@ -46,80 +57,89 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     });
   };
 
-  app.post(
-    '/api/auth/login',
-    { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } },
-    async (request, reply) => {
-      noStore(reply);
-      const body = parseBody(loginBody, request.body);
-      const email = body.email.toLowerCase();
-      const user = await users.findByEmail(email);
-      const ip = clientIp(request);
-      const fail = async (code: 'INVALID_CREDENTIALS' | 'ACCOUNT_LOCKED', reason: string) => {
-        await audit.record({
-          action: 'auth.login_failed',
-          status: 'denied',
-          userId: user?.id ?? null,
-          userEmail: email.slice(0, 254),
-          ip,
-          requestId: request.id,
-          errorCode: code,
-          details: { reason },
-        });
-        // Locked accounts get the same answer as bad credentials, so lockouts cannot be used to
-        // find out which e-mails exist; the lock is visible in the audit log.
-        throw new AppError(
-          'INVALID_CREDENTIALS',
-          'Invalid e-mail or password. Repeated failures lock the account for a while.',
-        );
-      };
-
-      if (!user) {
-        await verifyDummy(body.password);
-        return fail('INVALID_CREDENTIALS', 'unknown_user');
-      }
-      if (user.lockedUntil && user.lockedUntil.getTime() > Date.now()) {
-        await verifyDummy(body.password);
-        return fail('ACCOUNT_LOCKED', 'locked');
-      }
-      const ok = await checkLocalPassword(user, body.password);
-      if (!ok) {
-        // Non-local accounts are never authenticated here, so failures must not lock them.
-        if (user.identityProvider !== 'local') return fail('INVALID_CREDENTIALS', 'bad_password');
-        const { locked } = await users.recordLoginFailure(
-          user.id,
-          config.session.loginMaxAttempts,
-          config.session.loginLockMinutes,
-        );
-        return fail(
-          locked ? 'ACCOUNT_LOCKED' : 'INVALID_CREDENTIALS',
-          locked ? 'locked_now' : 'bad_password',
-        );
-      }
-      if (!user.active) return fail('INVALID_CREDENTIALS', 'inactive');
-
-      // Session fixation: any session presented with the login request is revoked and a new one issued.
-      if (request.auth) await sessions.revoke(request.auth.session.id);
-      await users.recordLoginSuccess(user.id);
-      const { token, session } = await sessions.create(user.id, {
-        ip,
-        ...(request.headers['user-agent'] ? { userAgent: request.headers['user-agent'] } : {}),
-      });
-      setSessionCookie(reply, token, session.expiresAt);
+  app.post('/api/auth/login', { config: LOGIN_RATE_LIMIT }, async (request, reply) => {
+    noStore(reply);
+    const body = parseBody(loginBody, request.body);
+    const email = body.email.toLowerCase();
+    const user = await users.findByEmail(email);
+    const ip = clientIp(request);
+    const fail = async (code: 'INVALID_CREDENTIALS' | 'ACCOUNT_LOCKED', reason: string) => {
       await audit.record({
-        action: 'auth.login',
-        status: 'success',
-        userId: user.id,
-        userEmail: user.email,
+        action: 'auth.login_failed',
+        status: 'denied',
+        userId: user?.id ?? null,
+        userEmail: email.slice(0, 254),
         ip,
         requestId: request.id,
+        errorCode: code,
+        details: { reason },
       });
-      return {
-        user: toPublicUser(user, await authz.grants(user.id)),
-        expiresAt: session.expiresAt.toISOString(),
-      };
-    },
-  );
+      // Locked accounts get the same answer as bad credentials, so lockouts cannot be used to
+      // find out which e-mails exist; the lock is visible in the audit log.
+      throw new AppError(
+        'INVALID_CREDENTIALS',
+        'Invalid e-mail or password. Repeated failures lock the account for a while.',
+      );
+    };
+
+    if (!user) {
+      await verifyDummy(body.password);
+      return fail('INVALID_CREDENTIALS', 'unknown_user');
+    }
+    if (user.lockedUntil && user.lockedUntil.getTime() > Date.now()) {
+      await verifyDummy(body.password);
+      return fail('ACCOUNT_LOCKED', 'locked');
+    }
+    const ok = await checkLocalPassword(user, body.password);
+    if (!ok) {
+      // Non-local accounts are never authenticated here, so failures must not lock them.
+      if (user.identityProvider !== 'local') return fail('INVALID_CREDENTIALS', 'bad_password');
+      const { locked } = await users.recordLoginFailure(
+        user.id,
+        config.session.loginMaxAttempts,
+        config.session.loginLockMinutes,
+      );
+      return fail(
+        locked ? 'ACCOUNT_LOCKED' : 'INVALID_CREDENTIALS',
+        locked ? 'locked_now' : 'bad_password',
+      );
+    }
+    if (!user.active) return fail('INVALID_CREDENTIALS', 'inactive');
+
+    // Session fixation: any session presented with the login request is revoked and a new one issued.
+    if (request.auth) await sessions.revoke(request.auth.session.id);
+    await users.recordLoginSuccess(user.id);
+    const { token, session } = await sessions.create(user.id, {
+      ip,
+      ...(request.headers['user-agent'] ? { userAgent: request.headers['user-agent'] } : {}),
+    });
+    setSessionCookie(reply, token, session.expiresAt);
+    await audit.record({
+      action: 'auth.login',
+      status: 'success',
+      userId: user.id,
+      userEmail: user.email,
+      ip,
+      requestId: request.id,
+    });
+    return {
+      user: toPublicUser(user, await authz.grants(user.id)),
+      expiresAt: session.expiresAt.toISOString(),
+    };
+  });
+
+  // Creates the first administrator with the one-time token logged at boot. Answers 404 once any
+  // user exists.
+  app.post('/api/auth/bootstrap', { config: LOGIN_RATE_LIMIT }, async (request, reply) => {
+    noStore(reply);
+    const body = parseBody(bootstrapBody, request.body);
+    const user = await bootstrap.consume(body, {
+      ip: clientIp(request),
+      requestId: request.id,
+      passwordError: passwordPolicyError,
+    });
+    return reply.code(201).send({ user: toPublicUser(user, await authz.grants(user.id)) });
+  });
 
   app.post('/api/auth/logout', async (request, reply) => {
     noStore(reply);

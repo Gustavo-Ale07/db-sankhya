@@ -57,6 +57,13 @@
       "when": 1792425272923,
       "tag": "0007_plans",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1792425273923,
+      "tag": "0008_bootstrap_tokens",
+      "breakpoints": true
     }
   ]
 }

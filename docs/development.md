@@ -21,8 +21,6 @@ Create a `.env` at the repository root for local development:
 NODE_ENV=development
 APP_URL=http://localhost:5173
 SANKHYA_MODE=mock
-BOOTSTRAP_ADMIN_EMAIL=admin@example.com
-BOOTSTRAP_ADMIN_PASSWORD=Local-Dev#Pass2026
 ```
 
 ```bash
@@ -31,6 +29,23 @@ pnpm dev
 
 - Web UI (Vite, hot reload): <http://localhost:5173>
 - API (tsx watch): <http://localhost:3001>; Vite proxies `/api` and `/health` to it.
+
+There is no default password. On an empty database the API logs a one-time token once, at warn
+level (`bootstrap token: …`). Create the first administrator with it:
+
+```bash
+curl -X POST http://localhost:5173/api/auth/bootstrap \
+  -H 'Content-Type: application/json' -H 'Origin: http://localhost:5173' \
+  -d '{"token":"<token>","email":"admin@example.com","password":"<12+ chars, mixed>"}'
+```
+
+Or use the admin CLI against a persistent database (`pglite:<dir>` or PostgreSQL; stop the API
+first when using PGlite):
+
+```bash
+pnpm --filter @dbx/api admin bootstrap --email admin@example.com   # prints a one-time password
+pnpm --filter @dbx/api admin reset-password --email admin@example.com
+```
 
 The in-memory database starts empty on every restart. To keep data between restarts use a
 PGlite directory (`DATABASE_URL=pglite:./.pglite`) or a local PostgreSQL

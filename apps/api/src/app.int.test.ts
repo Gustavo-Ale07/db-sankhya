@@ -9,8 +9,6 @@ import type { BuildAppOptions } from './app';
 import { loadConfig } from './config';
 import { loggerOptions } from './logger';
 import { secretValues } from './config';
-import { UsersService } from './services/users';
-import { AuthzService } from './services/authz';
 
 const ORIGIN = 'http://localhost:5173';
 const ADMIN = { email: 'admin@example.com', password: 'Adm1n!Strong#Pass' };
@@ -22,7 +20,6 @@ const BASE_ENV = {
   DATABASE_URL: 'pglite:memory',
   SESSION_SECRET: 'integration-test-secret-7Hq2Lm9Xc4Vb8Nz1Kp5Rt3Wy6',
   BOOTSTRAP_ADMIN_EMAIL: ADMIN.email,
-  BOOTSTRAP_ADMIN_PASSWORD: ADMIN.password,
   BOOTSTRAP_ADMIN_ROLES: 'ADMIN,OPERATOR',
   LOG_LEVEL: 'silent',
   // The SANKHYA_* connection (mock gateway): the default connection of reads.
@@ -77,10 +74,13 @@ async function setup(
     logger: { ...(loggerOptions('trace', secretValues(config)) as object), stream },
     ...extra,
   });
-  await app.services.users.bootstrapAdmin(config.bootstrapAdmin);
-  // Most tests act as an admin who already replaced the bootstrap password.
-  const admin = await app.services.users.findByEmail(ADMIN.email);
-  if (admin) await app.services.users.setPassword(admin.id, ADMIN.password, false);
+  // Most tests act as an admin (BOOTSTRAP_ADMIN_ROLES) who already replaced the one-time password.
+  await app.services.users.create({
+    email: ADMIN.email,
+    name: config.bootstrapAdmin.name,
+    password: ADMIN.password,
+    roles: config.bootstrapAdmin.roles,
+  });
 
   const call: Harness['call'] = (cookie, opts) =>
     app.inject({
@@ -833,25 +833,7 @@ describe('admin', () => {
     expect(audit.json().total).toBe(1);
   });
 
-  it('forces the bootstrap admin to replace the .env password and never re-bootstraps', async () => {
-    const database = await createDatabase('pglite:memory');
-    try {
-      await database.migrate();
-      const users = new UsersService(database.db, new AuthzService(database.db));
-      const boot = {
-        email: 'boot@example.com',
-        password: 'Boot!Strong#Pass9',
-        name: 'Boot',
-        roles: ['ADMIN'],
-      };
-      expect(await users.bootstrapAdmin(boot)).toBe('created');
-      expect((await users.findByEmail(boot.email))?.mustChangePassword).toBe(true);
-      expect(await users.bootstrapAdmin({ ...boot, email: 'outro@example.com' })).toBe('skipped');
-      expect(await users.count()).toBe(1);
-    } finally {
-      await database.close();
-    }
-
+  it('forces an admin with a one-time password to replace it before anything else', async () => {
     const h = await setup();
     const admin = await h.app.services.users.findByEmail(ADMIN.email);
     await h.app.services.users.setPassword(admin!.id, ADMIN.password, true);

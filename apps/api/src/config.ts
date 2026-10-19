@@ -95,7 +95,9 @@ const envSchema = z.object({
   LOGIN_MAX_ATTEMPTS: int(5, 1, 100),
   LOGIN_LOCK_MINUTES: int(15, 1, 24 * 60),
 
+  /** Selects the admin CLI path for the first administrator (no bootstrap token is issued). */
   BOOTSTRAP_ADMIN_EMAIL: optionalText,
+  /** Removed: refused when set, so nobody keeps a password in .env thinking it is used. */
   BOOTSTRAP_ADMIN_PASSWORD: optionalText,
   BOOTSTRAP_ADMIN_NAME: z.string().default('Administrador'),
   /** Comma-separated role keys of the bootstrap administrator. */
@@ -211,7 +213,11 @@ export interface AppConfig {
     loginMaxAttempts: number;
     loginLockMinutes: number;
   };
-  bootstrapAdmin?: { email: string; password: string; name: string; roles: string[] };
+  /**
+   * The first administrator. `email` (BOOTSTRAP_ADMIN_EMAIL) selects the admin CLI path; without
+   * it an empty users table gets a one-time bootstrap token. Never holds a password.
+   */
+  bootstrapAdmin: { email?: string; name: string; roles: string[] };
   logLevel: Env['LOG_LEVEL'];
   version: string;
   commit: string;
@@ -316,11 +322,6 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
     if (appUrl.protocol !== 'https:' && !['localhost', '127.0.0.1'].includes(appUrl.hostname)) {
       problems.push('APP_URL must use https:// in production');
     }
-    if (e.BOOTSTRAP_ADMIN_PASSWORD && isWeakPassword(e.BOOTSTRAP_ADMIN_PASSWORD)) {
-      problems.push(
-        'BOOTSTRAP_ADMIN_PASSWORD is a placeholder or too weak (12+ characters mixing upper, lower, digits, symbols)',
-      );
-    }
     if (e.LOG_LEVEL === 'trace' || e.LOG_LEVEL === 'debug')
       problems.push('LOG_LEVEL debug/trace is not allowed in production');
     // Published directly, clients reach the app through Docker's NAT with a private source address,
@@ -338,8 +339,10 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
   if (e.BOOTSTRAP_ADMIN_EMAIL && !z.email().safeParse(e.BOOTSTRAP_ADMIN_EMAIL).success) {
     problems.push('BOOTSTRAP_ADMIN_EMAIL is not a valid e-mail');
   }
-  if (Boolean(e.BOOTSTRAP_ADMIN_EMAIL) !== Boolean(e.BOOTSTRAP_ADMIN_PASSWORD)) {
-    problems.push('BOOTSTRAP_ADMIN_EMAIL and BOOTSTRAP_ADMIN_PASSWORD must be set together');
+  if (e.BOOTSTRAP_ADMIN_PASSWORD) {
+    problems.push(
+      'BOOTSTRAP_ADMIN_PASSWORD is no longer supported: remove it and create the first administrator with the bootstrap token or the admin CLI',
+    );
   }
   if (problems.length > 0) throw new ConfigError(problems);
 
@@ -389,16 +392,11 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
       loginMaxAttempts: e.LOGIN_MAX_ATTEMPTS,
       loginLockMinutes: e.LOGIN_LOCK_MINUTES,
     },
-    ...(e.BOOTSTRAP_ADMIN_EMAIL && e.BOOTSTRAP_ADMIN_PASSWORD
-      ? {
-          bootstrapAdmin: {
-            email: e.BOOTSTRAP_ADMIN_EMAIL.toLowerCase(),
-            password: e.BOOTSTRAP_ADMIN_PASSWORD,
-            name: e.BOOTSTRAP_ADMIN_NAME,
-            roles: e.BOOTSTRAP_ADMIN_ROLES,
-          },
-        }
-      : {}),
+    bootstrapAdmin: {
+      ...(e.BOOTSTRAP_ADMIN_EMAIL ? { email: e.BOOTSTRAP_ADMIN_EMAIL.toLowerCase() } : {}),
+      name: e.BOOTSTRAP_ADMIN_NAME,
+      roles: e.BOOTSTRAP_ADMIN_ROLES,
+    },
     logLevel: e.LOG_LEVEL,
     version: e.APP_VERSION ?? process.env.npm_package_version ?? '0.1.0',
     commit: e.GIT_COMMIT ?? 'dev',
@@ -414,7 +412,6 @@ export function secretValues(config: AppConfig): string[] {
     env?.clientId,
     env?.clientSecret,
     env?.xToken,
-    config.bootstrapAdmin?.password,
   ].filter((v): v is string => typeof v === 'string' && v.length > 0);
 }
 

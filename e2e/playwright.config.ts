@@ -1,13 +1,25 @@
+import { readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defineConfig, devices } from '@playwright/test';
 
 // Runs against the production build (`pnpm build`): the API serves the web bundle from
-// STATIC_DIR, with the in-process mock Sankhya gateway (fictitious data) and an in-memory
-// database.
+// STATIC_DIR, with the in-process mock Sankhya gateway (fictitious data) and a fresh PGlite
+// directory. There is no default password: start-server.mjs creates the administrator with the
+// admin CLI (dist/admin.mjs) and saves its one-time password for the tests.
 const PORT = 3199;
 const root = (p: string) => fileURLToPath(new URL(p, import.meta.url));
+const E2E_DIR = join(tmpdir(), 'dbx-e2e');
+const PASSWORD_FILE = join(E2E_DIR, 'bootstrap-password.txt');
 
-export const BOOTSTRAP = { email: 'admin@example.com', password: 'E2E-Bootstrap#2026' };
+export const BOOTSTRAP = {
+  email: 'admin@example.com',
+  /** One-time password printed by the admin CLI when the e2e server started. */
+  get password(): string {
+    return readFileSync(PASSWORD_FILE, 'utf8').trim();
+  },
+};
 
 export default defineConfig({
   testDir: './tests',
@@ -32,7 +44,7 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: `node "${root('../apps/api/dist/server.mjs')}"`,
+    command: `node "${root('./start-server.mjs')}"`,
     url: `http://localhost:${PORT}/health/live`,
     reuseExistingServer: false,
     timeout: 60_000,
@@ -40,11 +52,12 @@ export default defineConfig({
       NODE_ENV: 'test',
       PORT: String(PORT),
       APP_URL: `http://localhost:${PORT}`,
-      DATABASE_URL: 'pglite:memory',
+      DATABASE_URL: `pglite:${join(E2E_DIR, 'db')}`,
+      E2E_PASSWORD_FILE: PASSWORD_FILE,
       STATIC_DIR: root('../apps/web/dist'),
       AUTH_SECRET: 'e2e-only-session-secret-0123456789abcdef',
+      // Read by the admin CLI (the first administrator); no bootstrap token is issued.
       BOOTSTRAP_ADMIN_EMAIL: BOOTSTRAP.email,
-      BOOTSTRAP_ADMIN_PASSWORD: BOOTSTRAP.password,
       BOOTSTRAP_ADMIN_NAME: 'Admin Demo',
       // OPERATOR is kept on purpose: the refusal test proves writes are denied even for a
       // write-capable role.

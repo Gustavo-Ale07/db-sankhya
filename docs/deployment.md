@@ -22,13 +22,11 @@ docker compose up -d --build
 Edit at least these values in `.env` — the app refuses to start in production while they hold
 the placeholders:
 
-| Variable                   | What to set                                                          |
-| -------------------------- | -------------------------------------------------------------------- |
-| `APP_URL`                  | the public HTTPS URL, e.g. `https://sql.example.com`                 |
-| `POSTGRES_PASSWORD`        | a long random password (URL-safe characters: `openssl rand -hex 24`) |
-| `SESSION_SECRET`           | `openssl rand -base64 48`                                            |
-| `BOOTSTRAP_ADMIN_EMAIL`    | the first administrator's e-mail                                     |
-| `BOOTSTRAP_ADMIN_PASSWORD` | a temporary strong password; you must change it on first login       |
+| Variable            | What to set                                                          |
+| ------------------- | -------------------------------------------------------------------- |
+| `APP_URL`           | the public HTTPS URL, e.g. `https://sql.example.com`                 |
+| `POSTGRES_PASSWORD` | a long random password (URL-safe characters: `openssl rand -hex 24`) |
+| `SESSION_SECRET`    | `openssl rand -base64 48`                                            |
 
 Then check:
 
@@ -37,6 +35,35 @@ docker compose ps                     # both services "healthy"
 docker compose logs -f app            # "DB-Sankhya API started"
 curl -fsS http://127.0.0.1:3001/health/ready
 ```
+
+### First administrator
+
+There is no default password. Pick one of two ways:
+
+- **Bootstrap token** (default). On its first start with an empty database, the app logs a
+  one-time token once, at warn level: `bootstrap token: <token>`. Only its SHA-256 is stored and
+  it is never logged again. Within `BOOTSTRAP_TOKEN_TTL_MINUTES` (default 30) create the
+  administrator (roles from `BOOTSTRAP_ADMIN_ROLES`):
+
+  ```bash
+  docker compose logs app | grep 'bootstrap token'
+  curl -X POST https://sql.example.com/api/auth/bootstrap \
+    -H 'Content-Type: application/json' -H 'Origin: https://sql.example.com' \
+    -d '{"token":"<token>","email":"admin@example.com","password":"<12+ chars, mixed>"}'
+  ```
+
+  The token works once. An expired token gets `410`; restart the app to issue a new one. Once any
+  user exists the endpoint answers `404`.
+
+- **Admin CLI**. Set `BOOTSTRAP_ADMIN_EMAIL` (no token is issued then) and run:
+
+  ```bash
+  docker compose exec app node dist/admin.mjs bootstrap --email admin@example.com
+  ```
+
+  It prints a one-time password that must be changed at the first login. On a non-empty users
+  table it refuses unless `--force-additional` is given.
+  `node dist/admin.mjs reset-password --email <e-mail>` resets a password the same way.
 
 The app listens on `127.0.0.1:3001` on the host (`APP_BIND` / `APP_PORT`). PostgreSQL has no
 published port; it is reachable only from the `app` container on an internal network. If another

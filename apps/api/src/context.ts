@@ -1,6 +1,7 @@
 import type { DatabaseHandle, SessionRow, UserRow } from '@dbx/database';
 import type { AppConfig } from './config';
 import type { AuthzService, Grants } from './services/authz';
+import type { BootstrapService } from './services/bootstrap';
 import type { ConnectionsService } from './services/connections';
 import type { AuditService, HistoryService, SavedQueriesService } from './services/records';
 import type { SessionsService } from './services/sessions';
@@ -14,6 +15,8 @@ export interface AppServices {
   database: DatabaseHandle;
   users: UsersService;
   authz: AuthzService;
+  /** First administrator: one-time bootstrap token. */
+  bootstrap: BootstrapService;
   sessions: SessionsService;
   audit: AuditService;
   history: HistoryService;

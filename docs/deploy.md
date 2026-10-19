@@ -30,7 +30,8 @@ openssl rand -hex 24      # POSTGRES_PASSWORD (URL-safe, it is embedded in DATAB
 ```
 
 Set `APP_ENV=production`, `APP_URL=https://app.example.com` (must be the public HTTPS origin),
-`TRUST_PROXY=loopback,uniquelocal`, the bootstrap admin values and the Sankhya settings.
+`TRUST_PROXY=loopback,uniquelocal` and the Sankhya settings. The first administrator is created
+with the one-time bootstrap token or the admin CLI (see [deployment.md](deployment.md)).
 
 Start it. `--env-file` supplies the `${...}` values used by the compose file, `env_file` supplies
 the container environment:

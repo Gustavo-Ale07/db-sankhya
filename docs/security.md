@@ -27,8 +27,8 @@ anonymous users.
   `cookie`, `client_secret`, `x-token`, `*token`, `*secret`, `*password`, `*apikey`, …) with
   `***REDACTED***` and also scrubs the literal configured secret values from any string.
 - Configuration is validated with a schema at boot. In production the server **refuses to
-  start** when a secret is short or a placeholder, when the bootstrap password is the placeholder
-  or weak, when `DATABASE_URL` still contains the placeholder password or points to the in-memory
+  start** when a secret is short or a placeholder, when the removed `BOOTSTRAP_ADMIN_PASSWORD`
+  is still set, when `DATABASE_URL` still contains the placeholder password or points to the in-memory
   database, when `APP_URL` is not HTTPS, when `LOG_LEVEL` is `debug`/`trace`, when
   `ENCRYPTION_KEY` is missing, or when `SANKHYA_MODE` is missing (or `mock` without
   `DEMO_MODE=true`). Problems are listed by name; secret values are never printed.
@@ -38,8 +38,11 @@ anonymous users.
 ## Authentication and sessions
 
 - Passwords are hashed with Argon2id (`@node-rs/argon2`). Policy: at least 12 characters and three
-  of upper case, lower case, digits and symbols. The bootstrap administrator must change the
-  password on first login (`PASSWORD_CHANGE_REQUIRED` until then).
+  of upper case, lower case, digits and symbols. There is no default password: the first
+  administrator is created with a one-time bootstrap token (32 random bytes, only its SHA-256
+  stored, compared in constant time, logged once at warn level, single use, rate-limited like
+  login) or with the admin CLI. Passwords printed by the CLI are one-time: the user must change
+  them on first login (`PASSWORD_CHANGE_REQUIRED` until then).
 - Login failures are counted per account; after `LOGIN_MAX_ATTEMPTS` the account is locked for
   `LOGIN_LOCK_MINUTES`. A locked account gets the same `INVALID_CREDENTIALS` answer as a wrong
   password, so lockouts do not reveal which e-mails exist; the lock is recorded in the audit log. Login and password change are also rate-limited per IP.

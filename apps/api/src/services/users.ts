@@ -33,7 +33,7 @@ export function toPublicUser(u: UserRow, grants: Grants): PublicUser {
   };
 }
 
-function isUniqueViolation(err: unknown): boolean {
+export function isUniqueViolation(err: unknown): boolean {
   const e = err as { code?: string; cause?: { code?: string } };
   return e?.code === '23505' || e?.cause?.code === '23505';
 }
@@ -95,26 +95,6 @@ export class UsersService {
     } catch (err) {
       if (isUniqueViolation(err))
         throw new AppError('CONFLICT', 'A user with this e-mail already exists');
-      throw err;
-    }
-  }
-
-  /**
-   * Creates the first administrator from BOOTSTRAP_ADMIN_* only when the users table is empty,
-   * with the roles in BOOTSTRAP_ADMIN_ROLES. An existing account is never overwritten.
-   */
-  async bootstrapAdmin(
-    admin: { email: string; password: string; name: string; roles: readonly string[] } | undefined,
-  ): Promise<'created' | 'skipped'> {
-    if (!admin) return 'skipped';
-    if ((await this.count()) > 0) return 'skipped';
-    try {
-      // The bootstrap password lives in .env, so it must be replaced on first login.
-      await this.create({ ...admin, mustChangePassword: true });
-      return 'created';
-    } catch (err) {
-      // Another instance may have bootstrapped concurrently.
-      if (err instanceof AppError && err.code === 'CONFLICT') return 'skipped';
       throw err;
     }
   }

@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { createDatabase } from '@dbx/database';
 import { ConfigError, loadConfig } from './config';
 import { buildApp } from './app';
+import { announceBootstrap } from './services/bootstrap';
 
 async function main(): Promise<void> {
   let config;
@@ -25,9 +26,8 @@ async function main(): Promise<void> {
   await database.migrate();
 
   const app = await buildApp({ config, database });
-  const bootstrap = await app.services.users.bootstrapAdmin(config.bootstrapAdmin);
-  if (bootstrap === 'created')
-    app.log.info({ email: config.bootstrapAdmin?.email }, 'bootstrap administrator created');
+  // Empty users table: a one-time bootstrap token is logged once (or the admin CLI is pointed to).
+  await announceBootstrap(app.services, app.log);
 
   const housekeeping = setInterval(() => {
     void app.services.sessions
