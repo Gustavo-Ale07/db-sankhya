@@ -206,4 +206,101 @@ describe('PolicyService', () => {
     expect(v4.rules).toEqual([]);
     expect(v4.version).toBe(empty.version);
   });
+
+  it('does not cache a load error: the next call re-reads', async () => {
+    const { database, service } = await setup();
+    await service.create(SIMPLE);
+    service.invalidate();
+    const spy = vi.spyOn(database.db, 'select').mockImplementationOnce(() => {
+      throw new Error('database down');
+    });
+    await expect(service.current()).rejects.toThrow('database down');
+    spy.mockRestore();
+    const snap = await service.current();
+    expect(snap.rules).toHaveLength(1);
+  });
+
+  it('does not keep a stale version from a read in flight during an update', async () => {
+    const { service } = await setup();
+    const created = await service.create(SIMPLE);
+    const before = await service.current();
+    service.invalidate();
+    const inFlight = service.current();
+    await service.update(created.id, { entities: ['OTHER'] });
+    await inFlight;
+    const after = await service.current();
+    expect(after.rules[0]!.entities).toEqual(['OTHER']);
+    expect(after.version).not.toBe(before.version);
+    expect(after.version).toBe(policyVersion(after.rules));
+  });
+
+  it('keeps both of two concurrent updates', async () => {
+    const { service } = await setup();
+    const created = await service.create(SIMPLE);
+    await Promise.all([
+      service.update(created.id, { name: 'Concurrent' }),
+      service.update(created.id, { entities: ['OTHER'] }),
+    ]);
+    const [row] = await service.list();
+    expect(row).toMatchObject({ name: 'Concurrent', entities: ['OTHER'] });
+  });
+
+  it('refuses switching to a user subject without a subjectId', async () => {
+    const { service } = await setup();
+    const created = await service.create(SIMPLE);
+    await expectValidation(service.update(created.id, { subjectType: 'user' }));
+    await expectValidation(service.update(created.id, { subjectType: 'user', subjectId: null }));
+  });
+
+  it('lets an admin disable a corrupt rule, and only that', async () => {
+    const { database, service } = await setup();
+    await database.db.execute(sql`
+      insert into policies (name, effect, subject_type, actions, enabled)
+      values ('corrupt', 'DENY', 'everyone', '{}', true)`);
+    const [corrupt] = await service.list();
+    await expectValidation(service.update(corrupt!.id, { name: 'renamed' }));
+    await expectValidation(service.update(corrupt!.id, { enabled: false, name: 'renamed' }));
+    await expectValidation(service.update(corrupt!.id, { enabled: true }));
+    expect((await service.current()).invalid).toHaveLength(1);
+
+    const disabled = await service.update(corrupt!.id, { enabled: false });
+    expect(disabled).toMatchObject({ name: 'corrupt', actions: [], enabled: false });
+    expect((await service.current()).invalid).toEqual([]);
+  });
+
+  it('evaluates over the current rules and never throws', async () => {
+    const { database, service, logger } = await setup();
+    const permissions = new Set<Permission>(['QUERY.SELECT']);
+    await service.create(SIMPLE);
+    const snap = await service.current();
+    const allowed = await service.evaluate(SELECT_REQ, permissions);
+    expect(allowed.effect).toBe('ALLOW');
+    expect(allowed.policyVersion).toBe(snap.version);
+    const denied = await service.evaluate({ ...SELECT_REQ, entities: ['SECRETS'] }, permissions);
+    expect(denied.effect).toBe('DENY');
+
+    // Load failure: DENY with a clear reason, logged, not thrown.
+    service.invalidate();
+    const spy = vi.spyOn(database.db, 'select').mockImplementationOnce(() => {
+      throw new Error('database down');
+    });
+    const down = await service.evaluate(SELECT_REQ, permissions);
+    spy.mockRestore();
+    expect(down).toMatchObject({ effect: 'DENY', reasons: ['policies unavailable'] });
+    expect(logger.error).toHaveBeenCalled();
+    expect((await service.evaluate(SELECT_REQ, permissions)).effect).toBe('ALLOW');
+
+    // A malformed request is denied, not thrown.
+    const odd = await service.evaluate(null as unknown as PolicyRequest, permissions);
+    expect(odd.effect).toBe('DENY');
+
+    // A corrupt enabled rule: every action denied, naming the rule.
+    await database.db.execute(sql`
+      insert into policies (name, effect, subject_type, actions, enabled)
+      values ('corrupt', 'DENY', 'everyone', '{}', true)`);
+    await service.load();
+    const corrupt = await service.evaluate(SELECT_REQ, permissions);
+    expect(corrupt.effect).toBe('DENY');
+    expect(corrupt.reasons.join(' ')).toMatch(/invalid policy rule .*corrupt/);
+  });
 });

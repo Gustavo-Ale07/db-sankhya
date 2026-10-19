@@ -1,8 +1,21 @@
 import { asc, eq, sql } from 'drizzle-orm';
 import { policies } from '@dbx/database';
 import type { Database, PolicyRow } from '@dbx/database';
-import { AppError, policyVersion, validatePolicyRule } from '@dbx/shared';
-import type { Environment, PolicyRule } from '@dbx/shared';
+import {
+  AppError,
+  DEFAULT_LIMITS,
+  evaluatePolicy,
+  policyVersion,
+  validatePolicyRule,
+} from '@dbx/shared';
+import type {
+  Environment,
+  EvaluateOptions,
+  Permission,
+  PolicyDecision,
+  PolicyRequest,
+  PolicyRule,
+} from '@dbx/shared';
 
 /** A rule as created by an admin: everything but the id, which the database assigns. */
 export type PolicyInput = Omit<PolicyRule, 'id'>;
@@ -44,6 +57,23 @@ const INPUT_KEYS = [
   'overrideWhereRequired',
   'enabled',
 ] as const satisfies ReadonlyArray<keyof PolicyInput>;
+
+/** The one patch allowed on a stored rule that does not validate: switching it off. */
+function isDisableOnly(patch: unknown): boolean {
+  if (typeof patch !== 'object' || patch === null || Array.isArray(patch)) return false;
+  const keys = Object.keys(patch);
+  return keys.length === 1 && keys[0] === 'enabled' && (patch as PolicyPatch).enabled === false;
+}
+
+function denyAll(reasons: string[], version = ''): PolicyDecision {
+  return {
+    effect: 'DENY',
+    reasons,
+    matchedRuleIds: [],
+    limits: { ...DEFAULT_LIMITS },
+    policyVersion: version,
+  };
+}
 
 const notFound = () => new AppError('NOT_FOUND', 'Policy not found');
 
@@ -167,19 +197,44 @@ export class PolicyService {
     return toRecord(row!);
   }
 
+  /**
+   * Merges `patch` into the stored rule and validates the result. The read, merge and write run
+   * in one transaction with the row locked, so concurrent updates cannot lose each other's
+   * changes. `{ enabled: false }` alone is accepted even on a rule that does not validate, so an
+   * admin can always switch a corrupt rule off.
+   */
   async update(id: string, patch: PolicyPatch): Promise<PolicyRecord> {
-    const existing = await this.row(id);
-    const rule = { ...toRule(existing), ...pick(patch), id: existing.id } as PolicyRule;
-    if (rule.subjectType === 'everyone') rule.subjectId = null;
-    assertSavable(rule);
-    const [row] = await this.db
-      .update(policies)
-      .set({ ...toColumns(rule), updatedAt: sql`now()` })
-      .where(eq(policies.id, existing.id))
-      .returning();
-    this.invalidate();
-    if (!row) throw notFound();
-    return toRecord(row);
+    if (!UUID.test(id)) throw notFound();
+    const disableOnly = isDisableOnly(patch);
+    const fields = pick(patch);
+    try {
+      return await this.db.transaction(async (tx) => {
+        const [existing] = await tx
+          .select()
+          .from(policies)
+          .where(eq(policies.id, id))
+          .for('update');
+        if (!existing) throw notFound();
+        let values: Partial<ReturnType<typeof toColumns>>;
+        if (disableOnly) {
+          values = { enabled: false };
+        } else {
+          const rule = { ...toRule(existing), ...fields, id: existing.id } as PolicyRule;
+          if (rule.subjectType === 'everyone') rule.subjectId = null;
+          assertSavable(rule);
+          values = toColumns(rule);
+        }
+        const [row] = await tx
+          .update(policies)
+          .set({ ...values, updatedAt: sql`now()` })
+          .where(eq(policies.id, existing.id))
+          .returning();
+        if (!row) throw notFound();
+        return toRecord(row);
+      });
+    } finally {
+      this.invalidate();
+    }
   }
 
   async delete(id: string): Promise<void> {
@@ -211,15 +266,50 @@ export class PolicyService {
     return this.cache;
   }
 
+  /**
+   * The only entry point for policy-evaluated actions: `evaluatePolicy` over the current rule set.
+   * Never throws. If the rules cannot be loaded, or any enabled stored rule is invalid, every
+   * action is denied.
+   */
+  async evaluate(
+    req: PolicyRequest,
+    permissions: Set<Permission>,
+    options: Omit<EvaluateOptions, 'policyVersion'> = {},
+  ): Promise<PolicyDecision> {
+    let snapshot: PolicySnapshot;
+    try {
+      snapshot = await this.current();
+    } catch (err) {
+      this.logSafe('error', { err }, 'Policies unavailable: denying every policy-evaluated action');
+      return denyAll(['policies unavailable']);
+    }
+    try {
+      if (snapshot.invalid.length > 0) {
+        return denyAll(
+          snapshot.invalid.map((entry) => `invalid policy rule ${entry}`),
+          snapshot.version,
+        );
+      }
+      return evaluatePolicy(req, snapshot.rules, permissions, {
+        ...options,
+        policyVersion: snapshot.version,
+      });
+    } catch (err) {
+      this.logSafe('error', { err }, 'Policy evaluation failed');
+      return denyAll(['policy evaluation failed'], snapshot.version);
+    }
+  }
+
   invalidate(): void {
     this.cache = null;
   }
 
-  private async row(id: string): Promise<PolicyRow> {
-    if (!UUID.test(id)) throw notFound();
-    const [row] = await this.db.select().from(policies).where(eq(policies.id, id));
-    if (!row) throw notFound();
-    return row;
+  private logSafe(level: 'error' | 'warn', obj: object, msg: string): void {
+    try {
+      this.logger[level](obj, msg);
+    } catch {
+      // Logging must never turn a denial into a throw.
+    }
   }
 
   private async read(): Promise<PolicySnapshot> {
@@ -235,13 +325,14 @@ export class PolicyService {
       else ignored.push(entry);
     }
     if (invalid.length > 0) {
-      this.logger.error(
+      this.logSafe(
+        'error',
         { invalidPolicies: invalid },
         'Invalid enabled policy rules: every policy-evaluated action is denied until they are fixed',
       );
     }
     if (ignored.length > 0) {
-      this.logger.warn({ invalidPolicies: ignored }, 'Invalid disabled policy rules (ignored)');
+      this.logSafe('warn', { invalidPolicies: ignored }, 'Invalid disabled policy rules (ignored)');
     }
     return Object.freeze({
       rules,
