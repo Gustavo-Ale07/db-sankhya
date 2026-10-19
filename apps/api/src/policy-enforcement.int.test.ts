@@ -208,6 +208,22 @@ describe('policies on the Sankhya read path', () => {
     expect(audit.json().items[0]).toMatchObject({ errorCode: 'FORBIDDEN', resource: 'TGFPAR' });
   });
 
+  it('refuses NATURAL and condition-less joins that would hide a denied column', async () => {
+    const h = await setup();
+    await h.policy({ columns: ['TSICID.CODCID'] });
+    const { cookie } = await h.viewer();
+    for (const sqlText of [
+      'SELECT NOMEPARC FROM TGFPAR NATURAL JOIN TSICID',
+      'SELECT NOMEPARC FROM TGFPAR NATURAL INNER JOIN TSICID',
+      'SELECT NOMEPARC FROM TGFPAR LEFT JOIN TSICID',
+    ]) {
+      const res = await query(h, cookie, { sql: sqlText });
+      expect(res.statusCode, sqlText).toBe(400);
+      expect(codeOf(res), sqlText).toBe('SQL_UNSUPPORTED');
+    }
+    expect(reads(h.mock, 'TSICID')).toBe(0);
+  });
+
   it('allows COUNT(*) under a column DENY', async () => {
     const h = await setup();
     await h.policy({ columns: ['TGFPAR.EMAIL'] });

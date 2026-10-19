@@ -253,6 +253,39 @@ describe('analyzeRead', () => {
     });
   });
 
+  describe('joins whose columns are implicit', () => {
+    it.each(
+      (['oracle', 'mssql'] as const).flatMap((dialect) =>
+        [
+          'SELECT CODPARC FROM TGFPAR NATURAL JOIN TGFCAB',
+          'SELECT CODPARC FROM TGFPAR NATURAL INNER JOIN TGFCAB',
+          'SELECT CODPARC FROM TGFPAR natural LEFT JOIN TGFCAB',
+          'SELECT CODPARC FROM TGFPAR LEFT JOIN TGFCAB',
+          'SELECT CODPARC FROM TGFPAR INNER JOIN TGFCAB',
+          'SELECT CODPARC FROM TGFPAR JOIN TGFCAB',
+          'SELECT CODPARC FROM TGFPAR Natural',
+          'SELECT X.CODPARC FROM (SELECT CODPARC FROM TGFPAR) NATURAL JOIN TGFCAB X',
+        ].map((sql) => [dialect, sql] as const),
+      ),
+    )('%s refuses %s', (dialect, sql) => {
+      expect(errorOf(() => analyzeRead(sql, { dialect })).code).toBe('SQL_UNSUPPORTED');
+    });
+
+    it.each(['oracle', 'mssql'] as const)(
+      'still accepts CROSS JOIN and ON joins on %s',
+      (dialect) => {
+        expect(
+          analyzeRead('SELECT P.CODPARC FROM TGFPAR P CROSS JOIN TSICID C', { dialect }).tables,
+        ).toHaveLength(2);
+        expect(
+          analyzeRead('SELECT P.CODPARC FROM TGFPAR P LEFT JOIN TSICID C ON C.CODCID = P.CODCID', {
+            dialect,
+          }).tables,
+        ).toHaveLength(2);
+      },
+    );
+  });
+
   describe('rowCapSafe (outer select list survives SELECT * FROM (...))', () => {
     it.each([
       ['SELECT CODPARC FROM TGFPAR', true],
