@@ -13,6 +13,7 @@ vi.mock('../pages/SavedQueriesPage', () => ({ SavedQueriesPage: () => null }));
 vi.mock('../pages/ChangePasswordPage', () => ({ ChangePasswordPage: () => null }));
 vi.mock('../admin/UsersPage', () => ({ UsersPage: () => null }));
 vi.mock('../admin/AuditPage', () => ({ AuditPage: () => null }));
+vi.mock('../admin/ApprovalsPage', () => ({ ApprovalsPage: () => null }));
 vi.mock('../admin/StatusPage', () => ({ StatusPage: () => null }));
 
 vi.mock('../api/client', () => ({ api: { get: vi.fn() } }));

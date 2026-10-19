@@ -18,16 +18,19 @@ import { SavedQueriesPage } from '../pages/SavedQueriesPage';
 import { ChangePasswordPage } from '../pages/ChangePasswordPage';
 import { UsersPage } from '../admin/UsersPage';
 import { AuditPage } from '../admin/AuditPage';
+import { ApprovalsPage } from '../admin/ApprovalsPage';
 import { StatusPage } from '../admin/StatusPage';
 import { Footer } from './Footer';
 
-export type View = 'explorer' | 'history' | 'saved' | 'users' | 'audit' | 'status' | 'password';
+export type View =
+  'explorer' | 'history' | 'saved' | 'users' | 'approvals' | 'audit' | 'status' | 'password';
 
 const NAV: { view: View; label: string; permission?: Permission }[] = [
   { view: 'explorer', label: 'Editor SQL' },
   { view: 'history', label: 'Histórico' },
   { view: 'saved', label: 'Consultas salvas' },
   { view: 'users', label: 'Usuários', permission: 'ADMIN.USERS' },
+  { view: 'approvals', label: 'Aprovações', permission: 'APPROVAL.DECIDE' },
   { view: 'audit', label: 'Auditoria', permission: 'AUDIT.READ' },
   { view: 'status', label: 'Status' },
 ];
@@ -147,6 +150,7 @@ export function Layout({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: 
             {view === 'history' && <HistoryPage onOpen={openInEditor} />}
             {view === 'saved' && <SavedQueriesPage onOpen={openInEditor} />}
             {view === 'users' && allowed('users') && <UsersPage />}
+            {view === 'approvals' && allowed('approvals') && <ApprovalsPage />}
             {view === 'audit' && allowed('audit') && <AuditPage />}
             {view === 'status' && <StatusPage />}
             {view === 'password' && <ChangePasswordPage onDone={refresh} />}
