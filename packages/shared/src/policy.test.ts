@@ -3,10 +3,12 @@ import { PERMISSIONS, SYSTEM_ROLE_PERMISSIONS, type Permission } from './permiss
 import {
   DEFAULT_LIMITS,
   POLICY_ACTION_CLASS,
+  POLICY_HARD_MAX_LIMITS,
   evaluatePolicy,
   isPolicyWriteAction,
   policyVersion,
   sha256HexUtf8,
+  validatePolicyRule,
   type EffectiveLimits,
   type PolicyRequest,
   type PolicyRule,
@@ -707,6 +709,173 @@ const cases: Case[] = [
     rules: [rule({ id: 'cap', actions: ['DATA.*'], limits: { maxWriteRows: 5 } })],
     effect: 'ALLOW',
   },
+
+  // N1: entity names are at most SCHEMA.TABLE; ALLOW matches part by part.
+  {
+    name: 'R3: a three-part entity (another database) is malformed even under a scoped ALLOW',
+    request: update({
+      environment: 'SANDBOX',
+      entities: ['SANKHYA_PROD.dbo.TGFPAR'],
+      columns: [],
+    }),
+    rules: [rule({ ...allowUpdate, environments: ['SANDBOX'] })],
+    effect: 'DENY',
+    reason: /malformed request: entity SANKHYA_PROD\.dbo\.TGFPAR/,
+  },
+  {
+    name: 'R4: a four-part entity (linked server) is malformed even under ALLOW AD_*',
+    request: update({ entities: ['AD_LINK.db.dbo.TGFPAR'], columns: [] }),
+    rules: [rule({ ...allowUpdate, entities: ['AD_*'] })],
+    effect: 'DENY',
+    reason: /malformed request: entity/,
+  },
+  {
+    name: 'a three-part entity is malformed for a permission-only read too',
+    request: req({ entities: ['[other].[dbo].[TGFPAR]'] }),
+    rules: [],
+    effect: 'DENY',
+    reason: /malformed request: entity/,
+  },
+  {
+    name: 'R13: an entity with an empty part is malformed',
+    request: req({ entities: ['A..TGFPAR'] }),
+    rules: [],
+    effect: 'DENY',
+    reason: /malformed request: entity/,
+  },
+  {
+    name: 'R12: a quoted part hiding a dot is malformed',
+    request: req({ entities: ['"TGF.PAR"'] }),
+    rules: [],
+    effect: 'DENY',
+    reason: /malformed request: entity/,
+  },
+  {
+    name: 'an unbalanced quoted entity is malformed',
+    request: req({ entities: ['[TGFPAR'] }),
+    rules: [],
+    effect: 'DENY',
+    reason: /malformed request: entity/,
+  },
+  {
+    name: 'a three-part column table is malformed',
+    request: req({ columns: [{ table: 'db.dbo.TGFPAR', name: 'EMAIL' }] }),
+    rules: [],
+    effect: 'DENY',
+    reason: /malformed request: column/,
+  },
+  {
+    name: 'ALLOW X.TGFPAR does not cover an unqualified TGFPAR',
+    request: update({ columns: [] }),
+    rules: [rule({ ...allowUpdate, entities: ['X.TGFPAR'] })],
+    effect: 'DENY',
+    reason: /no ALLOW rule/,
+  },
+  {
+    name: 'ALLOW X.TGFPAR does not cover Y.TGFPAR',
+    request: update({ entities: ['Y.TGFPAR'], columns: [] }),
+    rules: [rule({ ...allowUpdate, entities: ['X.TGFPAR'] })],
+    effect: 'DENY',
+    reason: /no ALLOW rule/,
+  },
+  {
+    name: 'ALLOW SANKHYA.TGF* covers sankhya.TGFPAR part by part',
+    request: update({ entities: ['sankhya.TGFPAR'], columns: [] }),
+    rules: [rule({ ...allowUpdate, entities: ['SANKHYA.TGF*'] })],
+    effect: 'ALLOW',
+  },
+  {
+    name: 'ALLOW [sankhya].[tgfpar] covers SANKHYA.TGFPAR',
+    request: update({ entities: ['SANKHYA.TGFPAR'], columns: [] }),
+    rules: [rule({ ...allowUpdate, entities: ['[sankhya].[tgfpar]'] })],
+    effect: 'ALLOW',
+  },
+  {
+    name: 'an unqualified ALLOW covers the table part of a qualified entity',
+    request: update({ entities: ['dbo.TGFPAR'], columns: [] }),
+    rules: [allowUpdate],
+    effect: 'ALLOW',
+  },
+  {
+    name: 'ALLOW * does not cross a dot: SANKHYA* does not cover SANKHYA.TGFPAR',
+    request: update({ entities: ['SANKHYA.TGFPAR'], columns: [] }),
+    rules: [rule({ ...allowUpdate, entities: ['SANKHYA*'] })],
+    effect: 'DENY',
+    reason: /no ALLOW rule/,
+  },
+  {
+    name: 'an unqualified ALLOW *PAR does not match the schema part of XPAR.TGFCAB',
+    request: update({ entities: ['XPAR.TGFCAB'], columns: [] }),
+    rules: [rule({ ...allowUpdate, entities: ['*PAR'] })],
+    effect: 'DENY',
+    reason: /no ALLOW rule/,
+  },
+  {
+    name: 'a qualified column-scoped ALLOW matches the column table part by part',
+    request: update({
+      entities: ['dbo.TGFPAR'],
+      columns: [{ table: 'dbo.TGFPAR', name: 'NOMEPARC' }],
+    }),
+    rules: [rule({ ...allowUpdate, columns: ['X.TGFPAR.NOMEPARC'] })],
+    effect: 'DENY',
+    reason: /no ALLOW rule/,
+  },
+  {
+    name: 'a three-part rule entity pattern makes the rule invalid',
+    request: req(),
+    rules: [rule({ id: 'bad', effect: 'DENY', entities: ['db.dbo.TGFPAR'] })],
+    effect: 'DENY',
+    reason: /invalid rule bad/,
+  },
+  {
+    name: 'a rule entity pattern with an empty part makes the rule invalid',
+    request: req(),
+    rules: [rule({ id: 'bad', entities: ['dbo..TGFPAR'] })],
+    effect: 'DENY',
+    reason: /invalid rule bad/,
+  },
+  {
+    name: 'a column pattern with a three-part table makes the rule invalid',
+    request: req(),
+    rules: [rule({ id: 'bad', columns: ['db.dbo.TGFPAR.EMAIL'] })],
+    effect: 'DENY',
+    reason: /invalid rule bad/,
+  },
+  {
+    name: 'duplicate request entities are evaluated once',
+    request: update({ entities: ['TGFPAR', '[tgfpar]'], columns: [] }),
+    rules: [allowUpdate],
+    effect: 'ALLOW',
+  },
+
+  // N2: DENY stays broad, and a qualified DENY also hits an unqualified request name.
+  {
+    name: 'R6: DENY X.TGFPAR hits an unqualified TGFPAR',
+    request: req(),
+    rules: [rule({ id: 'deny-x', effect: 'DENY', entities: ['X.TGFPAR'] })],
+    effect: 'DENY',
+    reason: /denied by rule deny-x/,
+  },
+  {
+    name: 'DENY X.TGFPAR does not hit Y.TGFPAR',
+    request: req({ entities: ['Y.TGFPAR'] }),
+    rules: [rule({ id: 'deny-x', effect: 'DENY', entities: ['X.TGFPAR'] })],
+    effect: 'ALLOW',
+  },
+  {
+    name: 'DENY SANKHYA* still hits SANKHYA.TGFPAR (broad)',
+    request: req({ entities: ['SANKHYA.TGFPAR'] }),
+    rules: [rule({ id: 'deny-s', effect: 'DENY', entities: ['SANKHYA*'] })],
+    effect: 'DENY',
+    reason: /denied by rule deny-s/,
+  },
+  {
+    name: 'a qualified column DENY hits the column of an unqualified entity',
+    request: req({ columns: [{ table: 'TGFPAR', name: 'EMAIL' }] }),
+    rules: [rule({ id: 'deny-email', effect: 'DENY', columns: ['X.TGFPAR.EMAIL'] })],
+    effect: 'DENY',
+    reason: /denied by rule deny-email/,
+  },
 ];
 
 describe('evaluatePolicy', () => {
@@ -782,6 +951,39 @@ describe('evaluatePolicy', () => {
     );
     expect(capped.limits.maxReadRows).toBe(10);
     expect(capped.limits.maxWriteRows).toBe(200);
+  });
+
+  it('clamps configured defaults to the hard maxima', () => {
+    expect(POLICY_HARD_MAX_LIMITS).toEqual({ maxReadRows: 100000, maxWriteRows: 1000 });
+    const huge = { maxReadRows: 1e9, maxWriteRows: 1e9 };
+    const d = evaluatePolicy(update(), [allowUpdate], ALL, { defaults: huge });
+    expect(d.limits.maxReadRows).toBe(100000);
+    expect(d.limits.maxWriteRows).toBe(1000);
+    const atMax = evaluatePolicy(update(), [allowUpdate], ALL, {
+      defaults: { maxReadRows: 100000, maxWriteRows: 1000 },
+    });
+    expect(atMax.limits.maxReadRows).toBe(100000);
+    expect(atMax.limits.maxWriteRows).toBe(1000);
+  });
+
+  it('rules still lower clamped defaults, and cannot raise them past the clamp', () => {
+    const huge = { maxReadRows: 1e9, maxWriteRows: 1e9 };
+    const lowered = evaluatePolicy(
+      update(),
+      [rule({ ...allowUpdate, limits: { maxReadRows: 300, maxWriteRows: 7 } })],
+      ALL,
+      { defaults: huge },
+    );
+    expect(lowered.limits.maxReadRows).toBe(300);
+    expect(lowered.limits.maxWriteRows).toBe(7);
+    const raised = evaluatePolicy(
+      update(),
+      [rule({ ...allowUpdate, limits: { maxReadRows: 1e9, maxWriteRows: 1e9 } })],
+      ALL,
+      { defaults: huge },
+    );
+    expect(raised.limits.maxReadRows).toBe(100000);
+    expect(raised.limits.maxWriteRows).toBe(1000);
   });
 
   it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, '10', null])(
@@ -907,6 +1109,57 @@ describe('evaluatePolicy', () => {
     const snapshot = JSON.stringify(rules);
     evaluatePolicy(update({ environment: 'PRODUCTION' }), rules, ALL);
     expect(JSON.stringify(rules)).toBe(snapshot);
+  });
+});
+
+describe('validatePolicyRule', () => {
+  it('returns no problems for a valid rule', () => {
+    expect(validatePolicyRule(allowUpdate)).toEqual([]);
+    expect(
+      validatePolicyRule(
+        rule({ id: 'q', entities: ['[dbo].[TGF*]'], columns: ['dbo.TGFPAR.EMAIL', 'NOME*'] }),
+      ),
+    ).toEqual([]);
+  });
+
+  it('lists every problem of an invalid rule', () => {
+    const bad = {
+      ...rule({ id: 'bad' }),
+      effect: 'MAYBE',
+      actions: ['DATA.UPDTE'],
+      entities: ['db.dbo.TGFPAR'],
+      limits: { maxWriteRows: -1, bogus: true },
+    } as unknown as PolicyRule;
+    const problems = validatePolicyRule(bad);
+    expect(problems).toHaveLength(5);
+    expect(problems.join('\n')).toMatch(/effect/);
+    expect(problems.join('\n')).toMatch(/DATA\.UPDTE/);
+    expect(problems.join('\n')).toMatch(/db\.dbo\.TGFPAR/);
+    expect(problems.join('\n')).toMatch(/maxWriteRows/);
+    expect(problems.join('\n')).toMatch(/bogus/);
+  });
+
+  it('validates disabled rules too, and never throws', () => {
+    expect(validatePolicyRule({ ...rule({ id: 'off', actions: [] }), enabled: false })).toEqual([
+      expect.stringMatching(/actions/),
+    ]);
+    expect(validatePolicyRule(null)).toEqual(['not an object']);
+    expect(validatePolicyRule([])).toEqual(['not an object']);
+    const hostile = new Proxy(
+      {},
+      {
+        getOwnPropertyDescriptor() {
+          throw new Error('boom');
+        },
+      },
+    );
+    expect(validatePolicyRule(hostile)).toEqual(['rule could not be read']);
+  });
+
+  it('agrees with evaluatePolicy: an invalid enabled rule denies everything', () => {
+    const bad = rule({ id: 'bad', entities: ['a.b.c'] });
+    expect(validatePolicyRule(bad)).not.toEqual([]);
+    expect(evaluatePolicy(req(), [bad], ALL).reasons.join('\n')).toMatch(/invalid rule bad/);
   });
 });
 

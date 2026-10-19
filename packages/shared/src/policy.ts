@@ -9,15 +9,26 @@
  * - Anything unknown is denied (fail closed): an unknown action or environment, a malformed
  *   request, a malformed enabled rule, or any error while evaluating returns DENY, never throws.
  * - Only own properties of rules and limits are read, so prototype pollution cannot inject them.
+ * - Scope: only callers of `evaluatePolicy` are policy-evaluated. `ADMIN.*` and `AUDIT.READ`
+ *   checks are RBAC-only and never routed here, so an invalid rule (which denies everything here)
+ *   cannot lock administrators out of fixing it. Use `validatePolicyRule` on save and at startup.
  *
  * Normalization and matching:
  * - Ids (`userId`, `groupIds`, `connectionId`, rule `subjectId` and `connectionIds`) are trimmed
  *   and lower-cased, then compared exactly. Environments and actions are exact catalog values.
- * - Entity names: each dot-separated segment is trimmed and stripped of `"…"` or `[…]` quoting,
- *   then upper-cased. A rule entity pattern matches when it matches the full dotted name OR its
- *   last segment, so `TGFPAR` hits `SANKHYA.TGFPAR`, `dbo.TGFPAR`, `"TGFPAR"` and `[TGFPAR]`.
- *   Callers pass resolved base table names, not views, aliases or synonyms.
+ * - Entity names are `TABLE` or `SCHEMA.TABLE`: each part is trimmed, stripped of `"…"` or
+ *   `[…]` quoting and upper-cased. A request entity with more than two parts (another database
+ *   or a linked server), an empty part, or a quoted part hiding a dot or quote is malformed (DENY).
+ *   Rule entity patterns follow the same shape, or the rule is invalid. Callers pass resolved base
+ *   table names, not views, aliases or synonyms.
+ * - ALLOW matching is strict and part-wise: an unqualified pattern matches the table part only
+ *   (`TGFPAR` covers `TGFPAR` and `dbo.TGFPAR`); a qualified one matches schema and table part
+ *   by part (`SANKHYA.TGF*` covers `sankhya.TGFPAR`, not `TGFPAR` or `dbo.TGFPAR`).
+ * - DENY matching is broad (fail closed): anything ALLOW would match, plus the pattern against the
+ *   full name, and a qualified pattern's table part against an unqualified entity, so DENY
+ *   `X.TGFPAR` also hits a plain `TGFPAR`.
  * - Patterns are case-insensitive globs where `*` is any run of characters (`TGF*` hits `TGFPAR`).
+ *   In ALLOW matching `*` never crosses a dot, since it is applied per part.
  * - A rule matches only when `enabled === true`. Disabled rules are ignored, even malformed ones.
  * - Subject: `user` matches `subjectId === userId`, `group` matches a `groupIds` entry,
  *   `everyone` matches anyone.
@@ -51,7 +62,8 @@
  *    on every entity it matches. Scope such rules carefully.
  * 4. Limits combine over the matching ALLOW rules (any overlap) to the most restrictive. Row
  *    limits are min(ceiling, every rule value): the rule-7 defaults (or `options.defaults`) are
- *    ceilings that rules can only lower. Flags are OR-ed; `requirePreview` and
+ *    ceilings that rules can only lower. `options.defaults` is trusted operator configuration and
+ *    may raise the ceilings, but never above `POLICY_HARD_MAX_LIMITS`. Flags are OR-ed; `requirePreview` and
  *    `requireConfirmation` are always true.
  * 5. In PRODUCTION a write forces `requireConfirmation` and `requireStrongConfirmation`.
  * 6. UPDATE/DELETE without WHERE: DENY, unless one matching ALLOW rule with
@@ -134,8 +146,9 @@ export interface EvaluateOptions {
   /** A version already computed with `policyVersion(policies)`, to skip rehashing per call. */
   policyVersion?: string;
   /**
-   * Row-limit ceilings replacing the rule-7 defaults (from configuration). Each must be a
-   * positive safe integer; an invalid value falls back to the rule-7 default.
+   * Row-limit ceilings replacing the rule-7 defaults (trusted operator configuration). Each must be
+   * a positive safe integer and is clamped to `POLICY_HARD_MAX_LIMITS`; an invalid value falls
+   * back to the rule-7 default. Rules can still only lower the result.
    */
   defaults?: Partial<Pick<EffectiveLimits, 'maxReadRows' | 'maxWriteRows'>>;
 }
@@ -187,8 +200,19 @@ type FlagLimit = (typeof FLAG_LIMITS)[number];
 const PERMISSION_SET: ReadonlySet<string> = new Set(PERMISSIONS);
 const ENVIRONMENT_SET: ReadonlySet<string> = new Set(ENVIRONMENTS);
 
+/**
+ * Hard maxima for `options.defaults`. Operator configuration is trusted to set the ceilings, but
+ * never above these; rules can still only lower the result.
+ */
+export const POLICY_HARD_MAX_LIMITS: Readonly<Pick<EffectiveLimits, RowLimit>> = Object.freeze({
+  maxReadRows: 100000,
+  maxWriteRows: 1000,
+});
+
+/** A parsed, upper-cased name of one or two parts (`TABLE` or `SCHEMA.TABLE`). */
 interface Entity {
   full: string;
+  parts: string[];
   last: string;
 }
 interface Column {
@@ -196,7 +220,7 @@ interface Column {
   name: string;
 }
 interface ColumnPattern {
-  table: string | null;
+  table: string[] | null;
   name: string;
 }
 interface CompiledRule {
@@ -208,7 +232,7 @@ interface CompiledRule {
   environments: string[];
   connectionIds: string[];
   actions: string[];
-  entities: string[];
+  entities: string[][];
   columns: ColumnPattern[];
   rows: Partial<Record<RowLimit, number>>;
   flags: Partial<Record<FlagLimit, boolean>>;
@@ -244,6 +268,19 @@ export function evaluatePolicy(
       limits: { ...DEFAULT_LIMITS },
       policyVersion: version,
     };
+  }
+}
+
+/**
+ * The problems that make a rule invalid; empty when it is valid. `evaluatePolicy` denies every
+ * request while any ENABLED rule is invalid, so callers should run this when a rule is saved
+ * (reject it) and over the stored rules at startup (report them).
+ */
+export function validatePolicyRule(rule: unknown): string[] {
+  try {
+    return compileRule(rule).problems;
+  } catch {
+    return ['rule could not be read'];
   }
 }
 
@@ -290,9 +327,9 @@ function evaluate(
       continue;
     }
     if (readOwn(raw, 'enabled') !== true) continue;
-    const compiled = compileRule(raw);
-    if (compiled) rules.push(compiled);
-    else invalid.push(`invalid rule ${describeId(raw)}`);
+    const { rule, problems } = compileRule(raw);
+    if (rule) rules.push(rule);
+    else invalid.push(`invalid rule ${describeId(raw)}: ${problems.join('; ')}`);
   }
   if (invalid.length > 0) return deny(...invalid);
 
@@ -362,13 +399,16 @@ function isPositiveSafeInteger(v: unknown): v is number {
   return typeof v === 'number' && Number.isSafeInteger(v) && v > 0;
 }
 
+/** Configured ceilings: positive safe integers clamped to the hard maxima, else rule 7. */
 function resolveCeilings(defaults: unknown): Pick<EffectiveLimits, RowLimit> {
-  const read = readOwn(defaults, 'maxReadRows');
-  const write = readOwn(defaults, 'maxWriteRows');
-  return {
-    maxReadRows: isPositiveSafeInteger(read) ? read : DEFAULT_LIMITS.maxReadRows,
-    maxWriteRows: isPositiveSafeInteger(write) ? write : DEFAULT_LIMITS.maxWriteRows,
-  };
+  const out = { ...POLICY_HARD_MAX_LIMITS };
+  for (const key of ROW_LIMITS) {
+    const v = readOwn(defaults, key);
+    out[key] = isPositiveSafeInteger(v)
+      ? Math.min(v, POLICY_HARD_MAX_LIMITS[key])
+      : DEFAULT_LIMITS[key];
+  }
+  return out;
 }
 
 function describeId(r: object): string {
@@ -378,21 +418,49 @@ function describeId(r: object): string {
 
 const normalizeId = (s: string): string => s.trim().toLowerCase();
 
-function unquote(segment: string): string {
-  const s = segment.trim();
-  if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) return s.slice(1, -1).trim();
-  if (s.length >= 2 && s.startsWith('[') && s.endsWith(']')) return s.slice(1, -1).trim();
-  return s;
-}
-
-function normalizeEntity(name: string): Entity {
-  const segments = name.split('.').map((s) => unquote(s).toUpperCase());
-  return { full: segments.join('.'), last: segments[segments.length - 1]! };
-}
-
 function isNonEmptyString(v: unknown): v is string {
   return typeof v === 'string' && v.trim() !== '';
 }
+
+/**
+ * Splits a dotted name into upper-cased parts, honouring `"…"` and `[…]` quoting (so a quoted
+ * part may not hide a dot). Returns null for an empty part, unbalanced quoting or stray quote
+ * characters.
+ */
+function parseName(name: string): string[] | null {
+  const parts: string[] = [];
+  let i = 0;
+  for (;;) {
+    while (name[i] === ' ') i++;
+    let part: string;
+    const open = name[i];
+    if (open === '"' || open === '[') {
+      const close = open === '"' ? '"' : ']';
+      const end = name.indexOf(close, i + 1);
+      if (end < 0) return null;
+      part = name.slice(i + 1, end).trim();
+      i = end + 1;
+      while (name[i] === ' ') i++;
+    } else {
+      const dot = name.indexOf('.', i);
+      const end = dot < 0 ? name.length : dot;
+      part = name.slice(i, end).trim();
+      i = end;
+    }
+    if (part === '' || /["[\].]/.test(part)) return null;
+    parts.push(part.toUpperCase());
+    if (i >= name.length) return parts;
+    if (name[i] !== '.') return null;
+    i++;
+  }
+}
+
+function toEntity(parts: string[]): Entity {
+  return { full: parts.join('.'), parts, last: parts[parts.length - 1]! };
+}
+
+const sameParts = (a: string[], b: string[]): boolean =>
+  a.length === b.length && a.every((p, i) => p === b[i]);
 
 /** Validates and normalizes a request; returns the reason when it is malformed. */
 function normalizeRequest(req: PolicyRequest): NormalizedRequest | string {
@@ -407,8 +475,15 @@ function normalizeRequest(req: PolicyRequest): NormalizedRequest | string {
   if (!Array.isArray(groupIds) || !groupIds.every(isNonEmptyString)) return 'groupIds';
   if (!Array.isArray(entities) || !entities.every(isNonEmptyString)) return 'entities';
   if (typeof hasWhere !== 'boolean') return 'hasWhere';
-  const ents = entities.map(normalizeEntity);
-  if (ents.some((e) => e.last === '')) return 'entities';
+
+  // At most SCHEMA.TABLE: three- and four-part names reach other databases or linked servers.
+  const ents: Entity[] = [];
+  for (const name of entities) {
+    const parts = parseName(name);
+    if (!parts || parts.length > 2) return `entity ${name}`;
+    const entity = toEntity(parts);
+    if (!ents.some((e) => e.full === entity.full)) ents.push(entity);
+  }
 
   let cols: Column[];
   if (columns === undefined) {
@@ -420,19 +495,21 @@ function normalizeRequest(req: PolicyRequest): NormalizedRequest | string {
       const table = readOwn(c, 'table');
       const name = readOwn(c, 'name');
       if (!isNonEmptyString(table) || !isNonEmptyString(name)) return 'columns';
-      const t = normalizeEntity(table);
-      // A column belongs to the entities it names: by full name, or by last segment when the
-      // column's table is unqualified. Anything else cannot be attributed and fails closed.
+      const t = parseName(table);
+      const n = parseName(name);
+      if (!t || t.length > 2 || !n || n.length !== 1) return `column ${table}.${name}`;
+      // A column belongs to the entities it names: same parts, or one side unqualified with the
+      // same table. Anything else cannot be attributed and fails closed.
       const owners = ents.filter(
         (e) =>
-          e.full === t.full ||
-          (!t.full.includes('.') && e.last === t.full) ||
-          (!e.full.includes('.') && t.last === e.full),
+          sameParts(e.parts, t) ||
+          (t.length === 1 && e.last === t[0]) ||
+          (e.parts.length === 1 && t[t.length - 1] === e.last),
       );
-      if (owners.length === 0)
+      if (owners.length === 0) {
         return `column ${table}.${name} is not attributed to a request entity`;
-      const n = unquote(name).toUpperCase();
-      for (const entity of owners) cols.push({ entity, name: n });
+      }
+      for (const entity of owners) cols.push({ entity, name: n[0]! });
     }
   }
   return {
@@ -455,8 +532,14 @@ function isValidAction(pattern: string): boolean {
   return PERMISSIONS.some((p) => glob(pattern, p));
 }
 
-/** Validates a rule from its own properties and compiles it, or returns null when invalid. */
-function compileRule(r: object): CompiledRule | null {
+/** Validates a rule from its own properties and compiles it; `rule` is null when invalid. */
+function compileRule(r: unknown): { rule: CompiledRule | null; problems: string[] } {
+  const problems: string[] = [];
+  const fail = () => ({ rule: null, problems });
+  if (typeof r !== 'object' || r === null || Array.isArray(r)) {
+    problems.push('not an object');
+    return fail();
+  }
   const id = readOwn(r, 'id');
   const name = readOwn(r, 'name');
   const effect = readOwn(r, 'effect');
@@ -469,67 +552,96 @@ function compileRule(r: object): CompiledRule | null {
   const columns = readOwn(r, 'columns');
   const limits = readOwn(r, 'limits');
   const override = readOwn(r, 'overrideWhereRequired');
+  const enabled = readOwn(r, 'enabled');
 
-  if (!isNonEmptyString(id) || typeof name !== 'string') return null;
-  if (effect !== 'ALLOW' && effect !== 'DENY') return null;
-  let subject = '';
+  if (!isNonEmptyString(id)) problems.push('id must be a non-empty string');
+  if (typeof name !== 'string') problems.push('name must be a string');
+  if (effect !== 'ALLOW' && effect !== 'DENY') problems.push('effect must be ALLOW or DENY');
   if (subjectType === 'user' || subjectType === 'group') {
-    if (!isNonEmptyString(subjectId)) return null;
-    subject = normalizeId(subjectId);
+    if (!isNonEmptyString(subjectId)) problems.push(`subjectId is required for ${subjectType}`);
   } else if (subjectType !== 'everyone') {
-    return null;
+    problems.push('subjectType must be user, group or everyone');
   }
   if (!isPatternList(environments) || !environments.every((e) => ENVIRONMENT_SET.has(e))) {
-    return null;
+    problems.push(`environments must list only ${ENVIRONMENTS.join(', ')}`);
   }
-  // Ids are trimmed and lower-cased like the request's; patterns must be exact (no padding).
-  if (!Array.isArray(connectionIds) || !connectionIds.every(isNonEmptyString)) return null;
-  if (!isPatternList(actions) || actions.length === 0 || !actions.every(isValidAction)) {
-    return null;
+  // Ids are trimmed and lower-cased like the request's.
+  if (!Array.isArray(connectionIds) || !connectionIds.every(isNonEmptyString)) {
+    problems.push('connectionIds must be non-empty strings');
   }
-  if (!isPatternList(entities) || !isPatternList(columns)) return null;
-  if (typeof override !== 'boolean') return null;
-  if (typeof limits !== 'object' || limits === null || Array.isArray(limits)) return null;
+  if (!isPatternList(actions) || actions.length === 0) {
+    problems.push('actions must be a non-empty list without padding');
+  } else {
+    const unknown = actions.filter((a) => !isValidAction(a));
+    if (unknown.length > 0) problems.push(`unknown actions: ${unknown.join(', ')}`);
+  }
+  const entityPatterns: string[][] = [];
+  if (!isPatternList(entities)) {
+    problems.push('entities must be patterns without padding');
+  } else {
+    for (const e of entities) {
+      const parts = parseName(e);
+      if (!parts || parts.length > 2) problems.push(`invalid entity pattern ${e}`);
+      else entityPatterns.push(parts);
+    }
+  }
+  const columnPatterns: ColumnPattern[] = [];
+  if (!isPatternList(columns)) {
+    problems.push('columns must be patterns without padding');
+  } else {
+    for (const c of columns) {
+      const parts = parseName(c);
+      if (!parts || parts.length > 3) problems.push(`invalid column pattern ${c}`);
+      else {
+        columnPatterns.push({
+          table: parts.length === 1 ? null : parts.slice(0, -1),
+          name: parts[parts.length - 1]!,
+        });
+      }
+    }
+  }
+  if (typeof override !== 'boolean') problems.push('overrideWhereRequired must be a boolean');
+  if (typeof enabled !== 'boolean') problems.push('enabled must be a boolean');
 
   const rows: CompiledRule['rows'] = {};
   const flags: CompiledRule['flags'] = {};
-  for (const key of Object.keys(limits)) {
-    const value = readOwn(limits, key);
-    if (value === undefined) continue;
-    if ((ROW_LIMITS as readonly string[]).includes(key)) {
-      if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) return null;
-      rows[key as RowLimit] = value;
-    } else if ((FLAG_LIMITS as readonly string[]).includes(key)) {
-      if (typeof value !== 'boolean') return null;
-      flags[key as FlagLimit] = value;
-    } else {
-      return null;
+  if (typeof limits !== 'object' || limits === null || Array.isArray(limits)) {
+    problems.push('limits must be an object');
+  } else {
+    for (const key of Object.keys(limits)) {
+      const value = readOwn(limits, key);
+      if (value === undefined) continue;
+      if ((ROW_LIMITS as readonly string[]).includes(key)) {
+        if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+          problems.push(`${key} must be a non-negative integer`);
+        } else rows[key as RowLimit] = value;
+      } else if ((FLAG_LIMITS as readonly string[]).includes(key)) {
+        if (typeof value !== 'boolean') problems.push(`${key} must be a boolean`);
+        else flags[key as FlagLimit] = value;
+      } else {
+        problems.push(`unknown limit ${key}`);
+      }
     }
   }
 
-  const columnPatterns: ColumnPattern[] = [];
-  for (const c of columns) {
-    const dot = c.lastIndexOf('.');
-    const table = dot < 0 ? null : c.slice(0, dot);
-    const col = unquote(dot < 0 ? c : c.slice(dot + 1)).toUpperCase();
-    if (col === '' || table === '') return null;
-    columnPatterns.push({ table, name: col });
-  }
-
+  if (problems.length > 0) return fail();
   return {
-    id,
-    name,
-    effect,
-    subjectType,
-    subjectId: subject,
-    environments,
-    connectionIds: connectionIds.map(normalizeId),
-    actions,
-    entities,
-    columns: columnPatterns,
-    rows,
-    flags,
-    overrideWhereRequired: override,
+    problems,
+    rule: {
+      id: id as string,
+      name: name as string,
+      effect: effect as PolicyEffect,
+      subjectType: subjectType as PolicySubjectType,
+      subjectId: subjectType === 'everyone' ? '' : normalizeId(subjectId as string),
+      environments: environments as string[],
+      connectionIds: (connectionIds as string[]).map(normalizeId),
+      actions: actions as string[],
+      entities: entityPatterns,
+      columns: columnPatterns,
+      rows,
+      flags,
+      overrideWhereRequired: override as boolean,
+    },
   };
 }
 
@@ -545,37 +657,64 @@ function matchesContext(r: CompiledRule, req: NormalizedRequest): boolean {
   return r.actions.some((a) => glob(a, req.action));
 }
 
-function entityPatternHit(pattern: string, e: Entity): boolean {
-  const p = normalizeEntity(pattern).full;
-  return glob(p, e.full) || glob(p, e.last);
+/**
+ * ALLOW (strict, part-wise): an unqualified pattern matches the table part only; a qualified one
+ * matches schema and table part by part. `*` never crosses a dot.
+ */
+function allowHit(p: string[], e: Entity): boolean {
+  if (p.length === 1) return glob(p[0]!, e.last);
+  return e.parts.length === 2 && glob(p[0]!, e.parts[0]!) && glob(p[1]!, e.last);
 }
 
-function entityMatches(r: CompiledRule, e: Entity): boolean {
-  return r.entities.length === 0 || r.entities.some((p) => entityPatternHit(p, e));
+/**
+ * DENY (broad, fails closed): anything ALLOW would match, plus the pattern against the full name
+ * (`*` may cross the dot), and a qualified pattern's table part against an unqualified entity.
+ */
+function denyHit(p: string[], e: Entity): boolean {
+  const full = p.join('.');
+  return (
+    allowHit(p, e) ||
+    glob(full, e.full) ||
+    glob(full, e.last) ||
+    (e.parts.length === 1 && glob(p[p.length - 1]!, e.last))
+  );
 }
 
-function columnHit(p: ColumnPattern, col: Column, wildcardHits: boolean): boolean {
-  if (p.table !== null && !entityPatternHit(p.table, col.entity)) return false;
+type Hit = (p: string[], e: Entity) => boolean;
+
+function hitFor(r: CompiledRule): Hit {
+  return r.effect === 'DENY' ? denyHit : allowHit;
+}
+
+function entityMatches(r: CompiledRule, e: Entity, hit: Hit): boolean {
+  return r.entities.length === 0 || r.entities.some((p) => hit(p, e));
+}
+
+function columnHit(p: ColumnPattern, col: Column, hit: Hit, wildcardHits: boolean): boolean {
+  if (p.table !== null && !hit(p.table, col.entity)) return false;
   if (col.name === '*') return wildcardHits;
   return glob(p.name, col.name);
 }
 
-/** Whether a rule touches any part of the request (used by DENY and for limits). */
+/** Whether a rule touches any part of the request (DENY, and ALLOW limits). */
 function overlaps(r: CompiledRule, req: NormalizedRequest): boolean {
+  const hit = hitFor(r);
   if (r.columns.length === 0) {
-    return r.entities.length === 0 || req.entities.some((e) => entityMatches(r, e));
+    return r.entities.length === 0 || req.entities.some((e) => entityMatches(r, e, hit));
   }
   return req.columns.some(
-    (c) => entityMatches(r, c.entity) && r.columns.some((p) => columnHit(p, c, true)),
+    (c) => entityMatches(r, c.entity, hit) && r.columns.some((p) => columnHit(p, c, hit, true)),
   );
 }
 
 /** Whether an ALLOW rule fully grants the action on one entity (used for writes). */
 function covers(r: CompiledRule, entity: Entity, req: NormalizedRequest): boolean {
-  if (!entityMatches(r, entity)) return false;
+  if (!entityMatches(r, entity, allowHit)) return false;
   if (r.columns.length === 0) return true;
   const cols = req.columns.filter((c) => c.entity === entity);
-  return cols.length > 0 && cols.every((c) => r.columns.some((p) => columnHit(p, c, false)));
+  return (
+    cols.length > 0 && cols.every((c) => r.columns.some((p) => columnHit(p, c, allowHit, false)))
+  );
 }
 
 /** Case-insensitive glob where `*` matches any run of characters, including none. */
