@@ -114,14 +114,18 @@ export async function runAdminCli(argv: readonly string[], deps: AdminCliDeps): 
       return 1;
     }
     const password = generateOneTimePassword();
-    await users.setPassword(user.id, password, true);
-    await users.revokeSessions(user.id);
-    await new AuditService(database.db, createRedactor(secretValues(config))).record({
-      action: 'user.password_reset',
-      status: 'success',
-      userId: user.id,
-      userEmail: user.email,
-      details: { via: 'cli' },
+    // One transaction: a failed audit write leaves the old password and sessions untouched.
+    await database.db.transaction(async (tx) => {
+      const txUsers = new UsersService(tx, new AuthzService(tx));
+      await txUsers.setPassword(user.id, password, true);
+      await txUsers.revokeSessions(user.id);
+      await new AuditService(tx, createRedactor(secretValues(config))).record({
+        action: 'user.password_reset',
+        status: 'success',
+        userId: user.id,
+        userEmail: user.email,
+        details: { via: 'cli' },
+      });
     });
     stderr(
       `Password of ${user.email} reset; its sessions were revoked.\n` +

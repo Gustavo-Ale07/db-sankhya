@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { sql } from 'drizzle-orm';
 import { auditEvents, createDatabase } from '@dbx/database';
 import type { DatabaseHandle } from '@dbx/database';
 import { isWeakPassword, loadConfig } from '../config';
@@ -97,6 +98,24 @@ describe('admin CLI', () => {
     expect(await checkLocalPassword(after!, r.password!)).toBe(true);
     expect(await checkLocalPassword(after!, STRONG)).toBe(false);
     expect(await sessions.resolve(token)).toBeNull();
+  });
+
+  it('reset-password changes nothing when the audit write fails', async () => {
+    const u = await users.create({
+      email: 'bia@example.com',
+      name: 'Bia',
+      password: STRONG,
+      roles: ['ADMIN'],
+    });
+    const sessions = new SessionsService(database.db, 12);
+    const { token } = await sessions.create(u.id, { ip: '127.0.0.1' });
+    await database.db.execute(sql`alter table audit_events rename to audit_events_off`);
+
+    await expect(cli(['reset-password', '--email', 'bia@example.com'])).rejects.toThrow();
+    const after = await users.findByEmail('bia@example.com');
+    expect(after).toMatchObject({ mustChangePassword: false });
+    expect(await checkLocalPassword(after!, STRONG)).toBe(true);
+    expect(await sessions.resolve(token)).not.toBeNull();
   });
 
   it('reset-password fails for an unknown e-mail, and unknown commands print usage', async () => {

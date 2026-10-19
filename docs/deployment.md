@@ -53,7 +53,8 @@ There is no default password. Pick one of two ways:
   ```
 
   The token works once. An expired token gets `410`; restart the app to issue a new one. Once any
-  user exists the endpoint answers `404`.
+  user exists, or while no token is pending, the endpoint answers `404`. A consumed or expired
+  token left in the logs is harmless: it can no longer create an account.
 
 - **Admin CLI**. Set `BOOTSTRAP_ADMIN_EMAIL` (no token is issued then) and run:
 

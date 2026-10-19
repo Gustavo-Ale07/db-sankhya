@@ -111,8 +111,12 @@ describe('bootstrap token', () => {
   it('issues no token when BOOTSTRAP_ADMIN_EMAIL selects the CLI path or users exist', async () => {
     const cli = await setup({ BOOTSTRAP_ADMIN_EMAIL: 'admin@example.com' });
     const silent = pino({ level: 'silent' });
+    // A token left by an earlier boot without BOOTSTRAP_ADMIN_EMAIL is discarded.
+    const stale = await cli.issue();
     expect((await announceBootstrap(cli.app.services, silent)).status).toBe('cli');
     expect(await cli.database.db.select().from(bootstrapTokens)).toHaveLength(0);
+    const res = await cli.post({ token: stale, email: 'a@example.com', password: STRONG });
+    expect(res.statusCode).toBe(404);
 
     const h = await setup();
     await h.app.services.users.create({
@@ -184,6 +188,20 @@ describe('bootstrap token', () => {
     );
   });
 
+  it('returns 404 while no token is pending, without revealing the route', async () => {
+    const h = await setup();
+    const res = await h.post({ token: 'anything', email: 'a@example.com', password: STRONG });
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error).toMatchObject({ code: 'NOT_FOUND', message: 'Route not found' });
+    const unknown = await h.app.inject({
+      method: 'POST',
+      url: '/api/auth/nope',
+      headers: { origin: ORIGIN },
+      payload: {},
+    });
+    expect(res.json().error.message).toBe(unknown.json().error.message);
+  });
+
   it('returns 404 once any user exists', async () => {
     const h = await setup();
     const token = await h.issue();
@@ -223,6 +241,7 @@ describe('bootstrap token', () => {
 
   it('is rate limited like login', async () => {
     const h = await setup();
+    await h.issue();
     const codes: number[] = [];
     for (let i = 0; i < 11; i++) {
       codes.push(

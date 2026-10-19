@@ -8,9 +8,11 @@ import { defineConfig, devices } from '@playwright/test';
 // STATIC_DIR, with the in-process mock Sankhya gateway (fictitious data) and a fresh PGlite
 // directory. There is no default password: start-server.mjs creates the administrator with the
 // admin CLI (dist/admin.mjs) and saves its one-time password for the tests.
-const PORT = 3199;
+// E2E_PORT lets two runs work side by side; each port gets its own data directory.
+const PORT = Number(process.env.E2E_PORT ?? 3199);
 const root = (p: string) => fileURLToPath(new URL(p, import.meta.url));
-const E2E_DIR = join(tmpdir(), 'dbx-e2e');
+// Same derivation as start-server.mjs (from PORT); keep the two in sync.
+const E2E_DIR = join(tmpdir(), `dbx-e2e-${PORT}`);
 const PASSWORD_FILE = join(E2E_DIR, 'bootstrap-password.txt');
 
 export const BOOTSTRAP = {
@@ -52,8 +54,6 @@ export default defineConfig({
       NODE_ENV: 'test',
       PORT: String(PORT),
       APP_URL: `http://localhost:${PORT}`,
-      DATABASE_URL: `pglite:${join(E2E_DIR, 'db')}`,
-      E2E_PASSWORD_FILE: PASSWORD_FILE,
       STATIC_DIR: root('../apps/web/dist'),
       AUTH_SECRET: 'e2e-only-session-secret-0123456789abcdef',
       // Read by the admin CLI (the first administrator); no bootstrap token is issued.

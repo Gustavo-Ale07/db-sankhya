@@ -87,6 +87,11 @@ export class BootstrapService {
     });
   }
 
+  /** Discards every pending token (the CLI path is configured). */
+  async discardTokens(): Promise<void> {
+    await this.db.delete(bootstrapTokens);
+  }
+
   /**
    * Creates the first administrator with a bootstrap token. One transaction deletes the token
    * and creates the user, so parallel requests cannot create two administrators.
@@ -113,9 +118,12 @@ export class BootstrapService {
         if (used) throw new AppError('CONFIRMATION_USED', 'This bootstrap token was already used');
         throw new AppError('NOT_FOUND', 'Route not found');
       }
+      const rows = await tx.select().from(bootstrapTokens);
+      // No token pending: answer like an unknown route, so the endpoint is not revealed.
+      if (rows.length === 0) throw new AppError('NOT_FOUND', 'Route not found');
       // Every stored hash is compared in constant time; there is normally a single one.
       let match: typeof bootstrapTokens.$inferSelect | undefined;
-      for (const row of await tx.select().from(bootstrapTokens)) {
+      for (const row of rows) {
         if (safeEqual(row.tokenHash, tokenHash)) match = row;
       }
       if (!match) throw new AppError('CONFIRMATION_INVALID', 'Invalid bootstrap token');
@@ -241,6 +249,8 @@ export async function announceBootstrap(
 ): Promise<IssueResult | { status: 'cli' }> {
   const email = services.config.bootstrapAdmin.email;
   if (email) {
+    // With the CLI path selected, a token left by an earlier boot must not stay usable.
+    await services.bootstrap.discardTokens();
     if ((await services.users.count()) === 0) {
       log.warn(
         { email },
