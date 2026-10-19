@@ -7,9 +7,17 @@ import { checkLocalPassword } from '../services/identity';
 import { toPublicUser } from '../services/users';
 import { clientIp, noStore, parseBody, requireAuth } from '../http';
 
+// NUL breaks PostgreSQL text and no valid address holds a control character.
+// eslint-disable-next-line no-control-regex -- control characters are exactly what is refused.
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/;
+
 const loginBody = z
   .object({
-    email: z.string().trim().max(254),
+    email: z
+      .string()
+      .trim()
+      .max(254)
+      .refine((s) => !CONTROL_CHARS.test(s), 'E-mail must not contain control characters'),
     password: z.string().min(1).max(512),
   })
   .strict();
@@ -59,10 +67,29 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
   app.post('/api/auth/login', { config: LOGIN_RATE_LIMIT }, async (request, reply) => {
     noStore(reply);
-    const body = parseBody(loginBody, request.body);
+    const ip = clientIp(request);
+    let body: z.output<typeof loginBody>;
+    try {
+      body = parseBody(loginBody, request.body);
+    } catch (err) {
+      // A refused login attempt that names an e-mail is still a failed login: audit it (the
+      // audit service makes the text storable) before answering with the validation error.
+      const raw = (request.body as { email?: unknown } | null | undefined)?.email;
+      if (typeof raw === 'string') {
+        await audit.record({
+          action: 'auth.login_failed',
+          status: 'denied',
+          userEmail: raw.trim().toLowerCase().slice(0, 254),
+          ip,
+          requestId: request.id,
+          errorCode: 'VALIDATION_ERROR',
+          details: { reason: 'invalid_request' },
+        });
+      }
+      throw err;
+    }
     const email = body.email.toLowerCase();
     const user = await users.findByEmail(email);
-    const ip = clientIp(request);
     const fail = async (code: 'INVALID_CREDENTIALS' | 'ACCOUNT_LOCKED', reason: string) => {
       await audit.record({
         action: 'auth.login_failed',

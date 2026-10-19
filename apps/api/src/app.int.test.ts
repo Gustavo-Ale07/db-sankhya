@@ -218,6 +218,31 @@ describe('authentication', () => {
     expect(codeOf(unknown)).toBe('INVALID_CREDENTIALS');
   });
 
+  it('refuses an e-mail with NUL or control characters as a validation error and audits it', async () => {
+    const h = await setup();
+    for (const email of ['ad\u0000min@example.com', 'admin@example.com\u0007']) {
+      const res = await h.call(null, {
+        method: 'POST',
+        url: '/api/auth/login',
+        payload: { email, password: 'Wrong!Password1' },
+      });
+      expect(res.statusCode, res.body).toBe(400);
+      expect(codeOf(res)).toBe('VALIDATION_ERROR');
+      expect(res.headers['set-cookie']).toBeUndefined();
+    }
+    const admin = await h.login();
+    const audit = await h.call(admin, {
+      method: 'GET',
+      url: '/api/audit?action=auth.login_failed',
+    });
+    const items = (audit.json() as { items: { userEmail: string; errorCode: string }[] }).items;
+    expect(items.map((i) => i.userEmail).sort()).toEqual([
+      'admin@example.com',
+      'admin@example.com\u0007',
+    ]);
+    expect(items.every((i) => i.errorCode === 'VALIDATION_ERROR')).toBe(true);
+  });
+
   it('refuses non-local accounts like a wrong password and never counts failures', async () => {
     const h = await setup({ LOGIN_MAX_ATTEMPTS: '2' });
     const u = await h.app.services.users.create({

@@ -325,6 +325,44 @@ describe('AuditService lifecycle events', () => {
     expect(row?.errorMessage).toBe('ERP said �no');
   });
 
+  it('stores every text column with NUL and lone surrogates normalized', async () => {
+    const { handle, audit } = await setup();
+    const dirty = (s: string) => `${s}\u0000\uD800`;
+    await audit.record({
+      action: dirty('auth.login_failed'),
+      operation: dirty('UPDATE'),
+      resource: dirty('TGFPAR'),
+      status: 'denied',
+      userEmail: dirty('a@example.com'),
+      ip: dirty('203.0.113.7'),
+      requestId: dirty('req-1'),
+      errorCode: dirty('INVALID_CREDENTIALS'),
+      connectionId: dirty(CONN),
+      planHash: dirty('abc123'),
+      capability: dirty('DATA.UPDATE'),
+    });
+    const [row] = await allRows(handle);
+    expect(row).toMatchObject({
+      action: 'auth.login_failed�',
+      operation: 'UPDATE�',
+      resource: 'TGFPAR�',
+      userEmail: 'a@example.com�',
+      ip: '203.0.113.7�',
+      requestId: 'req-1�',
+      errorCode: 'INVALID_CREDENTIALS�',
+      connectionId: `${CONN}�`,
+      planHash: 'abc123�',
+      capability: 'DATA.UPDATE�',
+    });
+  });
+
+  it('normalizes the environment column too (NUL stripped before the CHECK)', async () => {
+    const { handle, audit } = await setup();
+    await audit.record({ action: 'x', status: 'info', environment: 'SAND\u0000BOX' });
+    const [row] = await allRows(handle);
+    expect(row?.environment).toBe('SANDBOX');
+  });
+
   it('redacts a credential split by NUL in errorMessage and statement before storing', async () => {
     const { handle, audit } = await setup();
     await audit.record({

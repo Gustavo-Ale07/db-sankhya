@@ -97,6 +97,63 @@ describe('jsonb-safe audit strings and keys', () => {
     expect(redact('the token expired')).toBe('the token expired');
   });
 
+  it('redacts single- and double-quoted keys and values, including values with spaces', () => {
+    expect(redact(`password='hunter2'`)).toBe(`password='${REDACTED}'`);
+    expect(redact(`{'senha': 'abc'}`)).toBe(`{'senha': '${REDACTED}'}`);
+    expect(redact(`password="my long pass"`)).toBe(`password="${REDACTED}"`);
+    expect(redact(`"token" = 'a b c' rest`)).toBe(`"token" = '${REDACTED}' rest`);
+    const out = redact(`password="my long pass" and {'senha': 'abc'}`) as string;
+    for (const part of ['my', 'long', 'pass"', `'abc'`]) expect(out).not.toContain(part);
+  });
+
+  it('matches the whole compound key name', () => {
+    for (const key of ['db_user_password', 'secret_key', 'password_hash', 'token_value']) {
+      expect(redact(`${key}=abc`)).toBe(`${key}=${REDACTED}`);
+      expect(redact(`x ${key.toUpperCase()}: "abc" y`)).toBe(
+        `x ${key.toUpperCase()}: "${REDACTED}" y`,
+      );
+    }
+    expect(redact('API-KEY=abc123&x=1')).toBe(`API-KEY=${REDACTED}&x=1`);
+    // A sensitive pair inside the quoted value of another key is still found.
+    expect(redact(`q="select 1" password=abc`)).toBe(`q="select 1" password=${REDACTED}`);
+  });
+
+  it('keeps short plain-word prose after "key: " but redacts credentials', () => {
+    expect(redact('password: must be 8 chars')).toBe('password: must be 8 chars');
+    expect(redact('token: expired')).toBe('token: expired');
+    expect(redact('password: hunter2')).toBe(`password: ${REDACTED}`);
+    expect(redact('password: Hunter')).toBe(`password: ${REDACTED}`);
+    expect(redact('password: sunshine')).toBe(`password: ${REDACTED}`);
+    // `=` is never prose, whatever the value looks like.
+    expect(redact('password=abc')).toBe(`password=${REDACTED}`);
+  });
+
+  it('is idempotent on already redacted pairs', () => {
+    const once = redact(`password="x y" token='z' secret=w1`) as string;
+    expect(redact(once)).toBe(once);
+  });
+
+  it('scrubs key=value pairs in linear time on adversarial input', () => {
+    const N = 1_000_000;
+    const inputs = [
+      'password'.repeat(N / 8),
+      'a-'.repeat(N / 2),
+      'x_'.repeat(N / 2),
+      `password="${'a'.repeat(N)}`,
+      `token:${' '.repeat(N)}`,
+      `token${' '.repeat(N)}x`,
+      `'token`.repeat(N / 6),
+      'password: '.repeat(N / 10),
+      'secret='.repeat(N / 7),
+      `${'p'.repeat(N)}password`,
+    ];
+    for (const input of inputs) {
+      const start = Date.now();
+      redact(input);
+      expect(Date.now() - start, input.slice(0, 20)).toBeLessThan(200);
+    }
+  });
+
   it('leaves keys of the log redactor untouched', () => {
     expect(Object.keys(redact({ 'a\u0000b': 1 }) as object)).toEqual(['a\u0000b']);
   });

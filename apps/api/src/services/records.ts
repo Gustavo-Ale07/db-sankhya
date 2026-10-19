@@ -25,6 +25,19 @@ function normalize(value: string | null | undefined): string | null | undefined 
   return typeof value === 'string' ? jsonbSafe(value) : value;
 }
 
+/**
+ * Copies `event` with every top-level string (userEmail, ip, requestId, action, operation,
+ * resource, errorCode, connectionId, environment, planHash, capability and any column added
+ * later) made storable: PostgreSQL text rejects NUL and lone surrogates would be mangled.
+ */
+function normalizeText<T extends object>(event: T): T {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(event)) {
+    out[key] = typeof value === 'string' ? jsonbSafe(value) : value;
+  }
+  return out as T;
+}
+
 /** Makes text storable (no NUL, no lone surrogate) and clips it to `max` characters. */
 function clip(raw: string | null | undefined, max: number): string | null {
   if (raw === null || raw === undefined) return null;
@@ -105,7 +118,7 @@ export class AuditService {
   async record(event: NewAuditEvent): Promise<void> {
     const r = <T>(v: T): T => (v === undefined || v === null ? v : (this.redactor(v) as T));
     await this.db.insert(auditEvents).values({
-      ...event,
+      ...normalizeText(event),
       // Normalize (NUL, lone surrogates) before the redactor, so NUL cannot split a secret
       // past it; clip() normalizes again, which is a no-op by then.
       statement: clip(r(normalize(event.statement)) ?? null, MAX_STATEMENT_CHARS),

@@ -56,10 +56,52 @@ type StringScrubber = (s: string) => string;
 const BEARER_PATTERN = /\b(bearer)\s+([A-Za-z0-9._~+/-]+=*)/gi;
 // Compact JWS/JWT: three base64url segments, the first starting with `{"` encoded as `eyJ`.
 const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g;
-// `password=x`, `senha: x`, `"client_secret":"x"` in free text (query strings, upstream bodies).
-// A separator (= or :) is required, so prose such as "the token expired" is kept.
+// `password=x`, `senha: x`, `db_user_password='a b'`, `{"client_secret": "x"}` in free text
+// (query strings, upstream bodies). The key is the whole name (letters, digits, `_`, `-`) holding a
+// sensitive word, optionally quoted; a separator (= or :) is required, so prose such as "the token
+// expired" is kept. A quoted value is taken up to its closing quote, spaces included.
+// Linear time: the lookbehind lets a key start only at the beginning of a name, and the
+// lookahead (atomic in JS) checks that name once; nothing nested can backtrack across names.
 const KEY_VALUE_PATTERN =
-  /\b((?:[a-z0-9]+[_-]?)?(?:password|passwd|senha|secret|token|api[_-]?key))("?\s*[=:]\s*"?)([^\s&;,"']+)/gi;
+  /(?<![\w-])(["']?)(?=[\w-]*?(?:password|passwd|senha|secret|token|api[_-]?key))([\w-]+)\1(\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s&;,"']+)/gi;
+
+// Trade-off (this pattern also feeds log redaction): after `key: ` (colon plus space, the shape
+// of prose and error messages) an unquoted value that is a plain lowercase word, either under 6
+// letters or a common status word, is kept, so "password: must be 8 chars" and "token: expired"
+// stay readable. A weak all-lowercase password of 5 letters or fewer written that way leaks;
+// `=`, a tight `:` and quoted values are always redacted.
+const PROSE_SEPARATOR = /^\s*:\s+$/;
+const PROSE_WORDS = new Set([
+  'expired',
+  'invalid',
+  'missing',
+  'required',
+  'incorrect',
+  'changed',
+  'revoked',
+  'rejected',
+  'unknown',
+  'provided',
+  'mismatch',
+]);
+
+function isProseValue(sep: string, value: string): boolean {
+  if (!PROSE_SEPARATOR.test(sep) || !/^[a-z]+$/.test(value)) return false;
+  return value.length < 6 || PROSE_WORDS.has(value);
+}
+
+function scrubKeyValue(
+  match: string,
+  quote: string,
+  key: string,
+  sep: string,
+  value: string,
+): string {
+  const valueQuote = value[0] === '"' || value[0] === "'" ? value[0] : '';
+  const inner = valueQuote ? value.slice(1, -1) : value;
+  if (inner === REDACTED || isProseValue(sep, value)) return match;
+  return `${quote}${key}${quote}${sep}${valueQuote}${REDACTED}${valueQuote}`;
+}
 
 /** Scrubs credential-shaped substrings that no key name or configured value would catch. */
 function scrubPatterns(s: string): string {
@@ -68,9 +110,7 @@ function scrubPatterns(s: string): string {
       /^[a-z]+$/.test(credential) ? match : `${word} ${REDACTED}`,
     )
     .replace(JWT_PATTERN, REDACTED)
-    .replace(KEY_VALUE_PATTERN, (match, key: string, sep: string, value: string) =>
-      value === REDACTED ? match : `${key}${sep}${REDACTED}`,
-    );
+    .replace(KEY_VALUE_PATTERN, scrubKeyValue);
 }
 
 type KeyMatcher = (key: string) => boolean;
