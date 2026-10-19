@@ -198,7 +198,11 @@ export class AuthzService {
       await db.insert(userRoles).values(ids.map((roleId) => ({ userId, roleId })));
   }
 
-  /** Changes a user's direct roles. Nobody changes their own roles. */
+  /**
+   * Changes a user's direct roles. Nobody changes their own roles. Removing a role needs an actor
+   * who covers the target as they are before the change: otherwise stripping a stronger account
+   * would make it weak enough for a password reset (account takeover).
+   */
   async setUserRoles(userId: string, roleKeys: readonly string[], actorId: string): Promise<void> {
     if (userId === actorId) throw selfChangeError();
     const [u] = await this.db.select({ id: users.id }).from(users).where(eq(users.id, userId));
@@ -208,6 +212,8 @@ export class AuthzService {
         .select({ id: userRoles.roleId })
         .from(userRoles)
         .where(eq(userRoles.userId, userId));
+      const kept = new Set(await this.roleIdsByKey(roleKeys, tx));
+      if (current.some((r) => !kept.has(r.id))) await this.assertCovers(actorId, userId, tx);
       const added = await this.addedRoleIds(roleKeys, current, tx);
       await this.assertCanGrant(actorId, await this.permissionsOfRoles(added, tx), tx);
       await this.assignUserRoles(userId, roleKeys, tx);
@@ -222,7 +228,7 @@ export class AuthzService {
 
   /**
    * Nobody grants a permission they do not hold themselves (effective). There is no exception
-   * for ADMIN. Removing grants is always allowed.
+   * for ADMIN. Removals from a user are guarded by `assertCovers` instead.
    */
   private async assertCanGrant(
     actorId: string,
@@ -271,8 +277,10 @@ export class AuthzService {
 
   /**
    * Refuses when the target holds a permission the actor lacks. Used before any change that would
-   * let the actor sign in as the target (password reset, reactivation). There is no exception for
-   * ADMIN: an ADMIN lacks DATA.*, so an OPERATOR account counts as stronger in that respect.
+   * let the actor sign in as the target (password reset, reactivation) and before removing roles
+   * or group memberships from the target, which could otherwise weaken it until it passes this
+   * check. There is no exception for ADMIN: an ADMIN lacks DATA.*, so an OPERATOR account counts
+   * as stronger in that respect.
    */
   async assertCovers(actorId: string, targetId: string, db: Db): Promise<void> {
     const mine = await this.grants(actorId, db);
@@ -348,14 +356,19 @@ export class AuthzService {
     return this.roleView(r, perms);
   }
 
-  async createRole(input: {
-    key: string;
-    name: string;
-    description?: string | null;
-    permissions: Permission[];
-  }): Promise<RoleView> {
+  /** Nobody creates a role carrying permissions they do not hold themselves. */
+  async createRole(
+    input: {
+      key: string;
+      name: string;
+      description?: string | null;
+      permissions: Permission[];
+    },
+    actorId: string,
+  ): Promise<RoleView> {
     try {
       const id = await this.db.transaction(async (tx) => {
+        await this.assertCanGrant(actorId, input.permissions, tx);
         const [r] = await tx
           .insert(roles)
           .values({
@@ -508,15 +521,24 @@ export class AuthzService {
     return this.findGroup(id);
   }
 
+  /** Deleting a group removes every member from it, so the actor must cover each of them. */
   async deleteGroup(id: string, actorId: string): Promise<void> {
     await this.findGroup(id);
     await this.guarded(async (tx) => {
       if (await this.isMember(id, actorId, tx)) throw selfChangeError();
+      const members = await tx
+        .select({ userId: groupMembers.userId })
+        .from(groupMembers)
+        .where(eq(groupMembers.groupId, id));
+      for (const m of members) await this.assertCovers(actorId, m.userId, tx);
       await tx.delete(groups).where(eq(groups.id, id));
     }, actorId);
   }
 
-  /** Replaces the members. Nobody adds or removes themselves. */
+  /**
+   * Replaces the members. Nobody adds or removes themselves. Removing a member needs an actor who
+   * covers that member as they are before the change (see `setUserRoles`).
+   */
   async setGroupMembers(
     id: string,
     userIds: readonly string[],
@@ -539,6 +561,9 @@ export class AuthzService {
         .from(groupMembers)
         .where(eq(groupMembers.groupId, id));
       const had = new Set(current.map((m) => m.userId));
+      const keeps = new Set(unique);
+      for (const m of current)
+        if (!keeps.has(m.userId)) await this.assertCovers(actorId, m.userId, tx);
       if (unique.some((u) => !had.has(u)))
         await this.assertCanGrant(actorId, await this.groupPermissions(id, tx), tx);
       await tx.delete(groupMembers).where(eq(groupMembers.groupId, id));

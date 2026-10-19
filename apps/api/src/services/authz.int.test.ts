@@ -26,6 +26,19 @@ afterEach(async () => {
 const newUser = async (email: string, roleKeys: string[]) =>
   (await users.create({ email, name: email, password: PASSWORD, roles: roleKeys })).id;
 
+/** Inserts a role directly, to set up state no actor could create through the service. */
+const seedRole = async (key: string, permissions: readonly string[]) => {
+  const [r] = await database.db
+    .insert(roles)
+    .values({ key, name: key, system: false })
+    .returning({ id: roles.id });
+  if (permissions.length > 0)
+    await database.db
+      .insert(rolePermissions)
+      .values(permissions.map((permission) => ({ roleId: r!.id, permission })));
+  return r!.id;
+};
+
 describe('AuthzService', () => {
   it('seeds exactly the catalog permissions for each system role', async () => {
     const listed = await authz.listRoles();
@@ -85,7 +98,7 @@ describe('AuthzService', () => {
 
   it('ignores permission strings outside the catalog (fail closed)', async () => {
     const id = await newUser('x@example.com', []);
-    const role = await authz.createRole({ key: 'CUSTOM', name: 'Custom', permissions: [] });
+    const role = await authz.createRole({ key: 'CUSTOM', name: 'Custom', permissions: [] }, id);
     await database.db
       .insert(rolePermissions)
       .values({ roleId: role.id, permission: 'DDL.NATIVE.EXECUTE' });
@@ -98,7 +111,11 @@ describe('AuthzService', () => {
   it('keeps at least one active administrator', async () => {
     const admin = await newUser('admin@example.com', ['ADMIN']);
     const other = await newUser('other@example.com', ['VIEWER']);
-    await expect(authz.setUserRoles(admin, ['VIEWER'], other)).rejects.toMatchObject({
+    // Removing roles needs an actor covering the target; an active one would keep ADMIN.USERS
+    // themselves, so only a disabled peer can reach the last-administrator rule.
+    const peer = await newUser('peer@example.com', ['ADMIN']);
+    await users.update(peer, { active: false }, admin);
+    await expect(authz.setUserRoles(admin, ['VIEWER'], peer)).rejects.toMatchObject({
       code: 'CONFLICT',
     });
     await expect(users.update(admin, { active: false }, other)).rejects.toMatchObject({
@@ -110,12 +127,12 @@ describe('AuthzService', () => {
     const [adminRole] = await database.db.select().from(roles).where(eq(roles.key, 'ADMIN'));
     await database.db.insert(groupRoles).values({ groupId: group.id, roleId: adminRole!.id });
     await database.db.insert(groupMembers).values({ groupId: group.id, userId: admin });
-    await authz.setUserRoles(admin, ['VIEWER'], other);
+    await authz.setUserRoles(admin, ['VIEWER'], peer);
     expect((await authz.grants(admin)).permissions.has('ADMIN.USERS')).toBe(true);
     await expect(authz.updateGroup(group.id, { active: false }, other)).rejects.toMatchObject({
       code: 'CONFLICT',
     });
-    await expect(authz.deleteGroup(group.id, other)).rejects.toMatchObject({ code: 'CONFLICT' });
+    await expect(authz.deleteGroup(group.id, peer)).rejects.toMatchObject({ code: 'CONFLICT' });
   });
 
   it('refuses edits of system roles', async () => {
@@ -133,14 +150,17 @@ describe('AuthzService', () => {
 
   it('creates, edits and deletes custom roles', async () => {
     const actor = await newUser('admin@example.com', ['ADMIN']);
-    const role = await authz.createRole({
-      key: 'AUDITOR',
-      name: 'Auditor',
-      permissions: ['AUDIT.READ', 'QUERY.SELECT', 'AUDIT.READ'],
-    });
+    const role = await authz.createRole(
+      {
+        key: 'AUDITOR',
+        name: 'Auditor',
+        permissions: ['AUDIT.READ', 'QUERY.SELECT', 'AUDIT.READ'],
+      },
+      actor,
+    );
     expect(role.permissions).toEqual(['AUDIT.READ', 'QUERY.SELECT']);
     await expect(
-      authz.createRole({ key: 'AUDITOR', name: 'Dup', permissions: [] }),
+      authz.createRole({ key: 'AUDITOR', name: 'Dup', permissions: [] }, actor),
     ).rejects.toMatchObject({ code: 'CONFLICT' });
     const edited = await authz.updateRole(role.id, { permissions: ['AUDIT.READ'] }, actor);
     expect(edited.permissions).toEqual(['AUDIT.READ']);
@@ -187,8 +207,11 @@ describe('AuthzService', () => {
     );
 
     // Permissions of a role the actor holds, directly or through a group.
-    const direct = await authz.createRole({ key: 'DIRECT', name: 'Direto', permissions: [] });
-    const viaGroup = await authz.createRole({ key: 'VIA_GROUP', name: 'Grupo', permissions: [] });
+    const direct = await authz.createRole({ key: 'DIRECT', name: 'Direto', permissions: [] }, peer);
+    const viaGroup = await authz.createRole(
+      { key: 'VIA_GROUP', name: 'Grupo', permissions: [] },
+      peer,
+    );
     await authz.setUserRoles(actor, ['ADMIN', 'DIRECT'], peer);
     await authz.updateGroup(ops.id, { active: true }, peer);
     await authz.setGroupRoles(ops.id, ['VIA_GROUP'], peer);
@@ -237,9 +260,12 @@ describe('AuthzService', () => {
 
   it('refuses resetting or reactivating an account with permissions the actor lacks', async () => {
     const forbidden = { code: 'FORBIDDEN' };
-    await authz.createRole({ key: 'USER_ADMIN', name: 'Cadastro', permissions: ['ADMIN.USERS'] });
-    const clerk = await newUser('clerk@example.com', ['USER_ADMIN']);
     const admin = await newUser('admin@example.com', ['ADMIN']);
+    await authz.createRole(
+      { key: 'USER_ADMIN', name: 'Cadastro', permissions: ['ADMIN.USERS'] },
+      admin,
+    );
+    const clerk = await newUser('clerk@example.com', ['USER_ADMIN']);
     const second = await newUser('second@example.com', ['ADMIN']);
     const op = await newUser('op@example.com', ['OPERATOR']);
     const blank = await newUser('blank@example.com', []);
@@ -274,7 +300,7 @@ describe('AuthzService', () => {
     const forbidden = { code: 'FORBIDDEN' };
     /** A user holding every catalog permission, to set up state an ADMIN could not. */
     const newRoot = async () => {
-      await authz.createRole({ key: 'ALL', name: 'Tudo', permissions: [...PERMISSIONS] });
+      await seedRole('ALL', PERMISSIONS);
       return newUser('root@example.com', ['ALL']);
     };
 
@@ -305,11 +331,14 @@ describe('AuthzService', () => {
         forbidden,
       );
       expect(await authz.directRoles(bia)).toEqual(['VIEWER']);
-      // Roles the actor covers are fine, and removing grants is always allowed.
+      // Roles the actor covers are fine, and so is removing them from a target they cover.
       await authz.setUserRoles(bia, ['ADMIN', 'VIEWER'], admin);
+      await authz.setUserRoles(bia, ['VIEWER'], admin);
       const root = await newRoot();
       await authz.setUserRoles(bia, ['OPERATOR'], root);
-      await authz.setUserRoles(bia, ['VIEWER'], admin);
+      // Bia now holds DATA.* that the admin lacks: stripping her roles is refused too.
+      await expect(authz.setUserRoles(bia, ['VIEWER'], admin)).rejects.toMatchObject(forbidden);
+      await authz.setUserRoles(bia, ['VIEWER'], root);
     });
 
     it('refuses creating a user with roles the actor lacks', async () => {
@@ -344,7 +373,9 @@ describe('AuthzService', () => {
       await authz.updateGroup(group.id, { active: false }, root);
       await expect(authz.setGroupMembers(group.id, [bia], admin)).rejects.toMatchObject(forbidden);
       await authz.setGroupMembers(group.id, [bia, cid], root);
-      await authz.setGroupMembers(group.id, [cid], admin);
+      // Removing a member the admin does not cover (latent OPERATOR) is refused as well.
+      await expect(authz.setGroupMembers(group.id, [cid], admin)).rejects.toMatchObject(forbidden);
+      await authz.setGroupMembers(group.id, [cid], root);
     });
 
     it('refuses re-enabling a group that grants permissions the actor lacks', async () => {
@@ -361,16 +392,85 @@ describe('AuthzService', () => {
 
     it('refuses adding permissions the actor lacks to a role', async () => {
       const admin = await newUser('admin@example.com', ['ADMIN']);
-      const role = await authz.createRole({
-        key: 'AUDITOR',
-        name: 'Auditor',
-        permissions: ['AUDIT.READ', 'QUERY.SELECT'],
-      });
+      const role = await authz.createRole(
+        { key: 'AUDITOR', name: 'Auditor', permissions: ['AUDIT.READ', 'QUERY.SELECT'] },
+        admin,
+      );
       await expect(
         authz.updateRole(role.id, { permissions: ['AUDIT.READ', 'DATA.DELETE'] }, admin),
       ).rejects.toMatchObject(forbidden);
       expect((await authz.findRole(role.id)).permissions).toEqual(['AUDIT.READ', 'QUERY.SELECT']);
       await authz.updateRole(role.id, { permissions: ['AUDIT.READ', 'ADMIN.GROUPS'] }, admin);
+    });
+
+    it('refuses creating a role with permissions the actor lacks', async () => {
+      const admin = await newUser('admin@example.com', ['ADMIN']);
+      const input = { key: 'EDITOR', name: 'Editor' };
+      await expect(
+        authz.createRole({ ...input, permissions: ['QUERY.SELECT', 'DATA.UPDATE'] }, admin),
+      ).rejects.toMatchObject({ ...forbidden, details: { missing: ['DATA.UPDATE'] } });
+      expect((await authz.listRoles()).map((r) => r.key)).not.toContain('EDITOR');
+      const created = await authz.createRole({ ...input, permissions: ['QUERY.SELECT'] }, admin);
+      expect(created.permissions).toEqual(['QUERY.SELECT']);
+    });
+  });
+
+  describe("no stripping an account stronger than the actor's", () => {
+    const forbidden = { code: 'FORBIDDEN', details: { reason: 'stronger_account' } };
+
+    /**
+     * A: user administration plus reads. B: ADMIN plus DATA.*, directly and through a group.
+     * Root holds everything, to set the scene and to show a covering actor is unaffected.
+     */
+    const scene = async () => {
+      await seedRole('ALL', PERMISSIONS);
+      await seedRole('DATA_ALL', ['DATA.INSERT', 'DATA.UPDATE', 'DATA.DELETE']);
+      await seedRole('USER_ADMIN', ['ADMIN.USERS', 'ADMIN.ROLES', 'ADMIN.GROUPS', 'QUERY.SELECT']);
+      const root = await newUser('root@example.com', ['ALL']);
+      const a = await newUser('a@example.com', ['USER_ADMIN']);
+      const b = await newUser('b@example.com', ['ADMIN', 'DATA_ALL']);
+      const group = await authz.createGroup({ name: 'Dados' });
+      await authz.setGroupRoles(group.id, ['DATA_ALL'], root);
+      await authz.setGroupMembers(group.id, [b], root);
+      return { root, a, b, group: group.id };
+    };
+
+    it("refuses removing a stronger target's roles", async () => {
+      const { a, b } = await scene();
+      await expect(authz.setUserRoles(b, ['ADMIN'], a)).rejects.toMatchObject(forbidden);
+      await expect(authz.setUserRoles(b, [], a)).rejects.toMatchObject(forbidden);
+      // Swapping (adding a role the actor holds while removing another) is a removal too.
+      await expect(authz.setUserRoles(b, ['ADMIN', 'USER_ADMIN'], a)).rejects.toMatchObject(
+        forbidden,
+      );
+      expect(await authz.directRoles(b)).toEqual(['ADMIN', 'DATA_ALL']);
+    });
+
+    it('refuses removing a stronger target from a group, by membership edit or deletion', async () => {
+      const { a, b, group } = await scene();
+      await expect(authz.setGroupMembers(group, [], a)).rejects.toMatchObject(forbidden);
+      await expect(authz.deleteGroup(group, a)).rejects.toMatchObject(forbidden);
+      expect((await authz.findGroup(group)).memberIds).toEqual([b]);
+    });
+
+    it("still refuses resetting the stronger target's password", async () => {
+      const { a, b } = await scene();
+      await expect(authz.setUserRoles(b, [], a)).rejects.toMatchObject(forbidden);
+      await expect(users.resetPassword(b, 'New!Strong#Pass12', a)).rejects.toMatchObject(forbidden);
+      expect((await users.findById(b))!.mustChangePassword).toBe(false);
+    });
+
+    it('lets an actor covering the target remove roles and memberships', async () => {
+      const { root, a, b, group } = await scene();
+      await authz.setUserRoles(b, ['ADMIN'], root);
+      await authz.setGroupMembers(group, [], root);
+      expect(await authz.directRoles(b)).toEqual(['ADMIN']);
+      expect((await authz.findGroup(group)).memberIds).toEqual([]);
+      // A weaker target stays manageable by A, removals included.
+      await seedRole('READER', ['QUERY.SELECT']);
+      const reader = await newUser('r@example.com', ['READER']);
+      await authz.setUserRoles(reader, [], a);
+      expect(await authz.directRoles(reader)).toEqual([]);
     });
   });
 });

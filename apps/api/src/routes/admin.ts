@@ -243,7 +243,13 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
   app.post('/api/admin/roles', async (request, reply) => {
     const { user: actor } = requirePermission(request, 'ADMIN.ROLES');
     const body = parseBody(createRoleBody, request.body);
-    const role = await authz.createRole(body);
+    const role = await attempt(
+      request,
+      actor,
+      'role.create',
+      { key: body.key, permissions: body.permissions },
+      () => authz.createRole(body, actor.id),
+    );
     await record(request, actor, 'role.create', {
       roleId: role.id,
       key: role.key,

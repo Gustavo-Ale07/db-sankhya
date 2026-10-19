@@ -952,7 +952,8 @@ describe('self-escalation', () => {
     const rid = (
       await call('POST', '/api/admin/roles', { key: 'EXTRA', name: 'Extra', permissions: [] })
     ).json().item.id as string;
-    const peer = await h.createUser('ADMIN', 'peer@example.com');
+    // The peer drops the bootstrap admin's OPERATOR role, so it must cover that account.
+    const peer = await h.createUser(['ADMIN', 'OPERATOR'], 'peer@example.com');
     const assign = await h.call(peer, {
       method: 'PUT',
       url: `/api/admin/users/${adminId}/roles`,
@@ -979,11 +980,10 @@ describe('self-escalation', () => {
   it('needs ADMIN.ROLES to assign roles, at creation or later, and lets an admin holding OPERATOR provision operators', async () => {
     const h = await setup();
     const admin = await h.login();
-    await h.app.services.authz.createRole({
-      key: 'USER_ADMIN',
-      name: 'Cadastro',
-      permissions: ['ADMIN.USERS'],
-    });
+    await h.app.services.authz.createRole(
+      { key: 'USER_ADMIN', name: 'Cadastro', permissions: ['ADMIN.USERS'] },
+      (await h.app.services.users.findByEmail(ADMIN.email))!.id,
+    );
     const clerk = await h.createUser('USER_ADMIN');
     const newUser = (cookie: string, email: string) =>
       h.call(cookie, {
@@ -1017,13 +1017,12 @@ describe('account takeover', () => {
   it('refuses and audits resetting or reactivating a stronger account', async () => {
     const h = await setup();
     const admin = await h.login();
-    await h.app.services.authz.createRole({
-      key: 'USER_ADMIN',
-      name: 'Cadastro',
-      permissions: ['ADMIN.USERS'],
-    });
-    const clerk = await h.createUser('USER_ADMIN', 'clerk@example.com');
     const adminId = (await h.app.services.users.findByEmail(ADMIN.email))!.id;
+    await h.app.services.authz.createRole(
+      { key: 'USER_ADMIN', name: 'Cadastro', permissions: ['ADMIN.USERS'] },
+      adminId,
+    );
+    const clerk = await h.createUser('USER_ADMIN', 'clerk@example.com');
     await h.createUser('ADMIN', 'second@example.com');
     const secondId = (await h.app.services.users.findByEmail('second@example.com'))!.id;
 
@@ -1082,6 +1081,13 @@ describe("granting beyond the actor's permissions", () => {
       payload: { roles: ['OPERATOR'] },
     });
     expect(codeOf(promote)).toBe('FORBIDDEN');
+    const role = await h.call(admin, {
+      method: 'POST',
+      url: '/api/admin/roles',
+      payload: { key: 'EDITOR', name: 'Editor', permissions: ['QUERY.SELECT', 'DATA.UPDATE'] },
+    });
+    expect(codeOf(role)).toBe('FORBIDDEN');
+    expect(role.json().error.details).toMatchObject({ missing: ['DATA.UPDATE'] });
 
     const denied = await h.call(root, { method: 'GET', url: '/api/audit?status=denied' });
     expect(
@@ -1089,7 +1095,7 @@ describe("granting beyond the actor's permissions", () => {
         .json()
         .items.map((e: { action: string }) => e.action)
         .sort(),
-    ).toEqual(['user.create', 'user.roles']);
+    ).toEqual(['role.create', 'user.create', 'user.roles']);
   });
 });
 
