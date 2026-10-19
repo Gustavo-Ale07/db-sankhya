@@ -614,3 +614,51 @@ describe('ApprovalsService.listPending', () => {
     expect(full!.plan.sql).toBe(newPlan().sql);
   });
 });
+
+describe('ApprovalsService: scratch targets and audit failures', () => {
+  it('refuses a scratch-route plan whose target is not a scratch table', async () => {
+    const hybrid = await plansService.create(
+      newPlan({
+        sql: 'INSERT INTO TGFPAR (CODPARC) SELECT CODPARC FROM tmp_x',
+        capability: {
+          class: 'SCRATCH_ONLY',
+          route: 'HYBRID',
+          reason: 'mislabelled',
+          action: 'TEMP.WRITE',
+          actions: ['TEMP.WRITE', 'TEMP.MATERIALIZE', 'QUERY.SELECT'],
+        },
+      }),
+    );
+    await expectCode(service.request(hybrid.id, requester), 'VALIDATION_ERROR');
+    const scratch = await plansService.create(
+      newPlan({
+        capability: {
+          class: 'SCRATCH_ONLY',
+          route: 'SCRATCH',
+          reason: 'mislabelled',
+          action: 'TEMP.WRITE',
+          actions: ['TEMP.WRITE'],
+        },
+      }),
+    );
+    await expectCode(service.request(scratch.id, requester), 'VALIDATION_ERROR');
+    expect(await database.db.select().from(approvals)).toHaveLength(0);
+  });
+
+  it('rethrows the original error and logs when the denied audit write fails', async () => {
+    const logged: { obj: object; msg: string }[] = [];
+    const failing = new ApprovalsService(database.db, {
+      plans: plansService,
+      policies: policyService,
+      authz: new AuthzService(database.db),
+      redact: () => {
+        throw new Error('redactor down');
+      },
+      logger: { error: (obj, msg) => logged.push({ obj, msg }) },
+    });
+    await expectCode(failing.decide(randomUUID(), decider, 'APPROVE', null), 'NOT_FOUND');
+    expect(logged).toHaveLength(1);
+    expect(logged[0]!.obj).toMatchObject({ action: 'approval.decide', errorCode: 'NOT_FOUND' });
+    expect(JSON.stringify(logged[0]!.obj)).not.toContain('redactor down');
+  });
+});

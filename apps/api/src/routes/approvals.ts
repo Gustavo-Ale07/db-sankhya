@@ -41,6 +41,7 @@ export async function approvalRoutes(app: FastifyInstance): Promise<void> {
     policies,
     authz,
     redact,
+    logger: app.log,
   });
 
   const context = (request: FastifyRequest, email: string): ApprovalAuditContext => ({

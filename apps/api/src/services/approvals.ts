@@ -18,6 +18,7 @@ import type {
 import { classifyStatement } from '@dbx/sql-engine';
 import type { AuthzService } from './authz';
 import type { ConsumePlanInput, ConsumedPlan, PlansService } from './plans';
+import { SCRATCH_TABLE_NAME } from './scratch-guard';
 import type { PolicyService, PolicySnapshot } from './policy';
 import { AuditService } from './records';
 
@@ -55,6 +56,8 @@ export interface ApprovalsDeps {
   authz: AuthzService;
   /** Redactor of the audit rows (the same one AuditService uses). */
   redact: (value: unknown) => unknown;
+  /** Receives failures of the denied-audit writes (redacted); the refusal is still thrown. */
+  logger?: { error(obj: object, msg: string): void };
 }
 
 type Tx = Parameters<Parameters<Database['transaction']>[0]>[0];
@@ -128,6 +131,8 @@ function scopeOf(plan: PlanRow): PlanScope | undefined {
   const classified = classifyStatement(plan.sql);
   if (classified.kind !== 'INSERT' && classified.kind !== 'UPDATE' && classified.kind !== 'DELETE')
     return undefined;
+  // A scratch route only ever writes a scratch table; anything else is mislabelled.
+  if (cap.route !== 'SANKHYA_SAVE' && !SCRATCH_TABLE_NAME.test(classified.table)) return undefined;
   const primary: Permission =
     cap.route === 'SANKHYA_SAVE' ? statementPermission(classified.kind) : 'TEMP.WRITE';
   const allowed: Permission[] =
@@ -340,13 +345,9 @@ export class ApprovalsService {
       });
     } catch (err) {
       if (isAppError(err) && err.code !== 'VALIDATION_ERROR') {
-        await this.audit(this.db).record({
+        await this.auditDenied(err, {
           ...this.auditBase(UUID.test(String(deciderId)) ? deciderId : null, context),
           action: 'approval.decide',
-          status: 'denied',
-          resource: 'plan',
-          errorCode: err.code,
-          errorMessage: err.message,
           details: { ...details, reason: err.details?.reason },
         });
       }
@@ -430,13 +431,9 @@ export class ApprovalsService {
       await this.assertRequester(plan);
     } catch (err) {
       if (isAppError(err) && err.code === 'FORBIDDEN') {
-        await this.audit(this.db).record({
+        await this.auditDenied(err, {
           ...this.auditBase(plan.userId, {}),
           action: 'approval.execute',
-          status: 'denied',
-          resource: 'plan',
-          errorCode: err.code,
-          errorMessage: err.message,
           details: {
             approvalId,
             planId: plan.id,
@@ -614,6 +611,51 @@ export class ApprovalsService {
     if (row && (row.status === 'EXPIRED' || (row.status === 'PENDING' && row.expired)))
       return expired();
     return invalid();
+  }
+
+  /**
+   * Writes a `denied` audit row for a refusal. Never throws: the caller always rethrows the
+   * original error, and a failed write is only logged (redacted, without the row's contents).
+   */
+  private async auditDenied(
+    err: AppError,
+    row: ReturnType<ApprovalsService['auditBase']> & {
+      action: string;
+      details: Record<string, unknown>;
+    },
+  ): Promise<void> {
+    try {
+      await this.audit(this.db).record({
+        ...row,
+        status: 'denied',
+        resource: 'plan',
+        errorCode: err.code,
+        errorMessage: err.message,
+      });
+    } catch (auditErr) {
+      let detail: unknown;
+      try {
+        detail = this.deps.redact({
+          message: auditErr instanceof Error ? auditErr.message : String(auditErr),
+        });
+      } catch {
+        detail = undefined;
+      }
+      try {
+        this.deps.logger?.error(
+          {
+            action: row.action,
+            errorCode: err.code,
+            requestId: row.requestId,
+            auditError: auditErr instanceof Error ? auditErr.name : typeof auditErr,
+            detail,
+          },
+          'Approval audit write failed',
+        );
+      } catch {
+        // Logging must not mask the refusal either.
+      }
+    }
   }
 
   private audit(db: Db): AuditService {
