@@ -869,12 +869,13 @@ const cases: Case[] = [
     effect: 'DENY',
     reason: /denied by rule deny-s/,
   },
-  // M1: a wildcard table part does not reach unqualified names.
+  // M1 (security ruling): a wildcard table part still reaches unqualified names (fail closed).
   {
-    name: 'DENY SYS.* does not block a plain TGFPAR',
+    name: 'DENY SYS.* blocks a plain TGFPAR (schema unknown)',
     request: req(),
     rules: [rule({ id: 'deny-sys', effect: 'DENY', entities: ['SYS.*'] })],
-    effect: 'ALLOW',
+    effect: 'DENY',
+    reason: /denied by rule deny-sys/,
   },
   {
     name: 'DENY SYS.* still blocks SYS.TGFPAR',
@@ -884,8 +885,15 @@ const cases: Case[] = [
     reason: /denied by rule deny-sys/,
   },
   {
-    name: 'DENY X.TGF* does not block a plain TGFPAR',
+    name: 'DENY X.TGF* blocks a plain TGFPAR',
     request: req(),
+    rules: [rule({ id: 'deny-x', effect: 'DENY', entities: ['X.TGF*'] })],
+    effect: 'DENY',
+    reason: /denied by rule deny-x/,
+  },
+  {
+    name: 'DENY X.TGF* does not block a qualified dbo.TGFPAR',
+    request: req({ entities: ['dbo.TGFPAR'] }),
     rules: [rule({ id: 'deny-x', effect: 'DENY', entities: ['X.TGF*'] })],
     effect: 'ALLOW',
   },

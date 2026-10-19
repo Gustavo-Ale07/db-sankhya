@@ -29,9 +29,10 @@
  *   (`TGFPAR` covers `TGFPAR` and `dbo.TGFPAR`); a qualified one matches schema and table part
  *   by part (`SANKHYA.TGF*` covers `sankhya.TGFPAR`, not `TGFPAR` or `dbo.TGFPAR`).
  * - DENY matching is broad (fail closed): anything ALLOW would match, plus the pattern against the
- *   full name, and a qualified pattern's table part against an unqualified entity when that table
- *   part has no `*`. So DENY `X.TGFPAR` also hits a plain `TGFPAR`, but DENY `SYS.*` does not
- *   hit every unqualified name (it still hits `SYS.TGFPAR`).
+ *   full name, and a qualified pattern's table part against an unqualified entity, since the
+ *   schema an unqualified name resolves to is unknown here. So DENY `X.TGFPAR` hits a plain
+ *   `TGFPAR`, and DENY `SYS.*` hits every unqualified name; send schema-qualified names to
+ *   avoid that over-match.
  * - Patterns are case-insensitive globs where `*` is any run of characters (`TGF*` hits `TGFPAR`).
  *   In ALLOW matching `*` never crosses a dot, since it is applied per part.
  * - A rule matches only when `enabled === true`. Disabled rules are ignored, even malformed ones.
@@ -678,8 +679,7 @@ function allowHit(p: string[], e: Entity): boolean {
 
 /**
  * DENY (broad, fails closed): anything ALLOW would match, plus the pattern against the full name
- * (`*` may cross the dot), and a qualified pattern's literal (`*`-free) table part against an
- * unqualified entity.
+ * (`*` may cross the dot), and a qualified pattern's table part against an unqualified entity.
  */
 function denyHit(p: string[], e: Entity): boolean {
   const full = p.join('.');
@@ -687,7 +687,7 @@ function denyHit(p: string[], e: Entity): boolean {
     allowHit(p, e) ||
     glob(full, e.full) ||
     glob(full, e.last) ||
-    (e.parts.length === 1 && !p[p.length - 1]!.includes('*') && glob(p[p.length - 1]!, e.last))
+    (e.parts.length === 1 && glob(p[p.length - 1]!, e.last))
   );
 }
 
