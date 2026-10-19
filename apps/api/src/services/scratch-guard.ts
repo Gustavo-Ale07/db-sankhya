@@ -258,7 +258,8 @@ function collectCteNames(ast: Node): Set<string> {
  * Columns a SELECT reads, attributed fail closed: a qualifier that is a scratch table or its
  * alias names that table; any other qualifier (a CTE, a derived table) and an unqualified column
  * belong to every table of the statement. A star, and a bare name that is a table, alias, CTE or
- * derived-table name (a whole-row reference such as `row_to_json(t)`), read every column: `*`,
+ * derived-table name (a whole-row reference such as `row_to_json(t)`), and a NATURAL JOIN read
+ * every column: `*`,
  * which every column rule hits (scratch has no catalog to expand it). `COUNT(*)` reads none.
  */
 function selectColumns(ast: Node, tables: string[]): PolicyColumn[] {
@@ -310,6 +311,25 @@ function selectColumns(ast: Node, tables: string[]): PolicyColumn[] {
   walk(ast, (node) => {
     if (node.type === 'star' && !countStars.has(node)) {
       for (const t of tables) push(t, '*');
+      return;
+    }
+    if (typeof node.table === 'string' && node.type !== 'column_ref' && !('column' in node)) {
+      // `JOIN … USING (c)` reads `c` on both sides; it is attributed to every table.
+      if (Array.isArray(node.using)) {
+        for (const u of node.using) {
+          const name = identifier(u);
+          for (const t of tables) push(t, name ?? '*');
+        }
+      }
+      // NATURAL JOIN compares every common column. The parser reads NATURAL as an alias of the
+      // left table and leaves the join without a condition; either sign reads every column.
+      const natural = typeof node.as === 'string' && node.as.toLowerCase() === 'natural';
+      const bare =
+        typeof node.join === 'string' &&
+        !/cross/i.test(node.join) &&
+        (node.on === null || node.on === undefined) &&
+        !Array.isArray(node.using);
+      if (natural || bare) for (const t of tables) push(t, '*');
       return;
     }
     if (node.type !== 'column_ref') return;

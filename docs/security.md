@@ -147,12 +147,15 @@ there: they are targeted by environment, or by a rule with no connection list. A
   so a column DENY refuses `SELECT *`; `COUNT(*)` reads no column and is not expanded, while
   `COUNT(col)` references `col`.
 - A scratch `SELECT` is evaluated with the columns it reads. Scratch has no catalog, so a star or
-  a whole-row reference (`row_to_json(t)`) counts as `*`, which every column rule on that table
-  hits. Every other scratch statement is evaluated as `*` on each table it touches. The policy's
-  `maxReadRows` truncates scratch results, and `maxWriteRows` caps the rows one scratch
-  `INSERT`/`UPDATE`/`DELETE` (or DDL) may change: a larger change is refused and rolled back. The
-  ceilings are `SCRATCH_MAX_ROWS`, clamped to the policy hard maxima (100000 read and 1000 written
-  rows per statement).
+  a whole-row reference (`row_to_json(t)`) or a `NATURAL JOIN` counts as `*`, which every column
+  rule on that table hits, and a `JOIN … USING (c)` column counts on every table of the statement.
+  Every other scratch statement is evaluated as `*` on each table it touches. The policy's
+  `maxReadRows` truncates scratch results (ceiling `SCRATCH_MAX_ROWS`, clamped to the policy hard
+  maximum of 100000). `maxWriteRows` applies to scratch only when a matching ALLOW rule sets it:
+  then it caps the rows one scratch `INSERT`/`UPDATE`/`DELETE` (or DDL) may change, and a larger
+  change is refused and rolled back. Without such a rule, the default write limit (meant for ERP
+  writes) does not apply, and scratch writes are bounded by the workspace quotas
+  (`SCRATCH_MAX_ROWS`, `SCRATCH_MAX_TABLES` and the storage size).
 - `GET /api/scratch/tables` evaluates `QUERY.SELECT` in the scratch context with no entities, so
   only a rule without entities or columns can deny it.
 - Materialization (`POST /api/scratch/materialize`) evaluates `TEMP.MATERIALIZE` in both contexts
@@ -161,6 +164,8 @@ there: they are targeted by environment, or by a rule with no connection list. A
   read touches). `QUERY.SELECT` is evaluated on the source side. A rule such as DENY
   `TEMP.MATERIALIZE` in `PRODUCTION`, or on `TGF*`, stops copying that data into scratch without
   stopping reads of it.
+  The copy is capped at `MATERIALIZE_MAX_ROWS` and at the lowest `maxReadRows` of the rules matched
+  in either context.
 
 ## Write protection
 

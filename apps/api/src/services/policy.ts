@@ -71,6 +71,7 @@ function denyAll(reasons: string[], version = ''): PolicyDecision {
     reasons,
     matchedRuleIds: [],
     limits: { ...DEFAULT_LIMITS },
+    rowLimitsFromRules: { maxReadRows: false, maxWriteRows: false },
     policyVersion: version,
   };
 }

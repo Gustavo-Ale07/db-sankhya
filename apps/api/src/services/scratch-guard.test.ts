@@ -170,6 +170,19 @@ describe('analyzeScratchSql', () => {
       });
     });
 
+    it('reads USING columns on every table and every column of a NATURAL JOIN', () => {
+      const using = cols('SELECT id FROM tmp_p JOIN tmp_q USING (email)');
+      expect(using).toContainEqual({ table: 'tmp_p', name: 'email' });
+      expect(using).toContainEqual({ table: 'tmp_q', name: 'email' });
+      for (const sql of [
+        'SELECT id FROM tmp_p NATURAL JOIN tmp_q',
+        'SELECT id FROM tmp_p natural LEFT JOIN tmp_q',
+      ]) {
+        const c = analyzeScratchSql(sql);
+        for (const t of c.tables) expect(c.columns, sql).toContainEqual({ table: t, name: '*' });
+      }
+    });
+
     it('is left undefined for statements other than SELECT', () => {
       expect(analyzeScratchSql('INSERT INTO tmp_a SELECT id FROM tmp_b').columns).toBeUndefined();
       expect(analyzeScratchSql('UPDATE tmp_a SET id = 2').columns).toBeUndefined();

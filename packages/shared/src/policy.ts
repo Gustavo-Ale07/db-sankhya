@@ -145,6 +145,11 @@ export interface PolicyDecision {
   reasons: string[];
   matchedRuleIds: string[];
   limits: EffectiveLimits;
+  /**
+   * Which row limits a matching ALLOW rule set (as opposed to the defaults or ceilings), so a
+   * caller can apply a limit only when a rule asked for it.
+   */
+  rowLimitsFromRules: { maxReadRows: boolean; maxWriteRows: boolean };
   policyVersion: string;
 }
 
@@ -272,6 +277,7 @@ export function evaluatePolicy(
       reasons: ['policy evaluation failed'],
       matchedRuleIds: [],
       limits: { ...DEFAULT_LIMITS },
+      rowLimitsFromRules: { maxReadRows: false, maxWriteRows: false },
       policyVersion: version,
     };
   }
@@ -299,6 +305,7 @@ function evaluate(
 ): PolicyDecision {
   const ceilings = resolveCeilings(readOwn(options, 'defaults'));
   const limits: EffectiveLimits = { ...DEFAULT_LIMITS, ...ceilings };
+  const rowLimitsFromRules = { maxReadRows: false, maxWriteRows: false };
   const reasons: string[] = [];
   const matchedRuleIds: string[] = [];
   const deny = (...why: string[]): PolicyDecision => ({
@@ -306,6 +313,7 @@ function evaluate(
     reasons: [...reasons, ...why],
     matchedRuleIds,
     limits,
+    rowLimitsFromRules,
     policyVersion: version,
   });
 
@@ -346,6 +354,7 @@ function evaluate(
 
   for (const key of ROW_LIMITS) {
     limits[key] = Math.min(limits[key], ...allows.map((r) => r.rows[key] ?? limits[key]));
+    rowLimitsFromRules[key] = allows.some((r) => r.rows[key] !== undefined);
   }
   for (const key of FLAG_LIMITS) {
     limits[key] = DEFAULT_LIMITS[key] || allows.some((r) => r.flags[key] === true);
@@ -392,7 +401,14 @@ function evaluate(
     limits.requireStrongConfirmation = true;
   }
 
-  return { effect: 'ALLOW', reasons, matchedRuleIds, limits, policyVersion: version };
+  return {
+    effect: 'ALLOW',
+    reasons,
+    matchedRuleIds,
+    limits,
+    rowLimitsFromRules,
+    policyVersion: version,
+  };
 }
 
 function readOwn(obj: unknown, key: string): unknown {

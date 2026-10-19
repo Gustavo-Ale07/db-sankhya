@@ -130,7 +130,9 @@ export async function scratchRoutes(app: FastifyInstance): Promise<void> {
       };
       await requireFor(request, auth, stmt.action, denial);
       // A SELECT carries the columns it reads; any other statement is evaluated as `*` on every
-      // table it touches. The workspace quotas are the ceilings that rules can only lower.
+      // table it touches. SCRATCH_MAX_ROWS is the read ceiling that rules can only lower. Writes
+      // are capped only when a matching rule sets maxWriteRows (the default write cap is meant
+      // for ERP writes); otherwise the workspace row and byte quotas bound them.
       const decision = await evaluateFor({
         policies,
         auth,
@@ -140,7 +142,7 @@ export async function scratchRoutes(app: FastifyInstance): Promise<void> {
         connectionId: SCRATCH_CONNECTION_ID,
         entities: tables,
         ...(stmt.columns ? { columns: stmt.columns } : {}),
-        defaults: { maxReadRows: config.scratch.maxRows, maxWriteRows: config.scratch.maxRows },
+        defaults: { maxReadRows: config.scratch.maxRows },
       });
       if (decision.effect !== 'ALLOW') {
         const err = new AppError('FORBIDDEN', DENIED);
@@ -153,7 +155,9 @@ export async function scratchRoutes(app: FastifyInstance): Promise<void> {
         return redact(
           await workspace.execStatement(stmt, signal, {
             maxResultRows: decision.limits.maxReadRows,
-            ...(stmt.mutating ? { maxWriteRows: decision.limits.maxWriteRows } : {}),
+            ...(stmt.mutating && decision.rowLimitsFromRules.maxWriteRows
+              ? { maxWriteRows: decision.limits.maxWriteRows }
+              : {}),
           }),
         );
       } finally {
@@ -213,6 +217,10 @@ export async function scratchRoutes(app: FastifyInstance): Promise<void> {
       const connectionId = body.connectionId ?? defaultConnection();
       const groupIds = await authz.activeGroupIds(auth.user.id);
 
+      // MATERIALIZE_MAX_ROWS is the ceiling of the copy; the maxReadRows of every
+      // rule below (both TEMP.MATERIALIZE contexts and the source read) can only lower it.
+      const defaults = { maxReadRows: config.materializeMaxRows };
+
       // TEMP.MATERIALIZE is evaluated in both contexts and must be allowed in each: the scratch
       // side (SANDBOX, `scratch`, the target table) and the source side (the Sankhya connection,
       // its environment, then the entities and columns the read touches). QUERY.SELECT is
@@ -225,14 +233,13 @@ export async function scratchRoutes(app: FastifyInstance): Promise<void> {
         environment: SCRATCH_ENVIRONMENT,
         connectionId: SCRATCH_CONNECTION_ID,
         entities: [body.into],
+        defaults,
       });
       if (target.effect !== 'ALLOW') {
         const err = new AppError('FORBIDDEN', DENIED);
         await recordDenial(request, auth, { ...denial, err, details: policyDetails(target) });
         throw err;
       }
-      // MATERIALIZE_MAX_ROWS is the ceiling of the copy; read rules can only lower it.
-      const defaults = { maxReadRows: config.materializeMaxRows };
       const access = await authorizeConnection({
         policies,
         auth,
@@ -307,7 +314,11 @@ export async function scratchRoutes(app: FastifyInstance): Promise<void> {
           if (copy.effect !== 'ALLOW') return { effect: 'DENY', reason: DENIED };
           return {
             effect: 'ALLOW',
-            maxRows: Math.min(read.limits.maxReadRows, copy.limits.maxReadRows),
+            maxRows: Math.min(
+              target.limits.maxReadRows,
+              read.limits.maxReadRows,
+              copy.limits.maxReadRows,
+            ),
           };
         };
 

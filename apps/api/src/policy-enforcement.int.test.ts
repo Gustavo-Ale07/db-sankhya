@@ -375,6 +375,7 @@ describe('scratch routes', () => {
     const { cookie } = await h.viewer();
     expect((await exec(h, cookie, 'CREATE TABLE tmp_p (id int, email text)')).statusCode).toBe(200);
     expect((await exec(h, cookie, "INSERT INTO tmp_p VALUES (1, 'a@x')")).statusCode).toBe(200);
+    expect((await exec(h, cookie, 'CREATE TABLE tmp_q (email text)')).statusCode).toBe(200);
     for (const sqlText of ['SELECT id FROM tmp_p', 'SELECT count(*) FROM tmp_p']) {
       const res = await exec(h, cookie, sqlText);
       expect(res.statusCode, `${sqlText} ${res.body}`).toBe(200);
@@ -385,6 +386,8 @@ describe('scratch routes', () => {
       'SELECT p.id FROM tmp_p p WHERE p.email IS NOT NULL',
       'SELECT row_to_json(p) FROM tmp_p p',
       'SELECT tmp_p FROM tmp_p',
+      'SELECT id FROM tmp_p JOIN tmp_q USING (email)',
+      'SELECT id FROM tmp_p NATURAL JOIN tmp_q',
     ]) {
       const res = await exec(h, cookie, sqlText);
       expect(res.statusCode, sqlText).toBe(403);
@@ -405,19 +408,31 @@ describe('scratch routes', () => {
     expect(res.json().rows).toHaveLength(3);
   });
 
-  it("refuses a scratch write over the policy's maxWriteRows and rolls it back", async () => {
+  it('does not cap scratch writes at the default write limit', async () => {
     const h = await setup();
-    await h.policy({ effect: 'ALLOW', actions: ['TEMP.WRITE'], limits: { maxWriteRows: 5 } });
     const { cookie } = await h.viewer();
     expect((await exec(h, cookie, 'CREATE TABLE tmp_n (a int)')).statusCode).toBe(200);
-    const ok = await exec(h, cookie, 'INSERT INTO tmp_n SELECT g FROM generate_series(1, 5) g');
+    const ins = await exec(h, cookie, 'INSERT INTO tmp_n SELECT g FROM generate_series(1, 1500) g');
+    expect(ins.statusCode, ins.body).toBe(200);
+    const upd = await exec(h, cookie, 'UPDATE tmp_n SET a = a + 1 WHERE a > 0');
+    expect(upd.statusCode, upd.body).toBe(200);
+    expect(upd.json().rowCount).toBe(1500);
+  });
+
+  it("refuses a scratch write over a rule's maxWriteRows and rolls it back", async () => {
+    const h = await setup();
+    await h.policy({ effect: 'ALLOW', actions: ['TEMP.WRITE'], limits: { maxWriteRows: 10 } });
+    const { cookie } = await h.viewer();
+    expect((await exec(h, cookie, 'CREATE TABLE tmp_n (a int)')).statusCode).toBe(200);
+    const ok = await exec(h, cookie, 'INSERT INTO tmp_n SELECT g FROM generate_series(1, 10) g');
     expect(ok.statusCode, ok.body).toBe(200);
-    const res = await exec(h, cookie, 'UPDATE tmp_n SET a = a + 1 WHERE a > 0');
-    const big = await exec(h, cookie, 'INSERT INTO tmp_n SELECT g FROM generate_series(1, 6) g');
-    expect(res.statusCode, res.body).toBe(200);
+    expect((await exec(h, cookie, 'INSERT INTO tmp_n VALUES (11)')).statusCode).toBe(200);
+    const big = await exec(h, cookie, 'UPDATE tmp_n SET a = 0 WHERE a > 0');
     expect(big.statusCode).toBe(400);
     expect(codeOf(big)).toBe('QUERY_LIMIT_EXCEEDED');
-    expect(await tables(h, cookie)).toEqual([{ name: 'tmp_n', rows: 5 }]);
+    // Rolled back: no row was zeroed.
+    const zeroed = await exec(h, cookie, 'SELECT a FROM tmp_n WHERE a = 0');
+    expect(zeroed.json().rowCount).toBe(0);
   });
 
   it('evaluates the read policy before listing scratch tables', async () => {
@@ -516,6 +531,20 @@ describe('materialization route', () => {
     expect(await tables(h, cookie)).toEqual([]);
     const ok = await materialize(h, cookie, { sql: 'SELECT CODCID FROM TSICID', into: 'tmp_src' });
     expect(ok.statusCode, ok.body).toBe(200);
+  });
+
+  it("caps the copy at a scratch-side TEMP.MATERIALIZE rule's maxReadRows", async () => {
+    const h = await setup();
+    await h.policy({
+      effect: 'ALLOW',
+      actions: ['TEMP.MATERIALIZE'],
+      environments: ['SANDBOX'],
+      limits: { maxReadRows: 4 },
+    });
+    const { cookie } = await h.viewer();
+    const res = await materialize(h, cookie, READ);
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json()).toMatchObject({ table: 'tmp_par', rows: 4, truncated: true });
   });
 
   it('needs replace: true to overwrite an existing table', async () => {

@@ -1290,3 +1290,25 @@ describe('canonicalJSON', () => {
     );
   });
 });
+
+describe('rowLimitsFromRules', () => {
+  it('reports only the row limits a matching ALLOW rule set', () => {
+    const none = evaluatePolicy(req(), [], ALL, { defaults: { maxWriteRows: 500 } });
+    expect(none.rowLimitsFromRules).toEqual({ maxReadRows: false, maxWriteRows: false });
+    expect(none.limits.maxWriteRows).toBe(500);
+
+    const capped = evaluatePolicy(
+      req({ action: 'TEMP.WRITE' }),
+      [
+        rule({ id: 'cap', actions: ['TEMP.WRITE'], limits: { maxWriteRows: 10 } }),
+        rule({ id: 'other', entities: ['TSIUSU'], limits: { maxReadRows: 3 } }),
+      ],
+      ALL,
+    );
+    expect(capped.rowLimitsFromRules).toEqual({ maxReadRows: false, maxWriteRows: true });
+    expect(capped.limits.maxWriteRows).toBe(10);
+
+    const failed = evaluatePolicy(req({ action: 'NOPE' as Permission }), [], ALL);
+    expect(failed.rowLimitsFromRules).toEqual({ maxReadRows: false, maxWriteRows: false });
+  });
+});
