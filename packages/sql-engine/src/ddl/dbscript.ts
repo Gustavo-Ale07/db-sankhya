@@ -1,37 +1,42 @@
 /**
  * Add-on Studio dbscript file (`V<n>.xml`, audit §3.3): one `<sql>` element per
- * statement, each with an `<oracle>` and an `<mssql>` body.
+ * statement, each with an `<oracle>` and an `<mssql>` body in a CDATA section.
  *
  *   <?xml version="1.0" encoding="UTF-8"?>
  *   <scripts version="3">
  *     <sql nomeTabela="AD_X" ordem="1" executar="SE_NAO_EXISTIR" tipoObjeto="COLUNA" nomeObjeto="NOVO">
- *       <oracle>ALTER TABLE AD_X ADD (NOVO DATE)</oracle>
- *       <mssql>ALTER TABLE AD_X ADD NOVO DATETIME</mssql>
+ *       <oracle><![CDATA[ALTER TABLE AD_X ADD (NOVO DATE)]]></oracle>
+ *       <mssql><![CDATA[ALTER TABLE AD_X ADD NOVO DATETIME]]></mssql>
  *     </sql>
  *   </scripts>
  *
- * `tipoObjeto` is TABELA, COLUNA or CONSTRAINT. Bodies never contain `;`
- * (dbscripts must not end in one, and every identifier and default is validated
- * against an alphabet without it). Statements are emitted in a safe order:
- * renames, primary-key drop, field drops, field adds, field changes, defaults,
+ * `toDbScriptXml` takes the current and the desired model and computes the
+ * changes itself (a caller's change list is never trusted). `tipoObjeto` is
+ * TABELA, COLUNA or CONSTRAINT. The raw file never contains `;`: bodies are
+ * built only from validated identifiers and defaults, and are checked again
+ * before they are written. Statements are emitted in a safe order: renames,
+ * primary-key drop, field drops, field adds, field changes, defaults,
  * primary-key add. Description-only changes produce no statement (they belong
- * to the AutoDDL dictionary). Nothing here is ever executed by DB-Sankhya.
+ * to the AutoDDL dictionary). Changes that the target databases cannot apply
+ * in place are refused with SQL_UNSUPPORTED instead of producing a script that
+ * fails half-way. Nothing here is ever executed by DB-Sankhya.
  */
 import { AppError } from '@dbx/shared';
 import { escapeXml } from './autoddl';
-import type { DdlChange, DdlChangeKind } from './diff';
-import {
-  assertCustomTable,
-  assertIdentifier,
-  validateTableModel,
-  type FieldModel,
-  type ModelOptions,
-  type TableModel,
-} from './model';
+import { diffTable, type DdlChange, type DdlSeverity } from './diff';
+import { validateTableModel, type FieldModel, type ModelOptions, type TableModel } from './model';
 
 export interface DbScriptOptions extends ModelOptions {
   /** The dbscript version, `n` in `V<n>.xml`; a positive integer. */
   version: number;
+}
+
+export interface DbScriptResult {
+  xml: string;
+  /** The worst severity of the computed changes. */
+  severity: DdlSeverity;
+  /** The changes the script applies, as computed by `diffTable`. */
+  changes: DdlChange[];
 }
 
 type Executar = 'SE_NAO_EXISTIR' | 'SE_EXISTIR' | 'SEMPRE';
@@ -47,22 +52,27 @@ interface Statement {
   mssql: string;
 }
 
-const KINDS: readonly DdlChangeKind[] = [
-  'CREATE_TABLE',
-  'RENAME_TABLE',
-  'ADD_FIELD',
-  'DROP_FIELD',
-  'RENAME_FIELD',
-  'CHANGE_TYPE',
-  'WIDEN_SIZE',
-  'NARROW_SIZE',
-  'CHANGE_REQUIRED',
-  'CHANGE_DEFAULT',
-  'CHANGE_DESCRIPTION',
-  'CHANGE_PRIMARY_KEY',
-];
+/** What the statement builders need besides the change itself. */
+interface Context {
+  desired: TableModel;
+  /** Current fields keyed by their name in the desired model (renames applied). */
+  currentByNewName: Map<string, FieldModel>;
+  /** The current primary key, in desired-model names. */
+  currentPrimaryKey: string[];
+  /** Whether the change list drops the primary key before altering columns. */
+  dropsPrimaryKey: boolean;
+}
 
 const invalid = (message: string): AppError => new AppError('VALIDATION_ERROR', message);
+const unsupported = (message: string): AppError => new AppError('SQL_UNSUPPORTED', message);
+
+/** Wraps a statement body in CDATA; refuses text that would end the section or contains `;`. */
+export function cdata(body: string): string {
+  if (body.includes(']]>')) throw invalid('A generated statement contains "]]>".');
+  // Defence in depth: validated input can never produce a ';'.
+  if (body.includes(';')) throw invalid('A generated statement contains ";".');
+  return `<![CDATA[${body}]]>`;
+}
 
 function oracleType(f: FieldModel): string {
   switch (f.dataType) {
@@ -71,8 +81,7 @@ function oracleType(f: FieldModel): string {
     case 'INTEIRO':
       return `NUMBER(${f.size ?? 10})`;
     case 'DECIMAL':
-      if (f.size === undefined) return 'NUMBER';
-      return f.scale === undefined ? `NUMBER(${f.size})` : `NUMBER(${f.size},${f.scale})`;
+      return `NUMBER(${f.size ?? 10},${f.scale ?? 0})`;
     case 'DATA':
     case 'DATA_HORA':
     case 'HORA':
@@ -93,8 +102,7 @@ function mssqlType(f: FieldModel): string {
     case 'INTEIRO':
       return f.size === undefined ? 'INT' : `NUMERIC(${f.size},0)`;
     case 'DECIMAL':
-      if (f.size === undefined) return 'FLOAT';
-      return f.scale === undefined ? `DECIMAL(${f.size})` : `DECIMAL(${f.size},${f.scale})`;
+      return `DECIMAL(${f.size ?? 10},${f.scale ?? 0})`;
     case 'DATA':
     case 'DATA_HORA':
     case 'HORA':
@@ -125,39 +133,68 @@ function sqlString(value: string): string {
   return `'${value}'`;
 }
 
-function mssqlDropPk(table: string): string {
+/**
+ * Runs `ALTER TABLE <table> DROP CONSTRAINT <name>` for a constraint name found
+ * at run time. The statement is built into a variable first: T-SQL does not
+ * accept a function call such as QUOTENAME inside EXEC('…').
+ */
+function mssqlDropNamedConstraint(variable: string, table: string, lookup: string): string {
   return (
-    `DECLARE @pk SYSNAME SELECT @pk = name FROM sys.key_constraints ` +
-    `WHERE parent_object_id = OBJECT_ID(${sqlString(table)}) AND type = 'PK' ` +
-    `IF @pk IS NOT NULL EXEC('ALTER TABLE ${table} DROP CONSTRAINT ' + QUOTENAME(@pk))`
+    `DECLARE @${variable} SYSNAME, @sql NVARCHAR(400) ${lookup} ` +
+    `IF @${variable} IS NOT NULL BEGIN ` +
+    `SET @sql = N'ALTER TABLE ${table} DROP CONSTRAINT ' + QUOTENAME(@${variable}) ` +
+    'EXEC(@sql) END'
+  );
+}
+
+function mssqlDropPk(table: string): string {
+  return mssqlDropNamedConstraint(
+    'pk',
+    table,
+    `SELECT @pk = name FROM sys.key_constraints ` +
+      `WHERE parent_object_id = OBJECT_ID(${sqlString(table)}) AND type = 'PK'`,
   );
 }
 
 function mssqlDropDefault(table: string, field: string): string {
-  return (
-    `DECLARE @df SYSNAME SELECT @df = dc.name FROM sys.default_constraints dc ` +
-    `JOIN sys.columns c ON c.object_id = dc.parent_object_id AND c.column_id = dc.parent_column_id ` +
-    `WHERE dc.parent_object_id = OBJECT_ID(${sqlString(table)}) AND c.name = ${sqlString(field)} ` +
-    `IF @df IS NOT NULL EXEC('ALTER TABLE ${table} DROP CONSTRAINT ' + QUOTENAME(@df))`
+  return mssqlDropNamedConstraint(
+    'df',
+    table,
+    `SELECT @df = dc.name FROM sys.default_constraints dc ` +
+      `JOIN sys.columns c ON c.object_id = dc.parent_object_id AND c.column_id = dc.parent_column_id ` +
+      `WHERE dc.parent_object_id = OBJECT_ID(${sqlString(table)}) AND c.name = ${sqlString(field)}`,
   );
 }
 
-function checkChange(change: DdlChange, opts: ModelOptions): DdlChange {
-  if (typeof change !== 'object' || change === null || !KINDS.includes(change.kind)) {
-    throw invalid('Unknown DDL change.');
+const LOB_TYPES: ReadonlySet<string> = new Set(['CAIXA_TEXTO', 'ARQUIVO']);
+
+/** Refuses column alterations that Oracle or SQL Server cannot apply in place. */
+function assertAlterable(change: DdlChange, f: FieldModel, ctx: Context): void {
+  const before = ctx.currentByNewName.get(f.name);
+  if (change.kind === 'CHANGE_TYPE' && before) {
+    if (LOB_TYPES.has(before.dataType) || LOB_TYPES.has(f.dataType)) {
+      throw unsupported(
+        `Changing ${f.name} from ${before.dataType} to ${f.dataType} is not supported: Oracle ` +
+          'cannot MODIFY a column to or from CLOB/BLOB. Add a new field and migrate the data.',
+      );
+    }
+    if (before.default !== undefined || f.default !== undefined) {
+      throw unsupported(
+        `Changing the type of ${f.name} is not supported while it has a default: SQL Server ` +
+          'refuses ALTER COLUMN on a column bound to a default constraint. Remove the default first.',
+      );
+    }
   }
-  const out: DdlChange = { ...change };
-  if (change.field !== undefined) out.field = assertIdentifier(change.field, 'field');
-  if (change.from !== undefined) {
-    out.from =
-      change.kind === 'RENAME_TABLE'
-        ? assertCustomTable(change.from, opts.customPrefixes)
-        : assertIdentifier(change.from, 'field');
+  if (ctx.currentPrimaryKey.includes(f.name) && !ctx.dropsPrimaryKey) {
+    throw unsupported(
+      `Altering ${f.name} is not supported while it is part of the primary key: SQL Server ` +
+        'refuses ALTER COLUMN on a primary-key column. Change the primary key in the same script.',
+    );
   }
-  return out;
 }
 
-function statementsFor(change: DdlChange, m: TableModel): Statement[] {
+function statementsFor(change: DdlChange, ctx: Context): Statement[] {
+  const m = ctx.desired;
   const t = m.name;
   const fieldOf = (): FieldModel => {
     const f = m.fields.find((x) => x.name === change.field);
@@ -240,7 +277,7 @@ function statementsFor(change: DdlChange, m: TableModel): Statement[] {
           'SE_EXISTIR',
           f,
           `ALTER TABLE ${t} DROP COLUMN ${f}`,
-          `ALTER TABLE ${t} DROP COLUMN ${f}`,
+          `${mssqlDropDefault(t, f)} ALTER TABLE ${t} DROP COLUMN ${f}`,
         ),
       ];
     }
@@ -260,6 +297,7 @@ function statementsFor(change: DdlChange, m: TableModel): Statement[] {
     case 'WIDEN_SIZE':
     case 'NARROW_SIZE': {
       const f = fieldOf();
+      assertAlterable(change, f, ctx);
       const nullability = f.required ? 'NOT NULL' : 'NULL';
       return [
         col(
@@ -273,6 +311,7 @@ function statementsFor(change: DdlChange, m: TableModel): Statement[] {
     }
     case 'CHANGE_REQUIRED': {
       const f = fieldOf();
+      assertAlterable(change, f, ctx);
       const nullability = f.required ? 'NOT NULL' : 'NULL';
       return [
         col(
@@ -299,8 +338,9 @@ function statementsFor(change: DdlChange, m: TableModel): Statement[] {
       ];
     }
     case 'CHANGE_PRIMARY_KEY': {
-      const out: Statement[] = [
-        {
+      const out: Statement[] = [];
+      if ((change.previousPrimaryKey ?? []).length > 0) {
+        out.push({
           phase: 2,
           nomeTabela: t,
           executar: 'SEMPRE',
@@ -308,8 +348,8 @@ function statementsFor(change: DdlChange, m: TableModel): Statement[] {
           nomeObjeto: t,
           oracle: `ALTER TABLE ${t} DROP PRIMARY KEY`,
           mssql: mssqlDropPk(t),
-        },
-      ];
+        });
+      }
       if (m.primaryKey.length > 0) {
         const add = `ALTER TABLE ${t} ADD PRIMARY KEY (${m.primaryKey.join(', ')})`;
         out.push({
@@ -329,20 +369,42 @@ function statementsFor(change: DdlChange, m: TableModel): Statement[] {
   }
 }
 
+/**
+ * Builds the dbscript that turns `current` (null for a new table) into
+ * `desired`. Both models are validated; the changes come from `diffTable`.
+ */
 export function toDbScriptXml(
-  changes: DdlChange[],
-  model: TableModel,
+  current: TableModel | null,
+  desired: TableModel,
   opts: DbScriptOptions,
-): string {
+): DbScriptResult {
   const { version } = opts;
   if (!Number.isSafeInteger(version) || version < 1) {
     throw invalid('The dbscript version must be a positive integer.');
   }
-  if (!Array.isArray(changes)) throw invalid('changes must be an array.');
-  const m = validateTableModel(model, opts);
+  const cur = current === null ? null : validateTableModel(current, opts);
+  const m = validateTableModel(desired, opts);
+  const { changes, severity } = diffTable(cur, m);
+
+  const renamedTo = new Map<string, string>();
+  for (const c of changes) {
+    if (c.kind === 'RENAME_FIELD' && c.from !== undefined && c.field !== undefined) {
+      renamedTo.set(c.from, c.field);
+    }
+  }
+  const ctx: Context = {
+    desired: m,
+    currentByNewName: new Map(
+      (cur?.fields ?? []).map((f) => [renamedTo.get(f.name) ?? f.name, f] as const),
+    ),
+    currentPrimaryKey: (cur?.primaryKey ?? []).map((k) => renamedTo.get(k) ?? k),
+    dropsPrimaryKey: changes.some(
+      (c) => c.kind === 'CHANGE_PRIMARY_KEY' && (c.previousPrimaryKey ?? []).length > 0,
+    ),
+  };
+
   const statements = changes
-    .map((c) => checkChange(c, opts))
-    .flatMap((c) => statementsFor(c, m))
+    .flatMap((c) => statementsFor(c, ctx))
     .map((s, i) => ({ s, i }))
     .sort((a, b) => a.s.phase - b.s.phase || a.i - b.i)
     .map(({ s }) => s);
@@ -350,18 +412,19 @@ export function toDbScriptXml(
 
   const lines = ['<?xml version="1.0" encoding="UTF-8"?>', `<scripts version="${version}">`];
   statements.forEach((s, i) => {
-    for (const body of [s.oracle, s.mssql]) {
-      // Defence in depth: validated input can never produce a ';'.
-      if (body.includes(';')) throw invalid('A generated statement contains ";".');
-    }
     lines.push(
       `  <sql nomeTabela="${escapeXml(s.nomeTabela)}" ordem="${i + 1}" executar="${s.executar}" ` +
         `tipoObjeto="${s.tipoObjeto}" nomeObjeto="${escapeXml(s.nomeObjeto)}">`,
-      `    <oracle>${escapeXml(s.oracle)}</oracle>`,
-      `    <mssql>${escapeXml(s.mssql)}</mssql>`,
+      `    <oracle>${cdata(s.oracle)}</oracle>`,
+      `    <mssql>${cdata(s.mssql)}</mssql>`,
       '  </sql>',
     );
   });
   lines.push('</scripts>');
-  return `${lines.join('\n')}\n`;
+  const xml = `${lines.join('\n')}\n`;
+  // Defence in depth: attributes are escaped, so the only ';' could come from an entity.
+  if (xml.replace(/&(amp|lt|gt|quot|apos);/g, '').includes(';')) {
+    throw invalid('The generated dbscript contains ";".');
+  }
+  return { xml, severity, changes };
 }

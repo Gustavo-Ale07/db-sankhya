@@ -7,6 +7,7 @@ import {
   tableFromCreate,
   tableFromCreateSql,
   validateTableModel,
+  type FieldModel,
   type TableModel,
 } from './model';
 
@@ -49,7 +50,6 @@ describe('mapDataType', () => {
       size: 10,
       scale: 2,
     });
-    expect(mapDataType({ dataType: 'DECIMAL' })).toEqual({ dataType: 'DECIMAL' });
     expect(mapDataType({ dataType: 'DATE' })).toEqual({ dataType: 'DATA' });
     expect(mapDataType({ dataType: 'TIMESTAMP' })).toEqual({ dataType: 'DATA_HORA' });
     expect(mapDataType({ dataType: 'DATETIME' })).toEqual({ dataType: 'DATA_HORA' });
@@ -69,6 +69,8 @@ describe('mapDataType', () => {
       { dataType: 'CHAR', length: 2 },
       { dataType: 'VARCHAR' },
       { dataType: 'NUMBER' },
+      { dataType: 'DECIMAL' },
+      { dataType: 'NUMERIC' },
       { dataType: 'JSON' },
     ]) {
       expect(codeOf(() => mapDataType(def))).toBe('SQL_UNSUPPORTED');
@@ -92,6 +94,24 @@ describe('assertCustomTable', () => {
     expect(codeOf(() => assertCustomTable('AD_X;DROP'))).toBe('VALIDATION_ERROR');
     expect(codeOf(() => assertCustomTable('AD X'))).toBe('VALIDATION_ERROR');
     expect(codeOf(() => assertCustomTable('"AD_X"'))).toBe('VALIDATION_ERROR');
+  });
+
+  it('checks the raw name before upper-casing, with a 30-character limit', () => {
+    // U+0131 (dotless i) and U+017F (long s) upper-case to ASCII I and S.
+    expect(codeOf(() => assertCustomTable('AD_ıTEM'))).toBe('VALIDATION_ERROR');
+    expect(codeOf(() => assertCustomTable('AD_ſAIDA'))).toBe('VALIDATION_ERROR');
+    expect(codeOf(() => assertCustomTable('_AD_X'))).toBe('VALIDATION_ERROR');
+    expect(assertCustomTable(`AD_${'X'.repeat(27)}`)).toHaveLength(30);
+    expect(codeOf(() => assertCustomTable(`AD_${'X'.repeat(28)}`))).toBe('VALIDATION_ERROR');
+  });
+
+  it('fails closed on a bad prefix list', () => {
+    for (const prefixes of [[], [''], ['AD'], ['ad_'], ['A;_'], ['%_'], ['_']]) {
+      expect(
+        codeOf(() => assertCustomTable('AD_X', prefixes)),
+        JSON.stringify(prefixes),
+      ).toBe('VALIDATION_ERROR');
+    }
   });
 });
 
@@ -243,6 +263,47 @@ describe('validateTableModel', () => {
         codeOf(() => validateTableModel(m)),
         JSON.stringify(m),
       ).toBe('VALIDATION_ERROR');
+  });
+
+  const withField = (f: FieldModel): TableModel => ({ ...base, fields: [base.fields[0]!, f] });
+
+  it('requires a precision for DECIMAL and defaults its scale to 0', () => {
+    expect(
+      codeOf(() =>
+        validateTableModel(withField({ name: 'V', dataType: 'DECIMAL', required: false })),
+      ),
+    ).toBe('VALIDATION_ERROR');
+    const m = validateTableModel(
+      withField({ name: 'V', dataType: 'DECIMAL', size: 8, required: false }),
+    );
+    expect(m.fields[1]).toMatchObject({ size: 8, scale: 0 });
+  });
+
+  it('accepts Latin text defaults only', () => {
+    const text = (d: string): FieldModel => ({
+      name: 'T',
+      dataType: 'TEXTO',
+      size: 20,
+      required: false,
+      default: d,
+    });
+    expect(validateTableModel(withField(text('São Paulo-1')))).toBeTruthy();
+    for (const d of ['', 'OʼK', 'O’K', 'O＇K', 'a]b', 'a>b', "O'K", 'a;b', 'a<b']) {
+      expect(
+        codeOf(() => validateTableModel(withField(text(d)))),
+        JSON.stringify(d),
+      ).toBe('VALIDATION_ERROR');
+    }
+  });
+
+  it('refuses descriptions with characters that XML or the terminal cannot carry', () => {
+    for (const description of ['a￾', 'a￿', 'a\uD800', 'a\uDC00b', 'a\u0085', 'a\u009B']) {
+      expect(
+        codeOf(() => validateTableModel({ ...base, description })),
+        JSON.stringify(description),
+      ).toBe('VALIDATION_ERROR');
+    }
+    expect(validateTableModel({ ...base, description: 'Ok 😀' }).description).toBe('Ok 😀');
   });
 
   it('refuses defaults on date and binary types', () => {

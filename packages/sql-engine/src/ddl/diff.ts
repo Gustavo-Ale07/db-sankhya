@@ -7,7 +7,8 @@
  * - DESTRUCTIVE: drop a field, narrow a size, change a type, rename a field or
  *   the table, change the primary key.
  * A dropped and an added field with identical definitions are reported as one
- * rename. Models are compared as given; validate them first.
+ * rename when that pairing is unique; otherwise as DROP + ADD. Models are
+ * compared as given; validate them first.
  */
 import type { FieldModel, TableModel } from './model';
 
@@ -33,6 +34,8 @@ export interface DdlChange {
   field?: string;
   /** Previous name, for RENAME_FIELD and RENAME_TABLE. */
   from?: string;
+  /** The current primary key (field names as in the desired model), for CHANGE_PRIMARY_KEY. */
+  previousPrimaryKey?: string[];
   severity: DdlSeverity;
   note: string;
 }
@@ -65,12 +68,35 @@ function describeType(f: FieldModel): string {
   return f.scale === undefined ? `${f.dataType}(${f.size})` : `${f.dataType}(${f.size},${f.scale})`;
 }
 
-/** Compares an optional bound: undefined means unbounded (the widest). */
-function compareBound(from: number | undefined, to: number | undefined): number {
-  if (from === to) return 0;
-  if (from === undefined) return -1;
-  if (to === undefined) return 1;
-  return Math.sign(to - from);
+/** Digits an unsized INTEIRO holds (Oracle NUMBER(10); MSSQL INT holds fewer). */
+const UNSIZED_INTEGER_DIGITS = 10;
+
+/**
+ * Compares the sizes of two fields of the same type: -1 when anything narrows,
+ * 1 when something widens and nothing narrows, 0 when equal. Numeric types
+ * compare integer digits (`size - scale`) and scale separately, so trading
+ * integer digits for decimals is a narrowing. A sized number becoming unsized
+ * is a narrowing (MSSQL INT / FLOAT are not wider than NUMERIC(p,s)).
+ */
+function compareSize(from: FieldModel, to: FieldModel): number {
+  if (from.dataType !== 'INTEIRO' && from.dataType !== 'DECIMAL') {
+    if (from.size === to.size) return 0;
+    if (from.size === undefined) return -1;
+    if (to.size === undefined) return 1;
+    return Math.sign(to.size - from.size);
+  }
+  if (from.size === undefined && to.size === undefined) return 0;
+  if (to.size === undefined) return -1;
+  if (from.size === undefined) {
+    if (from.dataType === 'DECIMAL') return -1;
+    return to.size >= UNSIZED_INTEGER_DIGITS ? 1 : -1;
+  }
+  const fromScale = from.scale ?? 0;
+  const toScale = to.scale ?? 0;
+  const intDelta = to.size - toScale - (from.size - fromScale);
+  const scaleDelta = toScale - fromScale;
+  if (intDelta < 0 || scaleDelta < 0) return -1;
+  return intDelta > 0 || scaleDelta > 0 ? 1 : 0;
 }
 
 function fieldChanges(from: FieldModel, to: FieldModel): DdlChange[] {
@@ -81,19 +107,20 @@ function fieldChanges(from: FieldModel, to: FieldModel): DdlChange[] {
       kind: 'CHANGE_TYPE',
       field,
       severity: 'DESTRUCTIVE',
-      note: `Type changes from ${describeType(from)} to ${describeType(to)}; existing data may not convert.`,
+      note:
+        `Type changes from ${describeType(from)} to ${describeType(to)}; existing data may not ` +
+        'convert, and Oracle only changes the type of an empty column.',
     });
   } else {
-    const size = compareBound(from.size, to.size);
-    const scale = compareBound(from.scale, to.scale);
-    if (size < 0 || scale < 0) {
+    const cmp = compareSize(from, to);
+    if (cmp < 0) {
       out.push({
         kind: 'NARROW_SIZE',
         field,
         severity: 'DESTRUCTIVE',
         note: `Size narrows from ${describeType(from)} to ${describeType(to)}; values may be truncated or rejected.`,
       });
-    } else if (size > 0 || scale > 0) {
+    } else if (cmp > 0) {
       out.push({
         kind: 'WIDEN_SIZE',
         field,
@@ -162,15 +189,18 @@ export function diffTable(current: TableModel | null, desired: TableModel): DdlD
   const dropped = current.fields.filter((f) => !desiredNames.has(f.name));
   const added = desired.fields.filter((f) => !currentByName.has(f.name));
 
-  // Pair a dropped field with an added one of identical definition (a rename).
+  // Pair a dropped field with an added one of identical definition (a rename),
+  // but only when the pairing is unambiguous in both directions. Otherwise the
+  // change is a DROP + ADD, which is still DESTRUCTIVE.
   const renamedFrom = new Map<string, string>();
   const consumed = new Set<string>();
   for (const a of added) {
-    const match = dropped.find((d) => !consumed.has(d.name) && sameDefinition(d, a));
-    if (match) {
-      consumed.add(match.name);
-      renamedFrom.set(a.name, match.name);
-    }
+    const matches = dropped.filter((d) => sameDefinition(d, a));
+    if (matches.length !== 1) continue;
+    const match = matches[0]!;
+    if (added.filter((other) => sameDefinition(match, other)).length !== 1) continue;
+    consumed.add(match.name);
+    renamedFrom.set(a.name, match.name);
   }
 
   for (const f of desired.fields) {
@@ -223,6 +253,7 @@ export function diffTable(current: TableModel | null, desired: TableModel): DdlD
   if (pkBefore.join(',') !== desired.primaryKey.join(',')) {
     changes.push({
       kind: 'CHANGE_PRIMARY_KEY',
+      previousPrimaryKey: pkBefore,
       severity: 'DESTRUCTIVE',
       note: `Primary key changes from (${current.primaryKey.join(', ')}) to (${desired.primaryKey.join(', ')}).`,
     });

@@ -29,7 +29,7 @@ describe('toAutoDdlXml', () => {
         name: `F_${t}`,
         dataType: t,
         required: t === 'INTEIRO',
-        ...(t === 'TEXTO' ? { size: 10 } : {}),
+        ...(t === 'TEXTO' || t === 'DECIMAL' ? { size: 10 } : {}),
       })),
     });
     expect(DDL_DATA_TYPES).toHaveLength(9);

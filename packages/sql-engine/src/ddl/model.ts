@@ -55,15 +55,24 @@ export interface ModelOptions {
 
 export const DEFAULT_CUSTOM_PREFIXES: readonly string[] = ['AD_'];
 
-const IDENTIFIER_RE = /^[A-Z][A-Z0-9_]*$/;
-const MAX_IDENTIFIER = 128;
+/** Checked on the raw value, before upper-casing, so no Unicode case folding sneaks in. */
+const IDENTIFIER_RE = /^[A-Za-z][A-Za-z0-9_]*$/;
+/** Oracle < 12.2 limit; also keeps generated names portable. */
+const MAX_IDENTIFIER = 30;
+const PREFIX_RE = /^[A-Z][A-Z0-9]*_$/;
 const MAX_DESCRIPTION = 255;
 const MAX_SIZE = 4000;
-/** Letters (incl. accents), digits, space and a few punctuation marks; never `;`, quotes or `<&`. */
-const SAFE_TEXT_DEFAULT_RE = /^[\p{L}\p{N} _.,:/@#+-]*$/u;
+/**
+ * Latin letters (incl. Latin-1 accents), digits, space and a few punctuation
+ * marks. Never `;`, quotes, quote-like modifier letters, `<&`, `]` or `>`.
+ */
+const SAFE_TEXT_DEFAULT_RE = /^[A-Za-z\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u00FF0-9 _.,:/@#+-]+$/;
 const NUMERIC_DEFAULT_RE = /^-?\d{1,30}(\.\d{1,30})?$/;
 // eslint-disable-next-line no-control-regex
-const CONTROL_RE = /[\u0000-\u001f\u007f]/;
+const CONTROL_RE = /[\u0000-\u001f\u007f-\u009f]/;
+/** Characters that are not allowed in XML 1.0: U+FFFE/U+FFFF and lone surrogates. */
+const XML_INVALID_RE =
+  /[\uFFFE\uFFFF]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
 const unsupported = (message: string, details?: Record<string, unknown>): AppError =>
   new AppError('SQL_UNSUPPORTED', message, details);
@@ -73,11 +82,12 @@ const invalid = (message: string, details?: Record<string, unknown>): AppError =
 /** Upper-cases and checks an untrusted identifier; throws VALIDATION_ERROR otherwise. */
 export function assertIdentifier(value: unknown, what: string): string {
   if (typeof value !== 'string') throw invalid(`The ${what} name must be a string.`);
-  const upper = value.toUpperCase();
-  if (upper.length > MAX_IDENTIFIER || !IDENTIFIER_RE.test(upper)) {
-    throw invalid(`The ${what} name must match ^[A-Z][A-Z0-9_]*$.`, { [what]: value });
+  if (value.length > MAX_IDENTIFIER || !IDENTIFIER_RE.test(value)) {
+    throw invalid(`The ${what} name must match ^[A-Z][A-Z0-9_]*$ (at most 30 characters).`, {
+      [what]: value,
+    });
   }
-  return upper;
+  return value.toUpperCase();
 }
 
 /**
@@ -89,10 +99,22 @@ export function assertCustomTable(
   name: unknown,
   customPrefixes: readonly string[] = DEFAULT_CUSTOM_PREFIXES,
 ): string {
+  if (!Array.isArray(customPrefixes) || customPrefixes.length === 0) {
+    throw invalid('At least one custom table prefix must be configured.');
+  }
+  for (const p of customPrefixes) {
+    if (typeof p !== 'string' || !PREFIX_RE.test(p)) {
+      throw invalid(
+        'Custom table prefixes must look like XYZ_ (upper-case letters/digits, then "_").',
+        {
+          prefix: p,
+        },
+      );
+    }
+  }
   const table = assertIdentifier(name, 'table');
   const ok = customPrefixes.some((p) => {
-    const prefix = p.toUpperCase();
-    return prefix !== '' && table.startsWith(prefix) && table.length > prefix.length;
+    return table.startsWith(p) && table.length > p.length;
   });
   if (!ok) {
     throw unsupported(
@@ -109,7 +131,12 @@ function isPositiveInt(n: unknown): n is number {
 
 function checkDescription(value: unknown, where: string): string | undefined {
   if (value === undefined) return undefined;
-  if (typeof value !== 'string' || value.length > MAX_DESCRIPTION || CONTROL_RE.test(value)) {
+  if (
+    typeof value !== 'string' ||
+    value.length > MAX_DESCRIPTION ||
+    CONTROL_RE.test(value) ||
+    XML_INVALID_RE.test(value)
+  ) {
     throw invalid(`The description of ${where} must be plain text of at most 255 characters.`);
   }
   return value;
@@ -173,8 +200,10 @@ function checkField(raw: FieldModel): FieldModel {
       if (size !== undefined) out.size = size;
       break;
     case 'DECIMAL':
-      if (size !== undefined) out.size = size;
-      if (scale !== undefined) out.scale = scale;
+      // An unsized DECIMAL has no portable equivalent (Oracle NUMBER vs MSSQL FLOAT).
+      if (size === undefined) throw invalid(`Field ${name}: DECIMAL requires a precision.`);
+      out.size = size;
+      out.scale = scale ?? 0;
       break;
     default:
       if (size !== undefined || scale !== undefined) {
@@ -258,7 +287,7 @@ export function mapDataType(def: SourceType): Pick<FieldModel, 'dataType' | 'siz
       return { dataType: 'DECIMAL', size: length, scale };
     case 'DECIMAL':
     case 'NUMERIC':
-      if (length === undefined) return { dataType: 'DECIMAL' };
+      if (length === undefined) return fail();
       return scale === undefined
         ? { dataType: 'DECIMAL', size: length }
         : { dataType: 'DECIMAL', size: length, scale };

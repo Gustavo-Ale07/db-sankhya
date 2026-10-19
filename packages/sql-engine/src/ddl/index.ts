@@ -22,4 +22,4 @@ export {
   type DdlSeverity,
 } from './diff';
 export { escapeXml, toAutoDdlXml } from './autoddl';
-export { toDbScriptXml, type DbScriptOptions } from './dbscript';
+export { cdata, toDbScriptXml, type DbScriptOptions, type DbScriptResult } from './dbscript';
