@@ -7,7 +7,7 @@ import { DEFAULT_LIMITS, canonicalJSON, isAppError } from '@dbx/shared';
 import type { ErrorCode, PolicyDecision } from '@dbx/shared';
 import type { Capability } from '@dbx/sql-engine';
 import { sha256Hex } from '../security/crypto';
-import { PlansService, strongConfirmationPhrase } from './plans';
+import { PlansService, paramsHashOf, strongConfirmationPhrase } from './plans';
 import type { NewPlan } from './plans';
 
 const SECRET = 'plan-test-secret-fixture-0123456789abcdef';
@@ -196,10 +196,44 @@ describe('PlansService.create', () => {
     );
     await expectCode(
       service().create(
-        newPlan({ summary: { action: 'UPDATE', count: 1, entity: 'TGFPAR; DROP' } }),
+        newPlan({ summary: { action: 'UPDATE', count: 3, entity: 'TGFPAR; DROP' } }),
       ),
       'VALIDATION_ERROR',
     );
+  });
+
+  it('refuses a phrase count that differs from the number of targets', async () => {
+    await expectCode(
+      service().create(newPlan({ summary: { action: 'UPDATE', count: 2, entity: 'TGFPAR' } })),
+      'VALIDATION_ERROR',
+    );
+    // A non-array target snapshot is not counted.
+    const plan = await service().create(
+      newPlan({ targets: { rows: [] }, summary: { action: 'UPDATE', count: 7, entity: 'TGFPAR' } }),
+    );
+    expect(plan.id).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  it('refuses NUL characters in targets, preview or params with VALIDATION_ERROR', async () => {
+    const nul = 'a\u0000b';
+    for (const over of [
+      { targets: [{ key: { CODPARC: 1 }, before: { NOMEPARC: nul } }, {}, {}] },
+      { targets: [{ key: { [nul]: 1 } }, {}, {}] },
+      { preview: { rows: [nul] } },
+      { params: [1, { deep: [nul] }] },
+    ] satisfies Partial<NewPlan>[]) {
+      await expectCode(service().create(newPlan(over)), 'VALIDATION_ERROR');
+    }
+    expect(await database.db.select().from(plans)).toHaveLength(0);
+  });
+
+  it('exports paramsHashOf, the hash stored as params_hash', async () => {
+    const params = [1, 'x', { b: 2, a: [null, true] }];
+    const plan = await service().create(newPlan({ params }));
+    const [row] = await database.db.select().from(plans).where(eq(plans.id, plan.id));
+    expect(row!.paramsHash).toBe(paramsHashOf(params));
+    expect(paramsHashOf([1, 'x', { a: [null, true], b: 2 }])).toBe(paramsHashOf(params));
+    expect(paramsHashOf([2])).not.toBe(paramsHashOf(params));
   });
 });
 
@@ -207,10 +241,29 @@ describe('PlansService.consume', () => {
   it('consumes a PENDING plan once', async () => {
     const svc = service();
     const plan = await svc.create(newPlan());
-    const row = await svc.consume({ id: plan.id, token: plan.token, userId, sessionId });
+    const result = await svc.consume({ id: plan.id, token: plan.token, userId, sessionId });
+    expect(result.replayed).toBe(false);
+    const row = result.plan;
     expect(row.status).toBe('CONSUMED');
     expect(row.consumedAt).toBeInstanceOf(Date);
     expect(row.id).toBe(plan.id);
+  });
+
+  it('refuses a non-string token or idempotency key', async () => {
+    const svc = service();
+    const plan = await svc.create(newPlan());
+    const base = { id: plan.id, token: plan.token, userId, sessionId };
+    for (const attempt of [
+      { ...base, token: 42 },
+      { ...base, token: null },
+      { ...base, token: { toString: () => plan.token } },
+      { ...base, idempotencyKey: 7 },
+      { ...base, idempotencyKey: null },
+      { ...base, idempotencyKey: ['k-1'] },
+    ]) {
+      await expectCode(svc.consume(attempt as never), 'CONFIRMATION_INVALID');
+    }
+    expect(await statusOf(plan.id)).toBe('PENDING');
   });
 
   it('binds the token to the session', async () => {
@@ -257,7 +310,12 @@ describe('PlansService.consume', () => {
     );
 
     const fresh = await service(past(TTL - 30)).create(newPlan());
-    const row = await service().consume({ id: fresh.id, token: fresh.token, userId, sessionId });
+    const { plan: row } = await service().consume({
+      id: fresh.id,
+      token: fresh.token,
+      userId,
+      sessionId,
+    });
     expect(row.status).toBe('CONSUMED');
   });
 
@@ -377,7 +435,7 @@ describe('PlansService.consume', () => {
     // Control: the same gated plan, untouched and approved, is consumable.
     const control = await svc.create(gated());
     await database.db.update(plans).set({ status: 'APPROVED' }).where(eq(plans.id, control.id));
-    const row = await svc.consume({
+    const { plan: row } = await svc.consume({
       id: control.id,
       token: control.token,
       userId,
@@ -408,7 +466,7 @@ describe('PlansService.consume', () => {
       );
     }
     expect(await statusOf(plan.id)).toBe('PENDING');
-    const row = await svc.consume({
+    const { plan: row } = await svc.consume({
       id: plan.id,
       token: plan.token,
       userId,
@@ -424,8 +482,10 @@ describe('PlansService.consume', () => {
     const input = { id: plan.id, token: plan.token, userId, sessionId, idempotencyKey: 'k-1' };
     const first = await svc.consume(input);
     const retry = await svc.consume(input);
-    expect(retry).toEqual(first);
-    expect(retry.idempotencyKey).toBe('k-1');
+    expect(first.replayed).toBe(false);
+    expect(retry.replayed).toBe(true);
+    expect(retry.plan).toEqual(first.plan);
+    expect(retry.plan.idempotencyKey).toBe('k-1');
 
     await expectCode(svc.consume({ ...input, idempotencyKey: 'k-2' }), 'CONFIRMATION_USED');
     const { idempotencyKey: _ignored, ...withoutKey } = input;
@@ -444,6 +504,41 @@ describe('PlansService.consume', () => {
       'CONFIRMATION_INVALID',
     );
     expect(await statusOf(b.id)).toBe('PENDING');
+  });
+
+  it('performs the transition exactly once for parallel consumes with the same key', async () => {
+    const svc = service();
+    const plan = await svc.create(newPlan());
+    const input = { id: plan.id, token: plan.token, userId, sessionId, idempotencyKey: 'k-par' };
+    const results = await Promise.allSettled([
+      svc.consume(input),
+      svc.consume(input),
+      svc.consume(input),
+    ]);
+    const fulfilled = results.filter((r) => r.status === 'fulfilled');
+    expect(fulfilled).toHaveLength(3);
+    expect(fulfilled.filter((r) => !r.value.replayed)).toHaveLength(1);
+    expect(fulfilled.filter((r) => r.value.replayed)).toHaveLength(2);
+    for (const r of fulfilled) expect(r.value.plan.id).toBe(plan.id);
+  });
+
+  it('lets one of two plans win a parallel race for the same key', async () => {
+    const svc = service();
+    const a = await svc.create(newPlan());
+    const b = await svc.create(newPlan());
+    const results = await Promise.allSettled([
+      svc.consume({ id: a.id, token: a.token, userId, sessionId, idempotencyKey: 'k-race' }),
+      svc.consume({ id: b.id, token: b.token, userId, sessionId, idempotencyKey: 'k-race' }),
+    ]);
+    const ok = results.filter((r) => r.status === 'fulfilled');
+    const failed = results.filter((r) => r.status === 'rejected');
+    expect(ok).toHaveLength(1);
+    expect(ok[0]!.value.replayed).toBe(false);
+    expect(failed).toHaveLength(1);
+    const reason: unknown = failed[0]!.reason;
+    expect(isAppError(reason) ? reason.code : reason).toBe('CONFIRMATION_INVALID');
+    const statuses = [await statusOf(a.id), await statusOf(b.id)].sort();
+    expect(statuses).toEqual(['CONSUMED', 'PENDING']);
   });
 
   it('refuses a malformed idempotency key', async () => {
@@ -472,7 +567,7 @@ describe('PlansService.consume', () => {
 
     // No approval flow yet (Task 14.1): set APPROVED directly.
     await database.db.update(plans).set({ status: 'APPROVED' }).where(eq(plans.id, plan.id));
-    const row = await svc.consume({ id: plan.id, token: plan.token, userId, sessionId });
+    const { plan: row } = await svc.consume({ id: plan.id, token: plan.token, userId, sessionId });
     expect(row.status).toBe('CONSUMED');
   });
 });

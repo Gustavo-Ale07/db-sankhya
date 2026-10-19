@@ -70,13 +70,43 @@ export function strongConfirmationPhrase(
   return `${environment} ${action.toUpperCase()} ${count} ${entity.toUpperCase()}`;
 }
 
-/** Round-trips through JSON, so what is hashed is exactly what jsonb stores and returns. */
-function plain(value: unknown): unknown {
+/** True when a string anywhere in the JSON value (keys included) holds U+0000. */
+function hasNul(value: unknown): boolean {
+  if (typeof value === 'string') return value.includes('\u0000');
+  if (Array.isArray(value)) return value.some(hasNul);
+  if (typeof value === 'object' && value !== null)
+    return Object.entries(value).some(([k, v]) => k.includes('\u0000') || hasNul(v));
+  return false;
+}
+
+/**
+ * Round-trips through JSON, so what is hashed is exactly what jsonb stores and returns. PostgreSQL
+ * text and jsonb cannot hold U+0000, so such input is refused here instead of failing the insert.
+ */
+function plain(value: unknown, field: string): unknown {
   const text = JSON.stringify(value ?? null);
-  return text === undefined ? null : (JSON.parse(text) as unknown);
+  const parsed = text === undefined ? null : (JSON.parse(text) as unknown);
+  if (hasNul(parsed)) throw badInput(`${field} must not contain NUL characters`);
+  return parsed;
 }
 
 const hashOf = (value: unknown) => sha256Hex(canonicalJSON(value));
+
+/** The `params_hash` of a plan, so the executor can re-verify the bound parameters. */
+export function paramsHashOf(params: unknown): string {
+  return hashOf(plain(params, 'params'));
+}
+
+/** Outcome of `consume`. */
+export interface ConsumedPlan {
+  plan: PlanRow;
+  /**
+   * True when this call did NOT perform the transition: it is an idempotent replay (same user,
+   * plan and key) of a consume that already happened. A replay must never execute the mutation
+   * again; the caller (Task 11.2) returns the stored execution result of the original instead.
+   */
+  replayed: boolean;
+}
 
 interface PlanHashInput {
   sqlHash: string;
@@ -177,17 +207,19 @@ export class PlansService {
       throw new AppError('FORBIDDEN', 'This statement cannot be planned.');
     }
 
-    const capability = plain(input.capability);
-    const targets = plain(input.targets);
+    const capability = plain(input.capability, 'capability');
+    const targets = plain(input.targets, 'targets');
     const sqlHash = sha256Hex(input.sql);
-    const paramsHash = hashOf(plain(input.params));
+    const paramsHash = paramsHashOf(input.params);
     const targetsHash = hashOf(targets);
-    const decision = plain(input.decision);
-    const preview = plain(input.preview);
+    const decision = plain(input.decision, 'decision');
+    const preview = plain(input.preview, 'preview');
     const policyVersion = input.decision.policyVersion;
     const gates = gatesOf(decision, input.environment);
     if (!gates) throw badInput('decision limits are invalid');
     const { action, count, entity } = input.summary;
+    if (Array.isArray(targets) && count !== targets.length)
+      throw badInput('summary.count must equal the number of targets');
     const phrase = gates.needsPhrase
       ? strongConfirmationPhrase(input.environment, action, count, entity)
       : null;
@@ -239,10 +271,25 @@ export class PlansService {
   }
 
   /**
-   * Marks the plan CONSUMED and returns it, or throws CONFIRMATION_INVALID / _EXPIRED / _USED.
-   * Nobody without a valid token for this user and session learns anything beyond INVALID.
+   * Marks the plan CONSUMED, or throws CONFIRMATION_INVALID / _EXPIRED / _USED. Nobody without a
+   * valid token for this user and session learns anything beyond INVALID.
+   *
+   * Only the call that performs the PENDING/APPROVED → CONSUMED transition gets
+   * `replayed: false` and may execute the mutation. A retry with the same idempotency key gets the
+   * same row with `replayed: true`: it must never execute the mutation again (Task 11.2 answers it
+   * with the stored execution result of the original call).
    */
-  async consume(input: ConsumePlanInput): Promise<PlanRow> {
+  async consume(input: ConsumePlanInput): Promise<ConsumedPlan> {
+    const raw = input as unknown as Record<string, unknown>;
+    if (
+      typeof raw.token !== 'string' ||
+      typeof raw.id !== 'string' ||
+      typeof raw.userId !== 'string' ||
+      typeof raw.sessionId !== 'string' ||
+      (raw.idempotencyKey !== undefined && typeof raw.idempotencyKey !== 'string') ||
+      (raw.strongConfirmation !== undefined && typeof raw.strongConfirmation !== 'string')
+    )
+      throw invalid();
     const match = TOKEN.exec(input.token);
     if (!match || match[1] !== input.id || !UUID.test(input.id)) throw invalid();
     if (!UUID.test(input.userId) || !UUID.test(input.sessionId)) throw invalid();
@@ -260,7 +307,8 @@ export class PlansService {
       throw invalid();
     }
     if (key !== undefined) {
-      if (row.status === 'CONSUMED' && row.idempotencyKey === key) return row;
+      if (row.status === 'CONSUMED' && row.idempotencyKey === key)
+        return { plan: row, replayed: true };
       const [holder] = await this.db
         .select({ id: plans.id })
         .from(plans)
@@ -299,8 +347,8 @@ export class PlansService {
       if (isUniqueViolation(err)) throw invalid();
       throw err;
     }
-    if (consumed) return consumed;
-    return this.refusal(row.id, key);
+    if (consumed) return { plan: consumed, replayed: false };
+    return { plan: await this.refusal(row.id, key), replayed: true };
   }
 
   /** Invalidates the live plans of a connection (secrets rotated, environment changed...). */
@@ -315,7 +363,7 @@ export class PlansService {
 
   /**
    * Why the conditional UPDATE matched nothing, for a caller who holds a valid token. Returns the
-   * row only for an idempotent retry that raced the consume carrying the same key.
+   * row only for an idempotent retry that raced the consume carrying the same key (a replay).
    */
   private async refusal(id: string, key: string | undefined): Promise<PlanRow> {
     const [current] = await this.db
@@ -397,6 +445,12 @@ export class PlansService {
     if (!(ENVIRONMENTS as readonly string[]).includes(input.environment))
       throw badInput('environment is invalid');
     if (typeof input.sql !== 'string' || input.sql.trim() === '') throw badInput('sql is required');
+    if (
+      [input.sql, input.connectionId, input.previewKind].some(
+        (s) => typeof s !== 'string' || s.includes('\u0000'),
+      )
+    )
+      throw badInput('text fields must not contain NUL characters');
     if (!input.previewKind || input.previewKind.length > 64)
       throw badInput('previewKind is invalid');
     if (!input.decision.policyVersion) throw badInput('policyVersion is required');
