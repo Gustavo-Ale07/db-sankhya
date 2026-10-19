@@ -6,35 +6,53 @@
  * Security invariants:
  * - DENY wins over any ALLOW.
  * - There is no bypass: an administrator is evaluated like anyone else, by permission and rules.
- * - Anything unknown is denied: an unknown action or environment, or an enabled rule that is
- *   malformed, denies the request (fail closed).
+ * - Anything unknown is denied (fail closed): an unknown action or environment, a malformed
+ *   request, a malformed enabled rule, or any error while evaluating returns DENY, never throws.
+ * - Only own properties of rules and limits are read, so prototype pollution cannot inject them.
  *
- * Matching (all comparisons are case-insensitive):
+ * Normalization and matching:
+ * - Ids (`userId`, `groupIds`, `connectionId`, rule `subjectId` and `connectionIds`) are trimmed
+ *   and lower-cased, then compared exactly. Environments and actions are exact catalog values.
+ * - Entity names: each dot-separated segment is trimmed and stripped of `"…"` or `[…]` quoting,
+ *   then upper-cased. A rule entity pattern matches when it matches the full dotted name OR its
+ *   last segment, so `TGFPAR` hits `SANKHYA.TGFPAR`, `dbo.TGFPAR`, `"TGFPAR"` and `[TGFPAR]`.
+ *   Callers pass resolved base table names, not views, aliases or synonyms.
+ * - Patterns are case-insensitive globs where `*` is any run of characters (`TGF*` hits `TGFPAR`).
  * - A rule matches only when `enabled === true`. Disabled rules are ignored, even malformed ones.
  * - Subject: `user` matches `subjectId === userId`, `group` matches a `groupIds` entry,
  *   `everyone` matches anyone.
- * - `environments` and `connectionIds`: empty means all.
- * - `actions`: permission names or globs (`DATA.*`, `*`). Empty matches no action, so a rule
- *   never grants every action by omission.
- * - `entities`: globs where `*` is any run of characters (`TGF*` matches `TGFPAR`). Empty means
- *   all entities. A rule with entities never matches a request without entities.
- * - `columns`: `TABLE.COLUMN` (the table part may be a glob) or a bare `COLUMN` that matches the
- *   column on any table. A rule with columns applies only to the request columns it names, and
- *   only on tables that also pass its `entities` filter. A request column named `*` (an
- *   unexpanded `SELECT *`) is hit by every column DENY on its table, and is never covered by a
- *   column-scoped ALLOW. Callers must list the columns a statement reads or writes; a request with
- *   no columns is not hit by column-scoped rules.
+ * - `environments` and `connectionIds`: empty means all. `entities`: empty means all entities;
+ *   a rule with entities never matches a request without entities.
+ * - `actions` must be non-empty, and each entry an exact permission or a glob matching at least
+ *   one permission (`DATA.*`, `*`). Anything else makes the rule invalid, which fails closed, so a
+ *   DENY can never be silently inert through an empty list or a typo.
+ * - `columns`: `TABLE.COLUMN` (the table part is an entity pattern) or a bare `COLUMN` that
+ *   matches the column on any table. A rule with columns applies only to the request columns it
+ *   names, on tables that also pass its `entities` filter.
+ *
+ * Request columns (caller contract):
+ * - `columns` must list EVERY column the statement references: select list, WHERE, JOIN, GROUP
+ *   BY, ORDER BY and subqueries, otherwise a column DENY can be inferred around through a
+ *   predicate. Each column's `table` must name one of `entities`; a column that cannot be
+ *   attributed to a request entity makes the request malformed (DENY).
+ * - `columns: undefined` means unknown and is treated as `*` on every entity. `[]` means the
+ *   statement references no column. A column named `*` (an unexpanded `SELECT *`) is hit by every
+ *   column DENY on its table and is never covered by a column-scoped ALLOW.
  *
  * Decision:
  * 1. Missing permission: DENY ("permission missing").
  * 2. A DENY rule that matches and overlaps any requested entity or column: DENY.
- * 3. Writes (`DATA.*`, `DDL.*`, `SANKHYA.*`) are default-deny: every requested entity must be
- *    covered by a matching ALLOW rule (one whose entities match it and, when the rule has columns,
- *    whose columns cover every requested column of that entity). `QUERY.SELECT` and `TEMP.*`
- *    are allowed by permission alone unless denied.
- * 4. Limits combine over the matching ALLOW rules (any overlap) to the most restrictive: the
- *    minimum row limit, OR of every `require*` flag. A row limit no rule sets keeps its default;
- *    flags are OR-ed with the defaults, so a rule can tighten but never relax a default flag.
+ * 3. Writes (see `POLICY_ACTION_CLASS`) are default-deny: every requested entity must be covered
+ *    by a matching ALLOW rule (one whose entities match it and, when the rule has columns, whose
+ *    columns cover every requested column of that entity). `QUERY.SELECT`, `TEMP.*` and the
+ *    other permission-only actions are allowed by permission alone unless denied.
+ *    NOTE: every matching ALLOW is a grant. A rule meant only to cap limits (for example
+ *    `actions: ['DATA.*']`, `limits: { maxWriteRows: 5 }`) also grants those writes to its subject
+ *    on every entity it matches. Scope such rules carefully.
+ * 4. Limits combine over the matching ALLOW rules (any overlap) to the most restrictive. Row
+ *    limits are min(ceiling, every rule value): the rule-7 defaults (or `options.defaults`) are
+ *    ceilings that rules can only lower. Flags are OR-ed; `requirePreview` and
+ *    `requireConfirmation` are always true.
  * 5. In PRODUCTION a write forces `requireConfirmation` and `requireStrongConfirmation`.
  * 6. UPDATE/DELETE without WHERE: DENY, unless one matching ALLOW rule with
  *    `overrideWhereRequired` covers every requested entity on its own and no matching rule sets
@@ -87,6 +105,11 @@ export interface PolicyRule {
   enabled: boolean;
 }
 
+export interface PolicyColumn {
+  table: string;
+  name: string;
+}
+
 export interface PolicyRequest {
   userId: string;
   groupIds: string[];
@@ -94,7 +117,8 @@ export interface PolicyRequest {
   environment: Environment;
   connectionId: string;
   entities: string[];
-  columns: Array<{ table: string; name: string }>;
+  /** Every referenced column; `undefined` means unknown and is treated as `*`. */
+  columns?: PolicyColumn[];
   hasWhere: boolean;
 }
 
@@ -109,6 +133,45 @@ export interface PolicyDecision {
 export interface EvaluateOptions {
   /** A version already computed with `policyVersion(policies)`, to skip rehashing per call. */
   policyVersion?: string;
+  /**
+   * Row-limit ceilings replacing the rule-7 defaults (from configuration). Each must be a
+   * positive safe integer; an invalid value falls back to the rule-7 default.
+   */
+  defaults?: Partial<Pick<EffectiveLimits, 'maxReadRows' | 'maxWriteRows'>>;
+}
+
+/**
+ * Exhaustive classification: adding a permission is a compile error until it is classified here.
+ * `write` actions need an explicit ALLOW rule; `permission-only` ones are allowed by permission
+ * unless a DENY matches.
+ */
+export const POLICY_ACTION_CLASS: Readonly<Record<Permission, 'write' | 'permission-only'>> =
+  Object.freeze({
+    'QUERY.SELECT': 'permission-only',
+    'TEMP.CREATE': 'permission-only',
+    'TEMP.WRITE': 'permission-only',
+    'TEMP.DROP': 'permission-only',
+    'TEMP.MATERIALIZE': 'permission-only',
+    'DATA.INSERT': 'write',
+    'DATA.UPDATE': 'write',
+    'DATA.DELETE': 'write',
+    'DDL.CUSTOM.GENERATE': 'write',
+    'SANKHYA.BUSINESS_ACTION.EXECUTE': 'write',
+    'APPROVAL.DECIDE': 'permission-only',
+    'AUDIT.READ': 'permission-only',
+    'ADMIN.USERS': 'permission-only',
+    'ADMIN.GROUPS': 'permission-only',
+    'ADMIN.ROLES': 'permission-only',
+    'ADMIN.POLICIES': 'permission-only',
+    'ADMIN.CONNECTIONS': 'permission-only',
+    'ADMIN.SECURITY': 'permission-only',
+  });
+
+/** Writes need an explicit ALLOW rule. An unknown action counts as a write (fail closed). */
+export function isPolicyWriteAction(action: string): boolean {
+  return !Object.hasOwn(POLICY_ACTION_CLASS, action)
+    ? true
+    : POLICY_ACTION_CLASS[action as Permission] !== 'permission-only';
 }
 
 const ROW_LIMITS = ['maxReadRows', 'maxWriteRows'] as const;
@@ -119,13 +182,47 @@ const FLAG_LIMITS = [
   'requireStrongConfirmation',
   'requireApproval',
 ] as const;
-const LIMIT_KEYS: ReadonlySet<string> = new Set<string>([...ROW_LIMITS, ...FLAG_LIMITS]);
+type RowLimit = (typeof ROW_LIMITS)[number];
+type FlagLimit = (typeof FLAG_LIMITS)[number];
 const PERMISSION_SET: ReadonlySet<string> = new Set(PERMISSIONS);
 const ENVIRONMENT_SET: ReadonlySet<string> = new Set(ENVIRONMENTS);
 
-/** Writes need an explicit ALLOW rule; everything else is allowed by permission alone. */
-export function isPolicyWriteAction(action: string): boolean {
-  return action.startsWith('DATA.') || action.startsWith('DDL.') || action.startsWith('SANKHYA.');
+interface Entity {
+  full: string;
+  last: string;
+}
+interface Column {
+  entity: Entity;
+  name: string;
+}
+interface ColumnPattern {
+  table: string | null;
+  name: string;
+}
+interface CompiledRule {
+  id: string;
+  name: string;
+  effect: PolicyEffect;
+  subjectType: PolicySubjectType;
+  subjectId: string;
+  environments: string[];
+  connectionIds: string[];
+  actions: string[];
+  entities: string[];
+  columns: ColumnPattern[];
+  rows: Partial<Record<RowLimit, number>>;
+  flags: Partial<Record<FlagLimit, boolean>>;
+  overrideWhereRequired: boolean;
+}
+interface NormalizedRequest {
+  userId: string;
+  groupIds: string[];
+  action: Permission;
+  environment: Environment;
+  connectionId: string;
+  entities: Entity[];
+  columns: Column[];
+  hasWhere: boolean;
 }
 
 export function evaluatePolicy(
@@ -134,8 +231,31 @@ export function evaluatePolicy(
   permissions: Set<Permission>,
   options: EvaluateOptions = {},
 ): PolicyDecision {
-  const version = options.policyVersion ?? policyVersion(policies);
-  const limits: EffectiveLimits = { ...DEFAULT_LIMITS };
+  let version = '';
+  try {
+    const given = readOwn(options, 'policyVersion');
+    version = typeof given === 'string' ? given : policyVersion(policies);
+    return evaluate(req, policies, permissions, options, version);
+  } catch {
+    return {
+      effect: 'DENY',
+      reasons: ['policy evaluation failed'],
+      matchedRuleIds: [],
+      limits: { ...DEFAULT_LIMITS },
+      policyVersion: version,
+    };
+  }
+}
+
+function evaluate(
+  rawReq: PolicyRequest,
+  policies: PolicyRule[],
+  permissions: Set<Permission>,
+  options: EvaluateOptions,
+  version: string,
+): PolicyDecision {
+  const ceilings = resolveCeilings(readOwn(options, 'defaults'));
+  const limits: EffectiveLimits = { ...DEFAULT_LIMITS, ...ceilings };
   const reasons: string[] = [];
   const matchedRuleIds: string[] = [];
   const deny = (...why: string[]): PolicyDecision => ({
@@ -146,31 +266,49 @@ export function evaluatePolicy(
     policyVersion: version,
   });
 
-  if (!PERMISSION_SET.has(req.action)) return deny(`unknown action ${String(req.action)}`);
-  if (!ENVIRONMENT_SET.has(req.environment)) {
-    return deny(`unknown environment ${String(req.environment)}`);
+  const action = readOwn(rawReq, 'action');
+  const environment = readOwn(rawReq, 'environment');
+  if (typeof action !== 'string' || !PERMISSION_SET.has(action)) {
+    return deny(`unknown action ${String(action)}`);
   }
-  if (!permissions.has(req.action)) return deny(`permission missing: ${req.action}`);
-
-  const enabled = policies.filter((r) => r.enabled === true);
-  const invalid = enabled.filter((r) => !isValidRule(r));
-  if (invalid.length > 0) {
-    return deny(...invalid.map((r) => `invalid rule ${describeId(r)}`));
+  if (typeof environment !== 'string' || !ENVIRONMENT_SET.has(environment)) {
+    return deny(`unknown environment ${String(environment)}`);
+  }
+  const normalized = normalizeRequest(rawReq);
+  if (typeof normalized === 'string') return deny(`malformed request: ${normalized}`);
+  const req = normalized;
+  if (typeof permissions?.has !== 'function' || permissions.has(req.action) !== true) {
+    return deny(`permission missing: ${req.action}`);
   }
 
-  const applicable = enabled.filter((r) => matchesContext(r, req) && overlaps(r, req));
+  if (!Array.isArray(policies)) return deny('malformed policy list');
+  const rules: CompiledRule[] = [];
+  const invalid: string[] = [];
+  for (const raw of policies) {
+    if (typeof raw !== 'object' || raw === null) {
+      invalid.push('invalid rule (not an object)');
+      continue;
+    }
+    if (readOwn(raw, 'enabled') !== true) continue;
+    const compiled = compileRule(raw);
+    if (compiled) rules.push(compiled);
+    else invalid.push(`invalid rule ${describeId(raw)}`);
+  }
+  if (invalid.length > 0) return deny(...invalid);
+
+  const applicable = rules.filter((r) => matchesContext(r, req) && overlaps(r, req));
   const denies = applicable.filter((r) => r.effect === 'DENY');
   const allows = applicable.filter((r) => r.effect === 'ALLOW');
   matchedRuleIds.push(...applicable.map((r) => r.id));
 
-  // A row limit no matching rule sets keeps its default; otherwise the smallest one wins.
   for (const key of ROW_LIMITS) {
-    const set = allows.map((r) => r.limits[key]).filter((v): v is number => v !== undefined);
-    limits[key] = set.length > 0 ? Math.min(...set) : DEFAULT_LIMITS[key];
+    limits[key] = Math.min(limits[key], ...allows.map((r) => r.rows[key] ?? limits[key]));
   }
   for (const key of FLAG_LIMITS) {
-    limits[key] = DEFAULT_LIMITS[key] || allows.some((r) => r.limits[key] === true);
+    limits[key] = DEFAULT_LIMITS[key] || allows.some((r) => r.flags[key] === true);
   }
+  limits.requirePreview = true;
+  limits.requireConfirmation = true;
 
   if (denies.length > 0) {
     return deny(...denies.map((r) => `denied by rule ${r.id} (${r.name})`));
@@ -181,7 +319,7 @@ export function evaluatePolicy(
     if (req.entities.length === 0) return deny('write without a target entity');
     const uncovered = req.entities.filter((e) => !allows.some((r) => covers(r, e, req)));
     if (uncovered.length > 0) {
-      return deny(`no ALLOW rule for ${req.action} on ${uncovered.join(', ')}`);
+      return deny(`no ALLOW rule for ${req.action} on ${uncovered.map((e) => e.full).join(', ')}`);
     }
     reasons.push(`allowed by rule(s) ${allows.map((r) => r.id).join(', ')}`);
   } else {
@@ -189,7 +327,7 @@ export function evaluatePolicy(
   }
 
   if (req.action === 'DATA.UPDATE' || req.action === 'DATA.DELETE') {
-    const forcedWhere = allows.some((r) => r.limits.requireWhere === true);
+    const forcedWhere = allows.some((r) => r.flags.requireWhere === true);
     const override = forcedWhere
       ? undefined
       : allows.find((r) => r.overrideWhereRequired && req.entities.every((e) => covers(r, e, req)));
@@ -214,92 +352,229 @@ export function evaluatePolicy(
   return { effect: 'ALLOW', reasons, matchedRuleIds, limits, policyVersion: version };
 }
 
-function describeId(r: PolicyRule): string {
-  return typeof r?.id === 'string' && r.id !== '' ? r.id : '(no id)';
+function readOwn(obj: unknown, key: string): unknown {
+  return typeof obj === 'object' && obj !== null && Object.hasOwn(obj, key)
+    ? (obj as Record<string, unknown>)[key]
+    : undefined;
 }
 
-function isStringArray(v: unknown): v is string[] {
-  return Array.isArray(v) && v.every((s) => typeof s === 'string' && s.trim() !== '');
+function isPositiveSafeInteger(v: unknown): v is number {
+  return typeof v === 'number' && Number.isSafeInteger(v) && v > 0;
 }
 
-function isValidRule(r: PolicyRule): boolean {
-  if (typeof r !== 'object' || r === null) return false;
-  if (typeof r.id !== 'string' || r.id === '' || typeof r.name !== 'string') return false;
-  if (r.effect !== 'ALLOW' && r.effect !== 'DENY') return false;
-  if (r.subjectType === 'user' || r.subjectType === 'group') {
-    if (typeof r.subjectId !== 'string' || r.subjectId === '') return false;
-  } else if (r.subjectType !== 'everyone') {
-    return false;
-  }
-  if (!isStringArray(r.environments) || !r.environments.every((e) => ENVIRONMENT_SET.has(e))) {
-    return false;
-  }
-  if (!isStringArray(r.connectionIds) || !isStringArray(r.actions)) return false;
-  if (!isStringArray(r.entities) || !isStringArray(r.columns)) return false;
-  if (typeof r.overrideWhereRequired !== 'boolean') return false;
-  if (typeof r.limits !== 'object' || r.limits === null || Array.isArray(r.limits)) return false;
-  for (const [key, value] of Object.entries(r.limits)) {
-    if (!LIMIT_KEYS.has(key)) return false;
-    if (value === undefined) continue;
-    if ((ROW_LIMITS as readonly string[]).includes(key)) {
-      if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) return false;
-    } else if (typeof value !== 'boolean') {
-      return false;
+function resolveCeilings(defaults: unknown): Pick<EffectiveLimits, RowLimit> {
+  const read = readOwn(defaults, 'maxReadRows');
+  const write = readOwn(defaults, 'maxWriteRows');
+  return {
+    maxReadRows: isPositiveSafeInteger(read) ? read : DEFAULT_LIMITS.maxReadRows,
+    maxWriteRows: isPositiveSafeInteger(write) ? write : DEFAULT_LIMITS.maxWriteRows,
+  };
+}
+
+function describeId(r: object): string {
+  const id = readOwn(r, 'id');
+  return typeof id === 'string' && id !== '' ? id : '(no id)';
+}
+
+const normalizeId = (s: string): string => s.trim().toLowerCase();
+
+function unquote(segment: string): string {
+  const s = segment.trim();
+  if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) return s.slice(1, -1).trim();
+  if (s.length >= 2 && s.startsWith('[') && s.endsWith(']')) return s.slice(1, -1).trim();
+  return s;
+}
+
+function normalizeEntity(name: string): Entity {
+  const segments = name.split('.').map((s) => unquote(s).toUpperCase());
+  return { full: segments.join('.'), last: segments[segments.length - 1]! };
+}
+
+function isNonEmptyString(v: unknown): v is string {
+  return typeof v === 'string' && v.trim() !== '';
+}
+
+/** Validates and normalizes a request; returns the reason when it is malformed. */
+function normalizeRequest(req: PolicyRequest): NormalizedRequest | string {
+  const userId = readOwn(req, 'userId');
+  const connectionId = readOwn(req, 'connectionId');
+  const groupIds = readOwn(req, 'groupIds');
+  const entities = readOwn(req, 'entities');
+  const columns = readOwn(req, 'columns');
+  const hasWhere = readOwn(req, 'hasWhere');
+  if (!isNonEmptyString(userId)) return 'userId';
+  if (!isNonEmptyString(connectionId)) return 'connectionId';
+  if (!Array.isArray(groupIds) || !groupIds.every(isNonEmptyString)) return 'groupIds';
+  if (!Array.isArray(entities) || !entities.every(isNonEmptyString)) return 'entities';
+  if (typeof hasWhere !== 'boolean') return 'hasWhere';
+  const ents = entities.map(normalizeEntity);
+  if (ents.some((e) => e.last === '')) return 'entities';
+
+  let cols: Column[];
+  if (columns === undefined) {
+    cols = ents.map((entity) => ({ entity, name: '*' }));
+  } else {
+    if (!Array.isArray(columns)) return 'columns';
+    cols = [];
+    for (const c of columns as unknown[]) {
+      const table = readOwn(c, 'table');
+      const name = readOwn(c, 'name');
+      if (!isNonEmptyString(table) || !isNonEmptyString(name)) return 'columns';
+      const t = normalizeEntity(table);
+      // A column belongs to the entities it names: by full name, or by last segment when the
+      // column's table is unqualified. Anything else cannot be attributed and fails closed.
+      const owners = ents.filter(
+        (e) =>
+          e.full === t.full ||
+          (!t.full.includes('.') && e.last === t.full) ||
+          (!e.full.includes('.') && t.last === e.full),
+      );
+      if (owners.length === 0)
+        return `column ${table}.${name} is not attributed to a request entity`;
+      const n = unquote(name).toUpperCase();
+      for (const entity of owners) cols.push({ entity, name: n });
     }
   }
-  return true;
+  return {
+    userId: normalizeId(userId),
+    groupIds: groupIds.map(normalizeId),
+    action: readOwn(req, 'action') as Permission,
+    environment: readOwn(req, 'environment') as Environment,
+    connectionId: normalizeId(connectionId),
+    entities: ents,
+    columns: cols,
+    hasWhere,
+  };
+}
+
+function isPatternList(v: unknown): v is string[] {
+  return Array.isArray(v) && v.every((s) => typeof s === 'string' && s !== '' && s === s.trim());
+}
+
+function isValidAction(pattern: string): boolean {
+  return PERMISSIONS.some((p) => glob(pattern, p));
+}
+
+/** Validates a rule from its own properties and compiles it, or returns null when invalid. */
+function compileRule(r: object): CompiledRule | null {
+  const id = readOwn(r, 'id');
+  const name = readOwn(r, 'name');
+  const effect = readOwn(r, 'effect');
+  const subjectType = readOwn(r, 'subjectType');
+  const subjectId = readOwn(r, 'subjectId');
+  const environments = readOwn(r, 'environments');
+  const connectionIds = readOwn(r, 'connectionIds');
+  const actions = readOwn(r, 'actions');
+  const entities = readOwn(r, 'entities');
+  const columns = readOwn(r, 'columns');
+  const limits = readOwn(r, 'limits');
+  const override = readOwn(r, 'overrideWhereRequired');
+
+  if (!isNonEmptyString(id) || typeof name !== 'string') return null;
+  if (effect !== 'ALLOW' && effect !== 'DENY') return null;
+  let subject = '';
+  if (subjectType === 'user' || subjectType === 'group') {
+    if (!isNonEmptyString(subjectId)) return null;
+    subject = normalizeId(subjectId);
+  } else if (subjectType !== 'everyone') {
+    return null;
+  }
+  if (!isPatternList(environments) || !environments.every((e) => ENVIRONMENT_SET.has(e))) {
+    return null;
+  }
+  // Ids are trimmed and lower-cased like the request's; patterns must be exact (no padding).
+  if (!Array.isArray(connectionIds) || !connectionIds.every(isNonEmptyString)) return null;
+  if (!isPatternList(actions) || actions.length === 0 || !actions.every(isValidAction)) {
+    return null;
+  }
+  if (!isPatternList(entities) || !isPatternList(columns)) return null;
+  if (typeof override !== 'boolean') return null;
+  if (typeof limits !== 'object' || limits === null || Array.isArray(limits)) return null;
+
+  const rows: CompiledRule['rows'] = {};
+  const flags: CompiledRule['flags'] = {};
+  for (const key of Object.keys(limits)) {
+    const value = readOwn(limits, key);
+    if (value === undefined) continue;
+    if ((ROW_LIMITS as readonly string[]).includes(key)) {
+      if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) return null;
+      rows[key as RowLimit] = value;
+    } else if ((FLAG_LIMITS as readonly string[]).includes(key)) {
+      if (typeof value !== 'boolean') return null;
+      flags[key as FlagLimit] = value;
+    } else {
+      return null;
+    }
+  }
+
+  const columnPatterns: ColumnPattern[] = [];
+  for (const c of columns) {
+    const dot = c.lastIndexOf('.');
+    const table = dot < 0 ? null : c.slice(0, dot);
+    const col = unquote(dot < 0 ? c : c.slice(dot + 1)).toUpperCase();
+    if (col === '' || table === '') return null;
+    columnPatterns.push({ table, name: col });
+  }
+
+  return {
+    id,
+    name,
+    effect,
+    subjectType,
+    subjectId: subject,
+    environments,
+    connectionIds: connectionIds.map(normalizeId),
+    actions,
+    entities,
+    columns: columnPatterns,
+    rows,
+    flags,
+    overrideWhereRequired: override,
+  };
 }
 
 /** Subject, environment, connection and action. */
-function matchesContext(r: PolicyRule, req: PolicyRequest): boolean {
+function matchesContext(r: CompiledRule, req: NormalizedRequest): boolean {
   const subject =
     r.subjectType === 'everyone' ||
     (r.subjectType === 'user' && r.subjectId === req.userId) ||
-    (r.subjectType === 'group' && req.groupIds.includes(r.subjectId ?? ''));
+    (r.subjectType === 'group' && req.groupIds.includes(r.subjectId));
   if (!subject) return false;
   if (r.environments.length > 0 && !r.environments.includes(req.environment)) return false;
   if (r.connectionIds.length > 0 && !r.connectionIds.includes(req.connectionId)) return false;
   return r.actions.some((a) => glob(a, req.action));
 }
 
-function entityMatches(r: PolicyRule, entity: string): boolean {
-  return r.entities.length === 0 || r.entities.some((p) => glob(p, entity));
+function entityPatternHit(pattern: string, e: Entity): boolean {
+  const p = normalizeEntity(pattern).full;
+  return glob(p, e.full) || glob(p, e.last);
 }
 
-/** Splits `TABLE.COLUMN` at the last dot; a bare `COLUMN` has no table part. */
-function splitColumn(pattern: string): { table: string | null; name: string } {
-  const dot = pattern.lastIndexOf('.');
-  return dot < 0
-    ? { table: null, name: pattern }
-    : { table: pattern.slice(0, dot), name: pattern.slice(dot + 1) };
+function entityMatches(r: CompiledRule, e: Entity): boolean {
+  return r.entities.length === 0 || r.entities.some((p) => entityPatternHit(p, e));
 }
 
-function columnHit(
-  pattern: string,
-  col: { table: string; name: string },
-  wildcardHits: boolean,
-): boolean {
-  const p = splitColumn(pattern);
-  if (p.table !== null && !glob(p.table, col.table)) return false;
+function columnHit(p: ColumnPattern, col: Column, wildcardHits: boolean): boolean {
+  if (p.table !== null && !entityPatternHit(p.table, col.entity)) return false;
   if (col.name === '*') return wildcardHits;
   return glob(p.name, col.name);
 }
 
 /** Whether a rule touches any part of the request (used by DENY and for limits). */
-function overlaps(r: PolicyRule, req: PolicyRequest): boolean {
+function overlaps(r: CompiledRule, req: NormalizedRequest): boolean {
   if (r.columns.length === 0) {
     return r.entities.length === 0 || req.entities.some((e) => entityMatches(r, e));
   }
   return req.columns.some(
-    (c) => entityMatches(r, c.table) && r.columns.some((p) => columnHit(p, c, true)),
+    (c) => entityMatches(r, c.entity) && r.columns.some((p) => columnHit(p, c, true)),
   );
 }
 
 /** Whether an ALLOW rule fully grants the action on one entity (used for writes). */
-function covers(r: PolicyRule, entity: string, req: PolicyRequest): boolean {
+function covers(r: CompiledRule, entity: Entity, req: NormalizedRequest): boolean {
   if (!entityMatches(r, entity)) return false;
   if (r.columns.length === 0) return true;
-  const cols = req.columns.filter((c) => c.table.toUpperCase() === entity.toUpperCase());
+  const cols = req.columns.filter((c) => c.entity === entity);
   return cols.length > 0 && cols.every((c) => r.columns.some((p) => columnHit(p, c, false)));
 }
 
@@ -338,8 +613,9 @@ function canonicalJson(value: unknown): string {
 }
 
 /**
- * Version of a rule set: sha256 of the canonical JSON of the rules sorted by id. It covers every
- * field, disabled rules included, so any change to any rule changes it.
+ * Version of a rule set: sha256 of the canonical JSON (keys sorted) of every rule, with the rules
+ * sorted by that canonical JSON, so neither rule order nor key order matters and duplicate ids are
+ * harmless. It covers every field, disabled rules included, so any change to any rule changes it.
  */
 export function policyVersion(rules: readonly PolicyRule[]): string {
   const sorted = rules.map((r) => canonicalJson(r)).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
