@@ -66,9 +66,9 @@ const KEY_VALUE_PATTERN =
   /(?<![\w-])(["']?)(?=[\w-]*?(?:password|passwd|senha|secret|token|api[_-]?key))([\w-]+)\1(\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s&;,"']+)/gi;
 
 // Trade-off (this pattern also feeds log redaction): after `key: ` (colon plus space, the shape
-// of prose and error messages) an unquoted value that is a plain lowercase word, either under 6
-// letters or a common status word, is kept, so "password: must be 8 chars" and "token: expired"
-// stay readable. A weak all-lowercase password of 5 letters or fewer written that way leaks;
+// of prose and error messages) an unquoted value that is one of the status words below is kept,
+// so "token: expired" stays readable. Any other word is redacted, even ordinary prose such as
+// "password: must be 8 chars": a password equal to a status word is the only thing that leaks.
 // `=`, a tight `:` and quoted values are always redacted.
 const PROSE_SEPARATOR = /^\s*:\s+$/;
 const PROSE_WORDS = new Set([
@@ -86,8 +86,7 @@ const PROSE_WORDS = new Set([
 ]);
 
 function isProseValue(sep: string, value: string): boolean {
-  if (!PROSE_SEPARATOR.test(sep) || !/^[a-z]+$/.test(value)) return false;
-  return value.length < 6 || PROSE_WORDS.has(value);
+  return PROSE_SEPARATOR.test(sep) && PROSE_WORDS.has(value);
 }
 
 function scrubKeyValue(
