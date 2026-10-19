@@ -18,15 +18,20 @@
  *   and lower-cased, then compared exactly. Environments and actions are exact catalog values.
  * - Entity names are `TABLE` or `SCHEMA.TABLE`: each part is trimmed, stripped of `"…"` or
  *   `[…]` quoting and upper-cased. A request entity with more than two parts (another database
- *   or a linked server), an empty part, or a quoted part hiding a dot or quote is malformed (DENY).
- *   Rule entity patterns follow the same shape, or the rule is invalid. Callers pass resolved base
- *   table names, not views, aliases or synonyms.
+ *   or a linked server), an empty part, unbalanced quoting, or a part that is not, once unquoted,
+ *   a plain identifier (`[A-Za-z0-9_$#@]+`: no dot, quote, backtick, `*` or space) is malformed
+ *   (DENY). Rule entity patterns follow the same shape (plus `*`), or the rule is invalid. Callers
+ *   pass resolved base table names, not views, aliases or synonyms.
+ * - Upper-casing makes quoted identifiers case-insensitive: ALLOW `TGFPAR` covers `"tgfpar"`,
+ *   which Oracle treats as a different table. Accepted (low impact); callers on case-sensitive
+ *   catalogs should reject such names before evaluating.
  * - ALLOW matching is strict and part-wise: an unqualified pattern matches the table part only
  *   (`TGFPAR` covers `TGFPAR` and `dbo.TGFPAR`); a qualified one matches schema and table part
  *   by part (`SANKHYA.TGF*` covers `sankhya.TGFPAR`, not `TGFPAR` or `dbo.TGFPAR`).
  * - DENY matching is broad (fail closed): anything ALLOW would match, plus the pattern against the
- *   full name, and a qualified pattern's table part against an unqualified entity, so DENY
- *   `X.TGFPAR` also hits a plain `TGFPAR`.
+ *   full name, and a qualified pattern's table part against an unqualified entity when that table
+ *   part has no `*`. So DENY `X.TGFPAR` also hits a plain `TGFPAR`, but DENY `SYS.*` does not
+ *   hit every unqualified name (it still hits `SYS.TGFPAR`).
  * - Patterns are case-insensitive globs where `*` is any run of characters (`TGF*` hits `TGFPAR`).
  *   In ALLOW matching `*` never crosses a dot, since it is applied per part.
  * - A rule matches only when `enabled === true`. Disabled rules are ignored, even malformed ones.
@@ -455,6 +460,9 @@ function parseName(name: string): string[] | null {
   }
 }
 
+/** A request entity name part, after unquoting. */
+const IDENTIFIER = /^[A-Za-z0-9_$#@]+$/;
+
 function toEntity(parts: string[]): Entity {
   return { full: parts.join('.'), parts, last: parts[parts.length - 1]! };
 }
@@ -480,7 +488,9 @@ function normalizeRequest(req: PolicyRequest): NormalizedRequest | string {
   const ents: Entity[] = [];
   for (const name of entities) {
     const parts = parseName(name);
-    if (!parts || parts.length > 2) return `entity ${name}`;
+    if (!parts || parts.length > 2 || !parts.every((p) => IDENTIFIER.test(p))) {
+      return `entity ${name}`;
+    }
     const entity = toEntity(parts);
     if (!ents.some((e) => e.full === entity.full)) ents.push(entity);
   }
@@ -668,7 +678,8 @@ function allowHit(p: string[], e: Entity): boolean {
 
 /**
  * DENY (broad, fails closed): anything ALLOW would match, plus the pattern against the full name
- * (`*` may cross the dot), and a qualified pattern's table part against an unqualified entity.
+ * (`*` may cross the dot), and a qualified pattern's literal (`*`-free) table part against an
+ * unqualified entity.
  */
 function denyHit(p: string[], e: Entity): boolean {
   const full = p.join('.');
@@ -676,7 +687,7 @@ function denyHit(p: string[], e: Entity): boolean {
     allowHit(p, e) ||
     glob(full, e.full) ||
     glob(full, e.last) ||
-    (e.parts.length === 1 && glob(p[p.length - 1]!, e.last))
+    (e.parts.length === 1 && !p[p.length - 1]!.includes('*') && glob(p[p.length - 1]!, e.last))
   );
 }
 

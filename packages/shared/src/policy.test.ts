@@ -869,6 +869,50 @@ const cases: Case[] = [
     effect: 'DENY',
     reason: /denied by rule deny-s/,
   },
+  // M1: a wildcard table part does not reach unqualified names.
+  {
+    name: 'DENY SYS.* does not block a plain TGFPAR',
+    request: req(),
+    rules: [rule({ id: 'deny-sys', effect: 'DENY', entities: ['SYS.*'] })],
+    effect: 'ALLOW',
+  },
+  {
+    name: 'DENY SYS.* still blocks SYS.TGFPAR',
+    request: req({ entities: ['sys.TGFPAR'] }),
+    rules: [rule({ id: 'deny-sys', effect: 'DENY', entities: ['SYS.*'] })],
+    effect: 'DENY',
+    reason: /denied by rule deny-sys/,
+  },
+  {
+    name: 'DENY X.TGF* does not block a plain TGFPAR',
+    request: req(),
+    rules: [rule({ id: 'deny-x', effect: 'DENY', entities: ['X.TGF*'] })],
+    effect: 'ALLOW',
+  },
+
+  // M2: request entity parts must be plain identifiers once unquoted.
+  ...[
+    '`TGFPAR`',
+    'TGF*',
+    'TGF PAR',
+    '[TGF PAR]',
+    '"TGF PAR"',
+    'dbo.`TGFPAR`',
+    'TGF-PAR',
+    "TGF'PAR",
+  ].map((entity): Case => ({
+    name: `entity ${entity} is not a plain identifier`,
+    request: req({ entities: [entity] }),
+    rules: [],
+    effect: 'DENY',
+    reason: /malformed request: entity/,
+  })),
+  {
+    name: 'identifier characters _ $ # @ and digits are accepted',
+    request: req({ entities: ['dbo.AD_T$#@1', '[sankhya].[TGFPAR]'] }),
+    rules: [],
+    effect: 'ALLOW',
+  },
   {
     name: 'a qualified column DENY hits the column of an unqualified entity',
     request: req({ columns: [{ table: 'TGFPAR', name: 'EMAIL' }] }),
