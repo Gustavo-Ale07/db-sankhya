@@ -12,6 +12,8 @@ const SENSITIVE_EXACT = new Set([
   'cookie',
   'setcookie',
   'password',
+  'passwd',
+  'senha',
   'passwordhash',
   'newpassword',
   'currentpassword',
@@ -33,7 +35,7 @@ const SENSITIVE_EXACT = new Set([
   'mgesession',
 ]);
 
-const SENSITIVE_SUFFIXES = ['token', 'apikey', 'secret', 'password'];
+const SENSITIVE_SUFFIXES = ['token', 'apikey', 'secret', 'password', 'passwd', 'senha'];
 
 const MIN_SECRET_VALUE_LENGTH = 6;
 
@@ -117,4 +119,53 @@ export function createRedactor(secretValues: readonly string[]): <T>(value: T) =
   };
 
   return (value) => walk(value, scrub, new WeakSet());
+}
+
+// ---------------------------------------------------------------- audit snapshots
+
+/** Most rows a before/after audit snapshot keeps. */
+export const SNAPSHOT_MAX_ROWS = 50;
+
+/**
+ * Fragments that make an ERP column sensitive wherever they appear in its name (e.g.
+ * `AD_SENHA_WEB`). Column names are checked more broadly than general keys: an over-masked
+ * snapshot value is harmless, a leaked credential is not.
+ */
+const SENSITIVE_COLUMN_FRAGMENTS = ['senha', 'password', 'passwd', 'token', 'secret'];
+
+/** True when a column's values must never be stored in an audit snapshot (case-insensitive). */
+export function isSensitiveColumn(name: string): boolean {
+  if (isSensitiveKey(name)) return true;
+  const k = normalizeKey(name);
+  return SENSITIVE_COLUMN_FRAGMENTS.some((fragment) => k.includes(fragment));
+}
+
+export interface RedactedSnapshot {
+  rows: unknown[];
+  /** Rows offered before the cap was applied. */
+  totalRows: number;
+  /** True when rows beyond the cap were dropped. */
+  truncated: boolean;
+}
+
+/**
+ * Copies at most `maxRows` (never more than {@link SNAPSHOT_MAX_ROWS}) rows, masking every
+ * sensitive column and scrubbing credential-shaped strings in the rest. A row that is not a
+ * plain object has no column names to check and is replaced whole (fail closed).
+ */
+export function redactSnapshot(
+  rows: readonly Record<string, unknown>[],
+  maxRows: number = SNAPSHOT_MAX_ROWS,
+): RedactedSnapshot {
+  const cap = Math.max(0, Math.min(Math.floor(maxRows), SNAPSHOT_MAX_ROWS));
+  const kept = rows.slice(0, cap).map((row) => {
+    if (row === null || typeof row !== 'object' || Array.isArray(row)) return REDACTED;
+    const out: Record<string, unknown> = {};
+    for (const [column, value] of Object.entries(row)) {
+      if (column === '__proto__' || column === 'constructor' || column === 'prototype') continue;
+      out[column] = isSensitiveColumn(column) ? REDACTED : redact(value);
+    }
+    return out;
+  });
+  return { rows: kept, totalRows: rows.length, truncated: rows.length > kept.length };
 }

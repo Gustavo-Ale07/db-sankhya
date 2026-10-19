@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { AppError, PERMISSIONS } from '@dbx/shared';
-import type { AuditEventRow, UserRow } from '@dbx/database';
+import type { UserRow } from '@dbx/database';
 import { toPublicUser } from '../services/users';
 import { clientIp, noStore, parseBody, requirePermission, uuidParam } from '../http';
 import { passwordPolicyError } from './auth';
@@ -66,41 +66,6 @@ const updateGroupBody = z
   })
   .strict()
   .refine((v) => Object.keys(v).length > 0, 'Nothing to update');
-
-const auditQuery = z
-  .object({
-    action: z.string().max(60).optional(),
-    userEmail: z.string().max(254).optional(),
-    resource: z.string().max(60).optional(),
-    status: z.enum(['success', 'partial', 'failed', 'denied', 'info']).optional(),
-    from: z.iso.datetime({ offset: true }).or(z.iso.date()).optional(),
-    to: z.iso.datetime({ offset: true }).or(z.iso.date()).optional(),
-    limit: z.coerce.number().int().min(1).max(200).default(50),
-    offset: z.coerce.number().int().min(0).max(1_000_000).default(0),
-  })
-  .strict();
-
-const toAudit = (a: AuditEventRow) => ({
-  id: a.id,
-  createdAt: a.createdAt.toISOString(),
-  userId: a.userId,
-  userEmail: a.userEmail,
-  ip: a.ip,
-  requestId: a.requestId,
-  action: a.action,
-  operation: a.operation,
-  resource: a.resource,
-  statement: a.statement,
-  targetIds: a.targetIds,
-  before: a.before,
-  after: a.after,
-  gatewayCalls: a.gatewayCalls,
-  status: a.status,
-  durationMs: a.durationMs,
-  errorCode: a.errorCode,
-  errorMessage: a.errorMessage,
-  details: a.details,
-});
 
 export async function adminRoutes(app: FastifyInstance): Promise<void> {
   const { users, audit, authz } = app.services;
@@ -353,23 +318,4 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     await record(request, actor, 'group.roles', { groupId: id, roles: group.roleKeys });
     return { item: group };
   });
-
-  // ---- audit -------------------------------------------------------------------------------
-
-  app.get('/api/audit', async (request, reply) => {
-    noStore(reply);
-    requirePermission(request, 'AUDIT.READ');
-    const { from, to, ...q } = parseBody(auditQuery, request.query);
-    const { items, total } = await audit.list({
-      ...q,
-      ...(from ? { from: new Date(from) } : {}),
-      ...(to ? { to: endOfDay(to) } : {}),
-    });
-    return { items: items.map(toAudit), total };
-  });
-}
-
-function endOfDay(value: string | Date): Date {
-  if (typeof value === 'string' && value.length === 10) return new Date(`${value}T23:59:59.999Z`);
-  return new Date(value);
 }

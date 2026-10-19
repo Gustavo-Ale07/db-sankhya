@@ -8,7 +8,8 @@ import type {
   QueryHistoryRow,
   SavedQueryRow,
 } from '@dbx/database';
-import { AppError } from '@dbx/shared';
+import { AppError, redactSnapshot } from '@dbx/shared';
+import type { Environment } from '@dbx/shared';
 
 type Redactor = (value: unknown) => unknown;
 
@@ -22,15 +23,60 @@ function clip(value: string | null | undefined, max: number): string | null {
 
 // ---------------------------------------------------------------- audit
 
+export const AUDIT_STATUSES = ['success', 'partial', 'failed', 'denied', 'info'] as const;
+export type AuditStatus = (typeof AUDIT_STATUSES)[number];
+
+/** Mutation-plan lifecycle events. The mutation orchestrator emits them through AuditService. */
+export const AUDIT_LIFECYCLE_ACTIONS = [
+  'PLAN_CREATED',
+  'PLAN_EXECUTED',
+  'PLAN_DENIED',
+  'VERIFICATION',
+] as const;
+export type AuditLifecycleAction = (typeof AUDIT_LIFECYCLE_ACTIONS)[number];
+
 export interface AuditFilters {
   action?: string;
+  userId?: string;
   userEmail?: string;
   resource?: string;
-  status?: string;
+  status?: AuditStatus;
+  environment?: Environment;
+  connectionId?: string;
+  planId?: string;
   from?: Date;
   to?: Date;
   limit: number;
   offset: number;
+}
+
+/** Who acted, where, and on which plan: shared by every lifecycle event. */
+export interface AuditLifecycleContext {
+  userId?: string | null;
+  userEmail?: string | null;
+  ip?: string | null;
+  requestId?: string | null;
+  connectionId: string;
+  environment: Environment;
+  planId: string;
+  planHash?: string | null;
+  capability?: string | null;
+  approvalId?: string | null;
+}
+
+type SnapshotRows = readonly Record<string, unknown>[];
+
+interface LifecycleCommon {
+  statement?: string | null;
+  policyDecision?: Record<string, unknown> | null;
+  details?: Record<string, unknown> | null;
+  /**
+   * The policy limit `auditSnapshots` (default true). EffectiveLimits has no such field yet, so
+   * the caller passes the resolved value. When false, no before/after rows are stored.
+   */
+  auditSnapshots?: boolean;
+  before?: SnapshotRows;
+  after?: SnapshotRows;
 }
 
 export class AuditService {
@@ -51,17 +97,119 @@ export class AuditService {
       after: r(event.after),
       gatewayCalls: r(event.gatewayCalls),
       details: r(event.details),
+      verification: r(event.verification),
+      policyDecision: r(event.policyDecision),
+      snapshot: r(event.snapshot),
+    });
+  }
+
+  /** A mutation plan was built (status `info`); `before` holds the rows it would change. */
+  recordPlanCreated(ctx: AuditLifecycleContext, input: LifecycleCommon): Promise<void> {
+    return this.recordLifecycle('PLAN_CREATED', 'info', ctx, input);
+  }
+
+  /** A plan ran; `outcome` is the execution result, `before`/`after` the affected rows. */
+  recordPlanExecuted(
+    ctx: AuditLifecycleContext,
+    input: LifecycleCommon & {
+      outcome: 'success' | 'partial' | 'failed';
+      affectedRows?: number;
+      durationMs?: number;
+      errorCode?: string | null;
+      errorMessage?: string | null;
+    },
+  ): Promise<void> {
+    const { outcome, affectedRows, durationMs, errorCode, errorMessage, ...rest } = input;
+    return this.recordLifecycle('PLAN_EXECUTED', outcome, ctx, {
+      ...rest,
+      details: {
+        ...(rest.details ?? {}),
+        ...(affectedRows !== undefined ? { affectedRows } : {}),
+      },
+      durationMs,
+      errorCode,
+      errorMessage,
+    });
+  }
+
+  /** The policy engine (or an approval) refused a plan. */
+  recordPlanDenied(
+    ctx: AuditLifecycleContext,
+    input: LifecycleCommon & { errorCode?: string | null; errorMessage?: string | null },
+  ): Promise<void> {
+    return this.recordLifecycle('PLAN_DENIED', 'denied', ctx, input);
+  }
+
+  /** The post-execution check: `success` when it passed, `failed` otherwise. */
+  recordVerification(
+    ctx: AuditLifecycleContext,
+    input: LifecycleCommon & { passed: boolean; verification?: Record<string, unknown> },
+  ): Promise<void> {
+    const { passed, verification, ...rest } = input;
+    return this.recordLifecycle('VERIFICATION', passed ? 'success' : 'failed', ctx, {
+      ...rest,
+      verification: { ...(verification ?? {}), passed },
+    });
+  }
+
+  private async recordLifecycle(
+    action: AuditLifecycleAction,
+    status: AuditStatus,
+    ctx: AuditLifecycleContext,
+    input: LifecycleCommon & {
+      verification?: Record<string, unknown>;
+      durationMs?: number;
+      errorCode?: string | null;
+      errorMessage?: string | null;
+    },
+  ): Promise<void> {
+    const snapshotsOn = input.auditSnapshots ?? true;
+    const hasRows = input.before !== undefined || input.after !== undefined;
+    let snapshot: Record<string, unknown> | null = null;
+    if (snapshotsOn && hasRows) {
+      snapshot = {};
+      if (input.before !== undefined) snapshot.before = redactSnapshot(input.before);
+      if (input.after !== undefined) snapshot.after = redactSnapshot(input.after);
+    }
+    const details: Record<string, unknown> = {
+      ...(input.details ?? {}),
+      ...(!snapshotsOn && hasRows ? { snapshotsDisabled: true } : {}),
+    };
+    await this.record({
+      action,
+      status,
+      userId: ctx.userId ?? null,
+      userEmail: ctx.userEmail ?? null,
+      ip: ctx.ip ?? null,
+      requestId: ctx.requestId ?? null,
+      connectionId: ctx.connectionId,
+      environment: ctx.environment,
+      planId: ctx.planId,
+      planHash: ctx.planHash ?? null,
+      capability: ctx.capability ?? null,
+      approvalId: ctx.approvalId ?? null,
+      statement: input.statement ?? null,
+      policyDecision: input.policyDecision ?? null,
+      verification: input.verification ?? null,
+      snapshot,
+      durationMs: input.durationMs ?? null,
+      errorCode: input.errorCode ?? null,
+      errorMessage: input.errorMessage ?? null,
+      details: Object.keys(details).length ? details : null,
     });
   }
 
   async list(filters: AuditFilters): Promise<{ items: AuditEventRow[]; total: number }> {
     const conditions: SQL[] = [];
     if (filters.action) conditions.push(eq(auditEvents.action, filters.action));
+    if (filters.userId) conditions.push(eq(auditEvents.userId, filters.userId));
     if (filters.userEmail)
       conditions.push(ilike(auditEvents.userEmail, `%${escapeLike(filters.userEmail)}%`));
     if (filters.resource) conditions.push(eq(auditEvents.resource, filters.resource));
-    if (filters.status)
-      conditions.push(eq(auditEvents.status, filters.status as AuditEventRow['status']));
+    if (filters.status) conditions.push(eq(auditEvents.status, filters.status));
+    if (filters.environment) conditions.push(eq(auditEvents.environment, filters.environment));
+    if (filters.connectionId) conditions.push(eq(auditEvents.connectionId, filters.connectionId));
+    if (filters.planId) conditions.push(eq(auditEvents.planId, filters.planId));
     if (filters.from) conditions.push(gte(auditEvents.createdAt, filters.from));
     if (filters.to) conditions.push(lte(auditEvents.createdAt, filters.to));
     const where = conditions.length ? and(...conditions) : undefined;

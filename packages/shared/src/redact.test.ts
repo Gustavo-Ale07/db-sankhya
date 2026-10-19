@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { REDACTED, createRedactor, redact } from './redact';
+import {
+  REDACTED,
+  SNAPSHOT_MAX_ROWS,
+  createRedactor,
+  isSensitiveColumn,
+  isSensitiveKey,
+  redact,
+  redactSnapshot,
+} from './redact';
 
 describe('redact', () => {
   it('replaces sensitive keys at any depth, case-insensitively', () => {
@@ -142,5 +150,84 @@ describe('createRedactor with errors and dates', () => {
     expect(out.err.stack).not.toContain('super-secret-value');
     expect(out.at).toBeInstanceOf(Date);
     expect(out.at.toISOString()).toBe('2026-01-01T00:00:00.000Z');
+  });
+});
+
+describe('sensitive column names', () => {
+  it('masks password-like columns case-insensitively, including Portuguese SENHA', () => {
+    for (const name of [
+      'SENHA',
+      'senha',
+      'Senha',
+      'PASSWORD',
+      'password',
+      'PASSWD',
+      'TOKEN',
+      'SECRET',
+    ])
+      expect(isSensitiveColumn(name), name).toBe(true);
+    // Embedded in a longer column name (ERP custom columns such as AD_SENHA_WEB).
+    for (const name of [
+      'AD_SENHA_WEB',
+      'SENHAUSU',
+      'USER_PASSWD',
+      'API_TOKEN_ID',
+      'CLIENT_SECRET_KEY',
+    ])
+      expect(isSensitiveColumn(name), name).toBe(true);
+    // Everything the key redactor already treats as sensitive stays sensitive.
+    for (const name of ['appkey', 'authorization', 'cookie', 'session', 'jsessionid'])
+      expect(isSensitiveColumn(name), name).toBe(true);
+  });
+
+  it('keeps ordinary columns', () => {
+    for (const name of ['CODPARC', 'NOMEPARC', 'EMAIL', 'DTALTER', 'VLRNOTA', 'ATIVO'])
+      expect(isSensitiveColumn(name), name).toBe(false);
+  });
+
+  it('treats senha and passwd as sensitive keys in general redaction too', () => {
+    expect(isSensitiveKey('SENHA')).toBe(true);
+    expect(isSensitiveKey('passwd')).toBe(true);
+    expect(redact({ SENHA: 'abc123', NOME: 'x' })).toEqual({ SENHA: REDACTED, NOME: 'x' });
+  });
+});
+
+describe('redactSnapshot', () => {
+  it('masks sensitive columns in every row and scrubs credentials in values', () => {
+    const out = redactSnapshot([
+      { CODUSU: 1, NOMEUSU: 'demo', SENHA: 'plain-1', PASSWORD: 'plain-2', Token: 't' },
+      { CODUSU: 2, NOMEUSU: 'other', OBS: 'sent Bearer abc.def.ghi1 upstream' },
+    ]);
+    expect(out).toEqual({
+      rows: [
+        { CODUSU: 1, NOMEUSU: 'demo', SENHA: REDACTED, PASSWORD: REDACTED, Token: REDACTED },
+        { CODUSU: 2, NOMEUSU: 'other', OBS: `sent Bearer ${REDACTED} upstream` },
+      ],
+      totalRows: 2,
+      truncated: false,
+    });
+    expect(JSON.stringify(out)).not.toContain('plain-');
+  });
+
+  it('caps the snapshot at 50 rows by default and records the truncation', () => {
+    expect(SNAPSHOT_MAX_ROWS).toBe(50);
+    const rows = Array.from({ length: 73 }, (_, i) => ({ ID: i }));
+    const out = redactSnapshot(rows);
+    expect(out.rows).toHaveLength(50);
+    expect(out.rows[49]).toEqual({ ID: 49 });
+    expect(out.totalRows).toBe(73);
+    expect(out.truncated).toBe(true);
+  });
+
+  it('never raises the cap above 50 rows and does not mutate its input', () => {
+    const rows = Array.from({ length: 60 }, (_, i) => ({ ID: i, SENHA: 's' }));
+    expect(redactSnapshot(rows, 10).rows).toHaveLength(10);
+    expect(redactSnapshot(rows, 1000).rows).toHaveLength(50);
+    expect(rows[0]).toEqual({ ID: 0, SENHA: 's' });
+  });
+
+  it('refuses rows that are not plain objects (no column names to check)', () => {
+    const out = redactSnapshot([['secret-value', 1] as unknown as Record<string, unknown>]);
+    expect(out.rows).toEqual([REDACTED]);
   });
 });

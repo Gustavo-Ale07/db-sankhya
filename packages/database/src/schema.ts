@@ -216,11 +216,31 @@ export const auditEvents = pgTable(
     errorCode: text('error_code'),
     errorMessage: text('error_message'),
     details: jsonb('details').$type<Record<string, unknown>>(),
+    // Mutation-plan lifecycle (PLAN_CREATED, PLAN_EXECUTED, PLAN_DENIED, VERIFICATION). All
+    // nullable: rows written before these columns existed stay valid and readable.
+    /** A saved connection's uuid or the env-defined connection id; no FK (kept after deletion). */
+    connectionId: text('connection_id'),
+    /** PRODUCTION, HOMOLOGATION or SANDBOX at the time of the event. */
+    environment: text('environment'),
+    /** The mutation plan this event belongs to. Plain uuid: plans may be purged, audit stays. */
+    planId: uuid('plan_id'),
+    planHash: text('plan_hash'),
+    /** The permission/capability exercised, e.g. DATA.UPDATE. */
+    capability: text('capability'),
+    /** Post-execution verification result. */
+    verification: jsonb('verification').$type<Record<string, unknown>>(),
+    approvalId: uuid('approval_id'),
+    /** Redacted policy engine decision behind the event. */
+    policyDecision: jsonb('policy_decision').$type<Record<string, unknown>>(),
+    /** Redacted before/after rows, capped at 50 rows each; absent when snapshots are disabled. */
+    snapshot: jsonb('snapshot').$type<Record<string, unknown>>(),
   },
   (t) => [
     index('audit_events_created_idx').on(t.createdAt),
     index('audit_events_user_idx').on(t.userId),
     index('audit_events_action_idx').on(t.action),
+    index('audit_events_plan_idx').on(t.planId),
+    index('audit_events_connection_idx').on(t.connectionId, t.createdAt),
   ],
 );
 

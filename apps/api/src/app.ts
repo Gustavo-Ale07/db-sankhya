@@ -25,6 +25,7 @@ import { AuthzService } from './services/authz';
 import { createBootstrapService } from './services/bootstrap';
 import { adminRoutes } from './routes/admin';
 import { approvalRoutes } from './routes/approvals';
+import { auditRoutes } from './routes/audit';
 import { authRoutes } from './routes/auth';
 import { connectionRoutes } from './routes/connections';
 import { dataRoutes } from './routes/data';
@@ -185,6 +186,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   await app.register(dataRoutes);
   await app.register(adminRoutes);
   await app.register(approvalRoutes);
+  await app.register(auditRoutes);
 
   const staticDir = config.staticDir ? resolve(config.staticDir) : undefined;
   if (staticDir && existsSync(staticDir)) {
