@@ -47,10 +47,16 @@ export function toJsonRecords(columns: string[], rows: Value[][]): Record<string
 
 /** Tab-separated text for pasting into spreadsheets. */
 export function toTsv(columns: string[], rows: Value[][], header = true): string {
-  const clean = (v: Value | undefined) =>
-    v === null || v === undefined ? '' : cellText(v).replace(/[\t\r\n]+/g, ' ');
+  const flat = (s: string) => s.replace(/[\t\r\n]+/g, ' ');
+  // Pasted into a spreadsheet, a leading = + - @ would run as a formula: neutralise it like the
+  // CSV export does (strings only; real numbers stay untouched).
+  const clean = (v: Value | undefined) => {
+    if (v === null || v === undefined) return '';
+    const raw = cellText(v);
+    return typeof v === 'string' && /^[=+\-@\t\r]/.test(raw) ? `'${flat(raw)}` : flat(raw);
+  };
   const lines = rows.map((r) => columns.map((_, i) => clean(r[i])).join('\t'));
-  return (header ? [columns.join('\t'), ...lines] : lines).join('\n');
+  return (header ? [columns.map(clean).join('\t'), ...lines] : lines).join('\n');
 }
 
 export function downloadText(filename: string, content: string, mime: string): void {

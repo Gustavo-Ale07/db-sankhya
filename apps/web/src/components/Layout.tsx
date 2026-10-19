@@ -1,7 +1,16 @@
 import { useCallback, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import type { Theme } from '../app/theme';
 import { can, rolesLabel, useSession } from '../app/session';
-import type { Permission } from '../api/types';
+import {
+  loadSelectedConnection,
+  resolveConnection,
+  saveSelectedConnection,
+} from '../app/connection';
+import { api } from '../api/client';
+import type { ConnectionOption, Permission } from '../api/types';
+import { ConnectionPicker } from '../explorer/ConnectionPicker';
+import { EnvironmentBanner } from './EnvironmentBanner';
 import { ExplorerPage } from '../explorer/ExplorerPage';
 import type { OpenRequest } from '../explorer/ExplorerPage';
 import { HistoryPage } from '../pages/HistoryPage';
@@ -27,6 +36,19 @@ export function Layout({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: 
   const { user, meta, logout, refresh } = useSession();
   const [view, setView] = useState<View>('explorer');
   const [openRequest, setOpenRequest] = useState<OpenRequest | null>(null);
+  const canQuery = can(user, 'QUERY.SELECT');
+  const [wantedConnection, setWantedConnection] = useState(loadSelectedConnection);
+  const connectionList = useQuery({
+    queryKey: ['connections'],
+    queryFn: () => api.get<{ items: ConnectionOption[] }>('/api/connections'),
+    enabled: canQuery,
+    staleTime: 60_000,
+  });
+  const connection = resolveConnection(connectionList.data?.items, wantedConnection);
+  const selectConnection = useCallback((id: string) => {
+    setWantedConnection(id);
+    saveSelectedConnection(id);
+  }, []);
 
   const openInEditor = useCallback((req: Omit<OpenRequest, 'nonce'>) => {
     setOpenRequest({ ...req, nonce: Date.now() + Math.random() });
@@ -47,6 +69,9 @@ export function Layout({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: 
         >
           DEMO — dados fictícios
         </div>
+      )}
+      {connection && (
+        <EnvironmentBanner environment={connection.environment} connectionName={connection.name} />
       )}
       <header className="flex items-center gap-1 border-b border-line bg-panel px-2 py-1">
         <span className="mr-3 flex items-center gap-1.5 font-semibold">
@@ -69,6 +94,14 @@ export function Layout({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: 
           ))}
         </nav>
         <div className="ml-auto flex items-center gap-2 text-xs">
+          {canQuery && (
+            <ConnectionPicker
+              connections={connectionList.data?.items ?? []}
+              selectedId={connection?.id}
+              onSelect={selectConnection}
+              loading={connectionList.isPending}
+            />
+          )}
           {meta?.sankhyaMode === 'mock' && (
             <span className="badge border-ok/50 text-ok" title="Dados fictícios em memória">
               MOCK
@@ -103,7 +136,13 @@ export function Layout({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: 
       <main className="relative min-h-0 flex-1">
         {/* The editor stays mounted so tabs, results and Monaco state survive navigation. */}
         <div className={view === 'explorer' ? 'h-full' : 'hidden'}>
-          <ExplorerPage theme={theme} openRequest={openRequest} active={view === 'explorer'} />
+          <ExplorerPage
+            theme={theme}
+            openRequest={openRequest}
+            active={view === 'explorer'}
+            connectionId={connection?.id}
+            connectionReady={!canQuery || !connectionList.isPending}
+          />
         </div>
         {view !== 'explorer' && (
           <div className="h-full overflow-auto">

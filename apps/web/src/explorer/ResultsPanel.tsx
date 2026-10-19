@@ -48,7 +48,7 @@ export function ResultsPanel({ run, tab, onTab }: Props) {
     messages.push(...run.result.messages);
     if (run.result.truncated)
       messages.push(
-        `Resultado truncated: exibindo ${run.result.rowCount} linha(s) pelo limite de linhas. Use filtros para refinar.`,
+        `Resultado truncado: exibindo ${run.result.rowCount} linha(s) pelo limite de linhas. Use filtros para refinar.`,
       );
   }
 
@@ -158,14 +158,17 @@ export function ResultsPanel({ run, tab, onTab }: Props) {
             <span>
               <strong className="text-fg">{result.rowCount}</strong> linha(s)
             </span>
-            <span>{formatDuration(result.durationMs)}</span>
+            <span data-testid="result-duration" title="Tempo de execução no servidor">
+              Tempo: {formatDuration(result.durationMs)}
+            </span>
             <span>{result.apiCalls} chamada(s) ao gateway</span>
             {result.truncated && (
               <span
                 className="badge border-warn/60 font-semibold text-warn"
                 data-testid="truncated"
+                title="O resultado atingiu o limite de linhas e está incompleto"
               >
-                truncated
+                truncado
               </span>
             )}
           </>

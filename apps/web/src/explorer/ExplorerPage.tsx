@@ -28,9 +28,19 @@ interface Props {
   theme: Theme;
   openRequest: OpenRequest | null;
   active: boolean;
+  /** Selected connection; undefined sends no connectionId (the API's default applies). */
+  connectionId?: string | undefined;
+  /** False while the connection list is still loading, so no call goes out with a stale default. */
+  connectionReady?: boolean;
 }
 
-export function ExplorerPage({ theme, openRequest, active }: Props) {
+export function ExplorerPage({
+  theme,
+  openRequest,
+  active,
+  connectionId,
+  connectionReady = true,
+}: Props) {
   const { user } = useSession();
   const qc = useQueryClient();
   const [tabs, setTabs] = useState<EditorTab[]>(() => loadTabs(user.id).tabs);
@@ -47,13 +57,15 @@ export function ExplorerPage({ theme, openRequest, active }: Props) {
   const splitRef = useRef<HTMLDivElement>(null);
 
   const schema = useQuery({
-    queryKey: ['schema'],
-    // The default Sankhya connection's data dictionary (no connection selector yet).
-    queryFn: () => api.get<SchemaResponse>('/api/schema'),
+    queryKey: ['schema', connectionId ?? null],
+    // Data dictionary of the selected connection; feeds the tree and the completion.
+    queryFn: () => api.get<SchemaResponse>('/api/schema', { query: { connectionId } }),
+    enabled: connectionReady,
     staleTime: 5 * 60_000,
   });
   useEffect(() => {
-    if (schema.data) setCompletionSchema(schema.data.catalog.tables);
+    // Cleared while another connection's dictionary loads: no suggestions from the wrong one.
+    setCompletionSchema(schema.data?.catalog.tables ?? []);
   }, [schema.data]);
 
   const tab = tabs.find((t) => t.id === activeId) ?? tabs[0]!;
@@ -82,7 +94,7 @@ export function ExplorerPage({ theme, openRequest, active }: Props) {
       try {
         const res = await api.post<QueryResult>(
           '/api/query',
-          { sql, executionId },
+          { sql, executionId, ...(connectionId ? { connectionId } : {}) },
           { signal: controller.signal },
         );
         setRun(tabId, { status: 'result', sql, result: res });
@@ -103,7 +115,7 @@ export function ExplorerPage({ theme, openRequest, active }: Props) {
         void qc.invalidateQueries({ queryKey: ['history'] });
       }
     },
-    [qc],
+    [qc, connectionId],
   );
 
   const runCurrent = useCallback(() => {
@@ -232,7 +244,7 @@ export function ExplorerPage({ theme, openRequest, active }: Props) {
         <aside className="w-64 shrink-0 border-r border-line bg-panel" aria-label="Schema">
           <SchemaTree
             tables={schema.data?.catalog.tables}
-            loading={schema.isPending}
+            loading={schema.isPending && connectionReady}
             onSelectQuery={openTableQuery}
             onInsertText={(text) => editorApi.current?.insertText(text)}
           />

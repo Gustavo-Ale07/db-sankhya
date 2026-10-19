@@ -25,6 +25,7 @@ import { AuthzService } from './services/authz';
 import { createBootstrapService } from './services/bootstrap';
 import { adminRoutes } from './routes/admin';
 import { authRoutes } from './routes/auth';
+import { connectionRoutes } from './routes/connections';
 import { dataRoutes } from './routes/data';
 import { queryRoutes } from './routes/query';
 import { systemRoutes } from './routes/system';
@@ -178,6 +179,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
 
   await app.register(systemRoutes);
   await app.register(authRoutes);
+  await app.register(connectionRoutes);
   await app.register(queryRoutes);
   await app.register(dataRoutes);
   await app.register(adminRoutes);

@@ -1,6 +1,8 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, render, screen } from '@testing-library/react';
-import type { Meta, User } from '../api/types';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { api } from '../api/client';
+import type { ConnectionOption, Meta, User } from '../api/types';
 import { SessionContext } from '../app/session';
 import { Layout } from './Layout';
 
@@ -12,6 +14,8 @@ vi.mock('../pages/ChangePasswordPage', () => ({ ChangePasswordPage: () => null }
 vi.mock('../admin/UsersPage', () => ({ UsersPage: () => null }));
 vi.mock('../admin/AuditPage', () => ({ AuditPage: () => null }));
 vi.mock('../admin/StatusPage', () => ({ StatusPage: () => null }));
+
+vi.mock('../api/client', () => ({ api: { get: vi.fn() } }));
 
 const USER: User = {
   id: 'u1',
@@ -34,12 +38,25 @@ const META: Meta = {
 
 function renderLayout(meta: Meta | undefined, user: User = USER) {
   const noop = () => Promise.resolve();
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
-    <SessionContext.Provider value={{ user, meta, logout: noop, refresh: noop }}>
-      <Layout theme="light" onToggleTheme={() => undefined} />
-    </SessionContext.Provider>,
+    <QueryClientProvider client={client}>
+      <SessionContext.Provider value={{ user, meta, logout: noop, refresh: noop }}>
+        <Layout theme="light" onToggleTheme={() => undefined} />
+      </SessionContext.Provider>
+    </QueryClientProvider>,
   );
 }
+
+const CONNECTIONS: ConnectionOption[] = [
+  { id: 'env-default', name: 'env-default', environment: 'SANDBOX' },
+  { id: 'prod', name: 'Principal', environment: 'PRODUCTION' },
+];
+
+beforeEach(() => {
+  window.localStorage.clear();
+  vi.mocked(api.get).mockResolvedValue({ items: CONNECTIONS });
+});
 
 afterEach(cleanup);
 
@@ -55,6 +72,29 @@ describe('Layout demo banner', () => {
     expect(screen.queryByTestId('demo-banner')).toBeNull();
     renderLayout(undefined);
     expect(screen.queryByTestId('demo-banner')).toBeNull();
+  });
+});
+
+describe('Layout environment banner and connection picker', () => {
+  it('shows the banner of the first connection, then of the selected one', async () => {
+    renderLayout(META);
+    expect((await screen.findByTestId('environment-label')).textContent).toBe('SANDBOX');
+    fireEvent.change(screen.getByTestId('connection-picker'), { target: { value: 'prod' } });
+    expect((await screen.findByTestId('environment-label')).textContent).toBe('PRODUÇÃO');
+    expect(window.localStorage.getItem('dbx.connection')).toBe('prod');
+  });
+
+  it('remembers the selection across loads', async () => {
+    window.localStorage.setItem('dbx.connection', 'prod');
+    renderLayout(META);
+    expect((await screen.findByTestId('environment-label')).textContent).toBe('PRODUÇÃO');
+  });
+
+  it('has no picker, no request and no banner without QUERY.SELECT', () => {
+    renderLayout(META, { ...USER, permissions: [] });
+    expect(screen.queryByTestId('connection-picker')).toBeNull();
+    expect(screen.queryByTestId('environment-banner')).toBeNull();
+    expect(api.get).not.toHaveBeenCalled();
   });
 });
 

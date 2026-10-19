@@ -70,6 +70,15 @@ export interface Meta {
   demoMode: boolean;
 }
 
+export type ConnectionEnvironment = 'PRODUCTION' | 'HOMOLOGATION' | 'SANDBOX';
+
+/** A selectable connection (GET /api/connections): never credentials or URLs. */
+export interface ConnectionOption {
+  id: string;
+  name: string;
+  environment: ConnectionEnvironment;
+}
+
 /** A column of the Sankhya data dictionary (GET /api/schema). */
 export interface CatalogColumn {
   name: string;

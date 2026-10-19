@@ -56,6 +56,12 @@ describe('toJsonRecords / toTsv', () => {
     expect(toTsv(['a', 'b'], [['x\ty', 'l1\nl2']])).toBe('a\tb\nx y\tl1 l2');
     expect(toTsv(['a'], [[null]], false)).toBe('');
   });
+  it('neutralises formula injection when pasted into a spreadsheet', () => {
+    expect(toTsv(['a'], [['=1+1']], false).startsWith("'")).toBe(true);
+    const text = toTsv(['v'], [['=1+1'], ['+1'], ['-2'], ['@A1'], ['\t=1'], [-5]], false);
+    expect(text.split('\n')).toEqual(["'=1+1", "'+1", "'-2", "'@A1", "' =1", '-5']);
+    expect(toTsv(['=h'], [['ok']])).toBe("'=h\nok");
+  });
 });
 
 describe('formatDuration', () => {

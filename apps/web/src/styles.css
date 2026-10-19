@@ -170,3 +170,18 @@ body {
   white-space: nowrap;
   border: 0;
 }
+
+/* Environment banner: solid colour so the environment is unmistakable in both themes. */
+.env-banner {
+  color: var(--dbx-bg);
+  border-bottom: 1px solid var(--dbx-line);
+}
+.env-banner-PRODUCTION {
+  background: var(--dbx-danger);
+}
+.env-banner-HOMOLOGATION {
+  background: var(--dbx-warn);
+}
+.env-banner-SANDBOX {
+  background: var(--dbx-ok);
+}

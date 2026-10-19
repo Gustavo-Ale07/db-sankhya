@@ -55,6 +55,27 @@ describe('suggest', () => {
     expect(labels).not.toContain('NUNOTA');
     expect(labels).not.toContain('UPDATE');
   });
+  it('covers the full SELECT vocabulary and no mutation keyword', () => {
+    const labels = suggest('SELECT ', 'SELECT  FROM TGFPAR', tables).map((x) => x.label);
+    for (const k of [
+      'WITH',
+      'CASE',
+      'WHEN',
+      'UNION',
+      'UNION ALL',
+      'HAVING',
+      'EXISTS',
+      'RIGHT JOIN',
+    ])
+      expect(labels).toContain(k);
+    for (const k of ['INSERT', 'UPDATE', 'DELETE', 'DROP', 'MERGE'])
+      expect(labels).not.toContain(k);
+  });
+  it('does not take UNION or HAVING for an alias', () => {
+    const a = findAliases('SELECT 1 FROM TGFPAR UNION SELECT 1 FROM TGFCAB HAVING 1=1', tables);
+    expect(a.has('union')).toBe(false);
+    expect(a.has('having')).toBe(false);
+  });
   it('returns nothing for an unknown qualifier', () => {
     expect(suggest('SELECT x.', 'SELECT x.', tables)).toEqual([]);
   });
