@@ -13,3 +13,8 @@ minimumReleaseAgeExclude:
   - vitest@5.0.5
   - '@tanstack/react-virtual@3.14.21'
   - '@tanstack/virtual-core@3.19.6'
+
+# Patched transitive dependencies (advisories: dompurify <3.4.16 via monaco-editor, esbuild <0.25.0 via drizzle-kit).
+overrides:
+  dompurify: 3.4.16
+  'esbuild@<0.25.0': 0.25.12
