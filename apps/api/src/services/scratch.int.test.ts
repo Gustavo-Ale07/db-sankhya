@@ -99,6 +99,40 @@ describe('ScratchManager', () => {
     expect(await ws.tables()).toEqual([{ name: 'tmp_a', rows: 60 }]);
   });
 
+  it('checks the row quota across tables after every mutating statement', async () => {
+    const ws = await manager({ maxRows: 100 }).workspace('u1');
+    await ws.exec('CREATE TABLE tmp_a (g int)');
+    await ws.exec('INSERT INTO tmp_a SELECT g FROM generate_series(1, 80) g');
+    await ws.exec('CREATE TABLE tmp_b (g int)');
+    expect(await codeOf(ws.exec('INSERT INTO tmp_b SELECT g FROM generate_series(1, 30) g'))).toBe(
+      'QUERY_LIMIT_EXCEEDED',
+    );
+    // An import is a mutation too: it is refused and the previous table survives.
+    expect(
+      await codeOf(
+        ws.importRows(
+          'tmp_a',
+          [{ name: 'g', type: 'numeric' }],
+          Array.from({ length: 101 }, (_, i) => [i]),
+        ),
+      ),
+    ).toBe('QUERY_LIMIT_EXCEEDED');
+    expect(
+      await codeOf(
+        ws.importRows(
+          'tmp_c',
+          [{ name: 'g', type: 'numeric' }],
+          Array.from({ length: 30 }, (_, i) => [i]),
+        ),
+      ),
+    ).toBe('QUERY_LIMIT_EXCEEDED');
+    expect(await ws.tables()).toEqual([
+      { name: 'tmp_a', rows: 80 },
+      { name: 'tmp_b', rows: 0 },
+    ]);
+    expect((await ws.exec('SELECT 1 AS one')).rows).toEqual([[1]]);
+  }, 60_000);
+
   it('evicts idle workspaces after the TTL', async () => {
     let now = 0;
     const m = manager({ ttlMinutes: 10, now: () => now });

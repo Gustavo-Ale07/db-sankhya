@@ -375,6 +375,7 @@ export class ScratchWorkspace {
     table: string,
     columns: Array<{ name: string; type: ScratchColumnType }>,
     rows: unknown[][],
+    signal?: AbortSignal,
   ): Promise<void> {
     assertScratchTableName(table);
     if (columns.length === 0 || columns.length > 200) {
@@ -397,7 +398,7 @@ export class ScratchWorkspace {
       );
     }
     await this.use(() =>
-      this.host.run({ op: 'import', table, columns, rows, limits: this.limits }),
+      this.host.run({ op: 'import', table, columns, rows, limits: this.limits }, signal),
     );
   }
 
