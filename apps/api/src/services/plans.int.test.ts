@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { eq, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { createDatabase, plans, users } from '@dbx/database';
 import type { DatabaseHandle } from '@dbx/database';
 import { DEFAULT_LIMITS, canonicalJSON, isAppError } from '@dbx/shared';
@@ -119,8 +119,8 @@ describe('PlansService.create', () => {
     expect(row!.capability).toEqual(CAPABILITY);
   });
 
-  it('computes planHash from the brief fields with canonical JSON', async () => {
-    const input = newPlan();
+  it('computes planHash from the brief fields plus the gate fields with canonical JSON', async () => {
+    const input = newPlan({ environment: 'PRODUCTION' });
     const plan = await service().create(input);
     const expected = sha256Hex(
       canonicalJSON({
@@ -132,6 +132,12 @@ describe('PlansService.create', () => {
         policyVersion: input.decision.policyVersion,
         targetsHash: sha256Hex(canonicalJSON(input.targets)),
         capability: input.capability,
+        requiresApproval: false,
+        strongConfirmationPhrase: 'PRODUCTION UPDATE 3 TGFPAR',
+        expiresAt: plan.expiresAt.toISOString(),
+        decisionHash: sha256Hex(canonicalJSON(input.decision)),
+        previewHash: sha256Hex(canonicalJSON(input.preview)),
+        previewKind: input.previewKind,
       }),
     );
     expect(plan.planHash).toBe(expected);
@@ -318,6 +324,67 @@ describe('PlansService.consume', () => {
       );
       expect(await statusOf(plan.id)).toBe('PENDING');
     }
+  });
+
+  it('refuses a plan whose gate columns were altered', async () => {
+    const svc = service();
+    const gated = () =>
+      newPlan({ environment: 'PRODUCTION', decision: decision({ requireApproval: true }) });
+    const cases: Array<[string, () => NewPlan, ReturnType<typeof sql>]> = [
+      ['clear requires_approval', gated, sql`requires_approval = false`],
+      ['set requires_approval', newPlan, sql`requires_approval = true`],
+      ['change the phrase', gated, sql`strong_confirmation_phrase = 'PRODUCTION UPDATE 1 X'`],
+      ['clear the phrase', gated, sql`strong_confirmation_phrase = null`],
+      ['add a phrase', newPlan, sql`strong_confirmation_phrase = 'SANDBOX UPDATE 3 TGFPAR'`],
+      ['extend expires_at', newPlan, sql`expires_at = expires_at + interval '1 hour'`],
+      [
+        'rewrite the decision',
+        newPlan,
+        sql`decision = jsonb_set(decision, '{matchedRuleIds}', '["r9"]')`,
+      ],
+      [
+        'clear approval in decision and column',
+        gated,
+        sql`decision = jsonb_set(decision, '{limits,requireApproval}', 'false'), requires_approval = false`,
+      ],
+      ['change policy_version', newPlan, sql`policy_version = ${'b'.repeat(64)}`],
+      ['change the preview', newPlan, sql`preview = '{"rows":1}'::jsonb`],
+      ['change preview_kind', newPlan, sql`preview_kind = 'OTHER'`],
+    ];
+    for (const [name, make, change] of cases) {
+      const plan = await svc.create(make());
+      await database.db.execute(sql`update plans set ${change} where id = ${plan.id}`);
+      // Approve where needed so only the tampering can be the reason for the refusal.
+      await database.db
+        .update(plans)
+        .set({ status: 'APPROVED' })
+        .where(and(eq(plans.id, plan.id), eq(plans.requiresApproval, true)));
+      const err = await svc
+        .consume({
+          id: plan.id,
+          token: plan.token,
+          userId,
+          sessionId,
+          strongConfirmation: 'PRODUCTION UPDATE 3 TGFPAR',
+        })
+        .then(
+          () => undefined,
+          (e: unknown) => e,
+        );
+      expect(isAppError(err) ? err.code : err, name).toBe('CONFIRMATION_INVALID');
+    }
+
+    // Control: the same gated plan, untouched and approved, is consumable.
+    const control = await svc.create(gated());
+    await database.db.update(plans).set({ status: 'APPROVED' }).where(eq(plans.id, control.id));
+    const row = await svc.consume({
+      id: control.id,
+      token: control.token,
+      userId,
+      sessionId,
+      strongConfirmation: 'PRODUCTION UPDATE 3 TGFPAR',
+    });
+    expect(row.status).toBe('CONSUMED');
   });
 
   it('requires the exact strong phrase', async () => {

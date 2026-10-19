@@ -78,7 +78,7 @@ function plain(value: unknown): unknown {
 
 const hashOf = (value: unknown) => sha256Hex(canonicalJSON(value));
 
-function planHashOf(p: {
+interface PlanHashInput {
   sqlHash: string;
   paramsHash: string;
   userId: string;
@@ -87,7 +87,16 @@ function planHashOf(p: {
   policyVersion: string;
   targetsHash: string;
   capability: unknown;
-}): string {
+  /** Gate fields (controller ruling, superset of the brief's list). */
+  requiresApproval: boolean;
+  strongConfirmationPhrase: string | null;
+  expiresAt: Date;
+  decision: unknown;
+  preview: unknown;
+  previewKind: string;
+}
+
+function planHashOf(p: PlanHashInput): string {
   return hashOf({
     sqlHash: p.sqlHash,
     paramsHash: p.paramsHash,
@@ -97,7 +106,31 @@ function planHashOf(p: {
     policyVersion: p.policyVersion,
     targetsHash: p.targetsHash,
     capability: p.capability,
+    requiresApproval: p.requiresApproval,
+    strongConfirmationPhrase: p.strongConfirmationPhrase,
+    expiresAt: p.expiresAt.toISOString(),
+    decisionHash: hashOf(p.decision),
+    previewHash: hashOf(p.preview),
+    previewKind: p.previewKind,
   });
+}
+
+/** The gates a stored decision and environment imply (re-derived at consume time). */
+function gatesOf(
+  decision: unknown,
+  environment: string,
+): { requiresApproval: boolean; needsPhrase: boolean } | undefined {
+  const limits = (decision as { limits?: Record<string, unknown> } | null)?.limits;
+  if (
+    !limits ||
+    typeof limits.requireApproval !== 'boolean' ||
+    typeof limits.requireStrongConfirmation !== 'boolean'
+  )
+    return undefined;
+  return {
+    requiresApproval: limits.requireApproval,
+    needsPhrase: limits.requireStrongConfirmation || environment === 'PRODUCTION',
+  };
 }
 
 const invalid = () =>
@@ -149,7 +182,17 @@ export class PlansService {
     const sqlHash = sha256Hex(input.sql);
     const paramsHash = hashOf(plain(input.params));
     const targetsHash = hashOf(targets);
+    const decision = plain(input.decision);
+    const preview = plain(input.preview);
     const policyVersion = input.decision.policyVersion;
+    const gates = gatesOf(decision, input.environment);
+    if (!gates) throw badInput('decision limits are invalid');
+    const { action, count, entity } = input.summary;
+    const phrase = gates.needsPhrase
+      ? strongConfirmationPhrase(input.environment, action, count, entity)
+      : null;
+    const createdAt = this.now();
+    const expiresAt = new Date(createdAt.getTime() + this.options.ttlSeconds * 1000);
     const planHash = planHashOf({
       sqlHash,
       paramsHash,
@@ -159,12 +202,13 @@ export class PlansService {
       policyVersion,
       targetsHash,
       capability,
+      requiresApproval: gates.requiresApproval,
+      strongConfirmationPhrase: phrase,
+      expiresAt,
+      decision,
+      preview,
+      previewKind: input.previewKind,
     });
-    const limits = input.decision.limits;
-    const needsPhrase = limits.requireStrongConfirmation || input.environment === 'PRODUCTION';
-    const { action, count, entity } = input.summary;
-    const createdAt = this.now();
-    const expiresAt = new Date(createdAt.getTime() + this.options.ttlSeconds * 1000);
 
     const [row] = await this.db
       .insert(plans)
@@ -177,17 +221,15 @@ export class PlansService {
         sqlHash,
         paramsHash,
         capability,
-        decision: plain(input.decision),
+        decision,
         policyVersion,
         targets,
         targetsHash,
-        preview: plain(input.preview),
+        preview,
         previewKind: input.previewKind,
         planHash,
-        requiresApproval: limits.requireApproval,
-        strongConfirmationPhrase: needsPhrase
-          ? strongConfirmationPhrase(input.environment, action, count, entity)
-          : null,
+        requiresApproval: gates.requiresApproval,
+        strongConfirmationPhrase: phrase,
         createdAt,
         expiresAt,
       })
@@ -308,11 +350,25 @@ export class PlansService {
     return hmac(this.options.secret, `plan|${id}|${planHash}|${sessionId}`);
   }
 
-  /** Recomputes every derivable hash, so an altered row is never executed. */
+  /**
+   * Recomputes every derivable hash and re-derives the gates from the stored decision and
+   * environment, so an altered row (content or gate columns) is never executed.
+   */
   private intact(row: PlanRow): boolean {
     const sqlHash = sha256Hex(row.sql);
     const targetsHash = hashOf(row.targets);
     if (sqlHash !== row.sqlHash || targetsHash !== row.targetsHash) return false;
+    const decision = row.decision as { policyVersion?: unknown } | null;
+    if (decision?.policyVersion !== row.policyVersion) return false;
+    const gates = gatesOf(row.decision, row.environment);
+    if (
+      !gates ||
+      gates.requiresApproval !== row.requiresApproval ||
+      gates.needsPhrase !== (row.strongConfirmationPhrase !== null) ||
+      (row.strongConfirmationPhrase !== null &&
+        !row.strongConfirmationPhrase.startsWith(`${row.environment} `))
+    )
+      return false;
     return (
       planHashOf({
         sqlHash,
@@ -323,6 +379,12 @@ export class PlansService {
         policyVersion: row.policyVersion,
         targetsHash,
         capability: row.capability,
+        requiresApproval: row.requiresApproval,
+        strongConfirmationPhrase: row.strongConfirmationPhrase,
+        expiresAt: row.expiresAt,
+        decision: row.decision,
+        preview: row.preview,
+        previewKind: row.previewKind,
       }) === row.planHash
     );
   }
