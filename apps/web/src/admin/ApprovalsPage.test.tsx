@@ -98,8 +98,18 @@ describe('ApprovalsPage', () => {
     fireEvent.click(screen.getAllByText('Aprovar')[0]!);
     fireEvent.click(screen.getByText('Confirmar'));
     expect((await screen.findByTestId('approval-message')).textContent).toBe(
-      decisionErrorMessage(new ApiError(409, { code: 'CONFLICT', message: '' })),
+      'Esta aprovação já foi decidida ou o plano mudou. A lista foi atualizada.',
     );
+    await waitFor(() => expect(api.get).toHaveBeenCalledTimes(2));
+  });
+
+  it('does not render a null preview', async () => {
+    const item = base('a3', true);
+    item.plan.preview = null;
+    vi.mocked(api.get).mockResolvedValue({ items: [item] });
+    renderPage();
+    await screen.findByTestId('approval-sql');
+    expect(screen.queryByTestId('approval-preview')).toBeNull();
   });
 });
 

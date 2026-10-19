@@ -125,7 +125,7 @@ export function ApprovalsPage() {
                   >
                     {a.plan.sql}
                   </pre>
-                  {a.plan.preview !== undefined && (
+                  {a.plan.preview !== undefined && a.plan.preview !== null && (
                     <pre
                       className="max-h-48 overflow-auto rounded border border-line p-2 font-mono whitespace-pre-wrap"
                       data-testid="approval-preview"
@@ -149,6 +149,7 @@ export function ApprovalsPage() {
                   <label className="block space-y-1">
                     <span className="block font-medium">Motivo (opcional)</span>
                     <input
+                      autoFocus
                       className="input w-full"
                       maxLength={1000}
                       value={reason}

@@ -140,6 +140,14 @@ describe('Layout navigation gating', () => {
     expect(screen.getByTestId('current-user').textContent).toContain('Leitor');
   });
 
+  it('shows Aprovações only with APPROVAL.DECIDE', () => {
+    renderLayout(META);
+    expect(navLabels()).not.toContain('Aprovações');
+    cleanup();
+    renderLayout(META, { ...USER, permissions: [...USER.permissions, 'APPROVAL.DECIDE'] });
+    expect(navLabels()).toContain('Aprovações');
+  });
+
   it('shows each page for its own permission, not for a role name', () => {
     renderLayout(META, { ...USER, roles: ['CUSTOM'], permissions: ['AUDIT.READ'] });
     expect(navLabels()).toContain('Auditoria');
