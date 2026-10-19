@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { api } from '../api/client';
 import type { ConnectionOption, Meta, User } from '../api/types';
@@ -78,23 +78,50 @@ describe('Layout demo banner', () => {
 describe('Layout environment banner and connection picker', () => {
   it('shows the banner of the first connection, then of the selected one', async () => {
     renderLayout(META);
-    expect((await screen.findByTestId('environment-label')).textContent).toBe('SANDBOX');
+    await waitFor(() =>
+      expect(screen.getByTestId('environment-label').textContent).toBe('SANDBOX'),
+    );
     fireEvent.change(screen.getByTestId('connection-picker'), { target: { value: 'prod' } });
-    expect((await screen.findByTestId('environment-label')).textContent).toBe('PRODUÇÃO');
+    await waitFor(() =>
+      expect(screen.getByTestId('environment-label').textContent).toBe('PRODUÇÃO'),
+    );
     expect(window.localStorage.getItem('dbx.connection')).toBe('prod');
   });
 
   it('remembers the selection across loads', async () => {
     window.localStorage.setItem('dbx.connection', 'prod');
     renderLayout(META);
-    expect((await screen.findByTestId('environment-label')).textContent).toBe('PRODUÇÃO');
+    await waitFor(() =>
+      expect(screen.getByTestId('environment-label').textContent).toBe('PRODUÇÃO'),
+    );
   });
 
-  it('has no picker, no request and no banner without QUERY.SELECT', () => {
+  it('has no picker and no request without QUERY.SELECT, but the banner stays', () => {
     renderLayout(META, { ...USER, permissions: [] });
     expect(screen.queryByTestId('connection-picker')).toBeNull();
-    expect(screen.queryByTestId('environment-banner')).toBeNull();
+    expect(screen.getByTestId('environment-label').textContent).toBe('Ambiente indisponível');
     expect(api.get).not.toHaveBeenCalled();
+  });
+
+  it('shows the neutral placeholder while connections load', () => {
+    vi.mocked(api.get).mockReturnValue(new Promise(() => undefined));
+    renderLayout(META);
+    expect(screen.getByTestId('environment-label').textContent).toBe('Ambiente indisponível');
+    expect(screen.getByTestId('environment-banner').getAttribute('data-environment')).toBe(
+      'UNAVAILABLE',
+    );
+  });
+
+  it('keeps the placeholder when loading fails or the list is empty', async () => {
+    vi.mocked(api.get).mockRejectedValue(new Error('boom'));
+    renderLayout(META);
+    await screen.findByText('Nenhuma conexão disponível');
+    expect(screen.getByTestId('environment-label').textContent).toBe('Ambiente indisponível');
+    cleanup();
+    vi.mocked(api.get).mockResolvedValue({ items: [] });
+    renderLayout(META);
+    await screen.findByText('Nenhuma conexão disponível');
+    expect(screen.getByTestId('environment-label').textContent).toBe('Ambiente indisponível');
   });
 });
 

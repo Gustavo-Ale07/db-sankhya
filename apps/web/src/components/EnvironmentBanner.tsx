@@ -7,8 +7,11 @@ export const ENVIRONMENT_LABEL: Record<ConnectionEnvironment, string> = {
   SANDBOX: 'SANDBOX',
 };
 
+export const UNAVAILABLE_LABEL = 'Ambiente indisponível';
+
 interface Props {
-  environment: ConnectionEnvironment;
+  /** Undefined while no connection is resolved: a neutral placeholder is shown instead. */
+  environment: ConnectionEnvironment | undefined;
   connectionName?: string;
 }
 
@@ -19,10 +22,12 @@ export function EnvironmentBanner({ environment, connectionName }: Props) {
       role="note"
       aria-label="Ambiente da conexão"
       data-testid="environment-banner"
-      data-environment={environment}
-      className={`env-banner env-banner-${environment} flex items-center justify-center gap-2 px-3 py-0.5 text-xs font-bold tracking-wide`}
+      data-environment={environment ?? 'UNAVAILABLE'}
+      className={`env-banner env-banner-${environment ?? 'UNAVAILABLE'} flex items-center justify-center gap-2 px-3 py-0.5 text-xs font-bold tracking-wide`}
     >
-      <span data-testid="environment-label">{ENVIRONMENT_LABEL[environment]}</span>
+      <span data-testid="environment-label">
+        {environment ? ENVIRONMENT_LABEL[environment] : UNAVAILABLE_LABEL}
+      </span>
       {connectionName && (
         <span className="font-normal" data-testid="environment-connection">
           · {connectionName}

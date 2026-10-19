@@ -182,6 +182,9 @@ body {
 .env-banner-HOMOLOGATION {
   background: var(--dbx-warn);
 }
+.env-banner-UNAVAILABLE {
+  background: var(--dbx-muted);
+}
 .env-banner-SANDBOX {
   background: var(--dbx-ok);
 }

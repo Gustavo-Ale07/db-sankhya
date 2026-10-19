@@ -28,7 +28,7 @@ interface Props {
   theme: Theme;
   openRequest: OpenRequest | null;
   active: boolean;
-  /** Selected connection; undefined sends no connectionId (the API's default applies). */
+  /** Selected connection. Undefined (loading, error, empty list) blocks running queries. */
   connectionId?: string | undefined;
   /** False while the connection list is still loading, so no call goes out with a stale default. */
   connectionReady?: boolean;
@@ -60,7 +60,7 @@ export function ExplorerPage({
     queryKey: ['schema', connectionId ?? null],
     // Data dictionary of the selected connection; feeds the tree and the completion.
     queryFn: () => api.get<SchemaResponse>('/api/schema', { query: { connectionId } }),
-    enabled: connectionReady,
+    enabled: connectionReady && Boolean(connectionId),
     staleTime: 5 * 60_000,
   });
   useEffect(() => {
@@ -86,6 +86,8 @@ export function ExplorerPage({
     async (sqlText: string, tabId: string) => {
       const sql = sqlText.trim().replace(/;\s*$/, '');
       if (!sql) return;
+      // Never run against an environment the banner is not showing.
+      if (!connectionId) return;
       aborts.current[tabId]?.abort();
       const controller = new AbortController();
       aborts.current[tabId] = controller;
@@ -319,8 +321,12 @@ export function ExplorerPage({
             type="button"
             className="btn btn-primary"
             onClick={runCurrent}
-            disabled={run.status === 'running'}
-            title="Executar (Ctrl+Enter / F5)"
+            disabled={run.status === 'running' || !connectionId}
+            title={
+              connectionId
+                ? 'Executar (Ctrl+Enter / F5)'
+                : 'Selecione uma conexão para executar (ambiente indisponível)'
+            }
             data-testid="run-query"
           >
             ▶ Executar

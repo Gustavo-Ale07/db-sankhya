@@ -70,9 +70,7 @@ export function Layout({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: 
           DEMO — dados fictícios
         </div>
       )}
-      {connection && (
-        <EnvironmentBanner environment={connection.environment} connectionName={connection.name} />
-      )}
+      <EnvironmentBanner environment={connection?.environment} connectionName={connection?.name} />
       <header className="flex items-center gap-1 border-b border-line bg-panel px-2 py-1">
         <span className="mr-3 flex items-center gap-1.5 font-semibold">
           <img src="/favicon.svg" alt="" width={18} height={18} />
