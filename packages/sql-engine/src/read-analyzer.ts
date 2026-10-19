@@ -18,7 +18,11 @@ type Node = Record<string, unknown>;
 export interface ReadAnalysis {
   tables: { name: string; alias?: string }[];
   columns: { table?: string; name: string }[];
-  star: { table?: string }[];
+  /**
+   * Star references. `inAggregate` marks a star that is the direct argument of COUNT (`COUNT(*)`):
+   * it counts rows and reads no column value, so the policy layer does not expand it.
+   */
+  star: { table?: string; inAggregate?: true }[];
   functions: string[];
   ctes: string[];
   /**
@@ -500,7 +504,12 @@ class Walker {
           if (!isNil(e.args.orderby) || !isNil(e.args.separator)) {
             throw unsupported(`Unsupported ${name} arguments.`);
           }
-          this.expr(e.args.expr);
+          const arg = e.args.expr;
+          if (name === 'COUNT' && isNode(arg) && isStarArg(arg)) {
+            const table =
+              arg.type === 'column_ref' && typeof arg.table === 'string' ? arg.table : undefined;
+            this.star.push(table ? { table, inAggregate: true } : { inAggregate: true });
+          } else this.expr(arg);
         }
         this.over(e.over);
         return;
@@ -532,6 +541,14 @@ class Walker {
         throw unsupported(`Expression type ${String(type)} is not allowed.`);
     }
   }
+}
+
+/** `*` (or `t.*`) as an expression node, with nothing else (no schema, no subquery). */
+function isStarArg(e: Node): boolean {
+  if (e.type === 'star') return true;
+  return (
+    e.type === 'column_ref' && columnText(e.column) === '*' && !e.db && !e.schema && !isNode(e.ast)
+  );
 }
 
 /** True when the outermost query, or any branch of its set-operator chain, has ORDER BY. */

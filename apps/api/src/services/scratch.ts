@@ -355,11 +355,24 @@ export class ScratchWorkspace {
     return this.execStatement(analyzeScratchSql(sql), signal);
   }
 
-  /** Runs a statement already analyzed with `analyzeScratchSql` (and authorized by the caller). */
-  async execStatement(stmt: ScratchStatement, signal?: AbortSignal): Promise<ScratchResult> {
+  /**
+   * Runs a statement already analyzed with `analyzeScratchSql` (and authorized by the caller).
+   * `caps` can only lower the workspace limits: `maxResultRows` truncates the returned rows, and
+   * `maxWriteRows` refuses (and rolls back) a mutating statement that changes more rows.
+   */
+  async execStatement(
+    stmt: ScratchStatement,
+    signal?: AbortSignal,
+    caps: { maxResultRows?: number; maxWriteRows?: number } = {},
+  ): Promise<ScratchResult> {
+    const limits: Limits = {
+      ...this.limits,
+      maxResultRows: Math.min(this.limits.maxResultRows, caps.maxResultRows ?? Infinity),
+      ...(caps.maxWriteRows !== undefined ? { maxWriteRows: caps.maxWriteRows } : {}),
+    };
     const res = await this.use(() =>
       this.host.run<Omit<ScratchResult, 'command'>>(
-        { op: 'exec', sql: stmt.sql, mutating: stmt.mutating, limits: this.limits },
+        { op: 'exec', sql: stmt.sql, mutating: stmt.mutating, limits },
         signal,
       ),
     );

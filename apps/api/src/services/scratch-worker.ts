@@ -40,6 +40,8 @@ export interface Limits {
   maxResultBytes: number;
   /** Stored bytes (pg_total_relation_size) across all tables. */
   maxBytes: number;
+  /** Rows one mutating statement may change (policy maxWriteRows); refused before COMMIT. */
+  maxWriteRows?: number;
 }
 
 export interface WorkerError {
@@ -116,6 +118,14 @@ async function exec(sql: string, mutating: boolean, limits: Limits) {
   await db.query('BEGIN');
   try {
     const res = await db.query<unknown[]>(sql, [], { rowMode: 'array' });
+    if (mutating && limits.maxWriteRows !== undefined) {
+      const changed = res.affectedRows ?? 0;
+      if (changed > limits.maxWriteRows) {
+        throw new LimitError(
+          `The statement changes ${changed} rows; the policy allows at most ${limits.maxWriteRows}.`,
+        );
+      }
+    }
     if (mutating) await enforceQuota(limits);
     // Every check that can throw runs before COMMIT, so a refused result (e.g. RETURNING over
     // maxResultBytes) rolls the write back instead of saving it and reporting an error.

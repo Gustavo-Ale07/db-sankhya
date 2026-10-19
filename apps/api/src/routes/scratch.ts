@@ -129,6 +129,8 @@ export async function scratchRoutes(app: FastifyInstance): Promise<void> {
         statement: stmt.sql,
       };
       await requireFor(request, auth, stmt.action, denial);
+      // A SELECT carries the columns it reads; any other statement is evaluated as `*` on every
+      // table it touches. The workspace quotas are the ceilings that rules can only lower.
       const decision = await evaluateFor({
         policies,
         auth,
@@ -137,6 +139,8 @@ export async function scratchRoutes(app: FastifyInstance): Promise<void> {
         environment: SCRATCH_ENVIRONMENT,
         connectionId: SCRATCH_CONNECTION_ID,
         entities: tables,
+        ...(stmt.columns ? { columns: stmt.columns } : {}),
+        defaults: { maxReadRows: config.scratch.maxRows, maxWriteRows: config.scratch.maxRows },
       });
       if (decision.effect !== 'ALLOW') {
         const err = new AppError('FORBIDDEN', DENIED);
@@ -146,7 +150,12 @@ export async function scratchRoutes(app: FastifyInstance): Promise<void> {
       const workspace = await scratch.workspace(auth.user.id);
       const { signal, release } = abortOnClose(reply);
       try {
-        return redact(await workspace.execStatement(stmt, signal));
+        return redact(
+          await workspace.execStatement(stmt, signal, {
+            maxResultRows: decision.limits.maxReadRows,
+            ...(stmt.mutating ? { maxWriteRows: decision.limits.maxWriteRows } : {}),
+          }),
+        );
       } finally {
         release();
       }
@@ -160,6 +169,29 @@ export async function scratchRoutes(app: FastifyInstance): Promise<void> {
     async (request, reply) => {
       noStore(reply);
       const auth = requirePermission(request, 'QUERY.SELECT');
+      // Listing reads table names and row counts only: no entity or column rule applies, but a
+      // rule that denies reads in the scratch context (SANDBOX, or every environment) does.
+      const decision = await evaluateFor({
+        policies,
+        auth,
+        groupIds: await authz.activeGroupIds(auth.user.id),
+        action: 'QUERY.SELECT',
+        environment: SCRATCH_ENVIRONMENT,
+        connectionId: SCRATCH_CONNECTION_ID,
+        entities: [],
+        columns: [],
+      });
+      if (decision.effect !== 'ALLOW') {
+        const err = new AppError('FORBIDDEN', DENIED);
+        await recordDenial(request, auth, {
+          operation: 'TABLES',
+          resource: null,
+          statement: null,
+          err,
+          details: policyDetails(decision),
+        });
+        throw err;
+      }
       const workspace = await scratch.workspace(auth.user.id);
       return { tables: await workspace.tables() };
     },
@@ -181,6 +213,10 @@ export async function scratchRoutes(app: FastifyInstance): Promise<void> {
       const connectionId = body.connectionId ?? defaultConnection();
       const groupIds = await authz.activeGroupIds(auth.user.id);
 
+      // TEMP.MATERIALIZE is evaluated in both contexts and must be allowed in each: the scratch
+      // side (SANDBOX, `scratch`, the target table) and the source side (the Sankhya connection,
+      // its environment, then the entities and columns the read touches). QUERY.SELECT is
+      // evaluated on the source side only.
       const target = await evaluateFor({
         policies,
         auth,
@@ -215,6 +251,27 @@ export async function scratchRoutes(app: FastifyInstance): Promise<void> {
         });
         throw err;
       }
+      // Source connection and environment, before the runtime or catalog is touched.
+      const sourceAccess = await evaluateFor({
+        policies,
+        auth,
+        groupIds,
+        action: 'TEMP.MATERIALIZE',
+        environment: access.environment,
+        connectionId,
+        entities: [],
+        columns: [],
+        defaults,
+      });
+      if (sourceAccess.effect !== 'ALLOW') {
+        const err = new AppError('FORBIDDEN', DENIED);
+        await recordDenial(request, auth, {
+          ...denial,
+          err,
+          details: { connectionId, ...policyDetails(sourceAccess) },
+        });
+        throw err;
+      }
 
       const workspace = await scratch.workspace(auth.user.id);
       // The workspace belongs to this user alone, so the check cannot race another user.
@@ -231,20 +288,27 @@ export async function scratchRoutes(app: FastifyInstance): Promise<void> {
         (catalog: Catalog) =>
         async (a: ReadAnalysis): Promise<ReadDecision> => {
           const targets = readTargets(a, catalog);
-          source = await evaluateFor({
+          const check = {
             policies,
             auth,
             groupIds,
-            action: 'QUERY.SELECT',
             environment: access.environment,
             connectionId,
             entities: targets.entities,
             columns: targets.columns,
             defaults,
-          });
-          return source.effect === 'ALLOW'
-            ? { effect: 'ALLOW', maxRows: source.limits.maxReadRows }
-            : { effect: 'DENY', reason: 'The read was denied by policy' };
+          };
+          const read = await evaluateFor({ ...check, action: 'QUERY.SELECT' });
+          source = read;
+          if (read.effect !== 'ALLOW')
+            return { effect: 'DENY', reason: 'The read was denied by policy' };
+          const copy = await evaluateFor({ ...check, action: 'TEMP.MATERIALIZE' });
+          source = copy;
+          if (copy.effect !== 'ALLOW') return { effect: 'DENY', reason: DENIED };
+          return {
+            effect: 'ALLOW',
+            maxRows: Math.min(read.limits.maxReadRows, copy.limits.maxReadRows),
+          };
         };
 
       const { signal, release } = abortOnClose(reply);

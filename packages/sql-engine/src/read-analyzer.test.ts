@@ -61,8 +61,25 @@ describe('analyzeRead', () => {
       'SELECT UF, COUNT(*) N FROM TSICID WHERE ATIVO = 1 GROUP BY UF HAVING SUM(POP) > 10 ORDER BY NOMECID',
     );
     expect(r.columns.map((c) => c.name)).toEqual(['UF', 'ATIVO', 'UF', 'POP', 'NOMECID']);
-    expect(r.star).toEqual([{}]);
+    expect(r.star).toEqual([{ inAggregate: true }]);
     expect(r.functions.sort()).toEqual(['COUNT', 'SUM']);
+  });
+
+  it('marks only the star that is the direct argument of COUNT as inAggregate', () => {
+    expect(analyzeRead('SELECT COUNT(*) FROM TGFPAR').star).toEqual([{ inAggregate: true }]);
+    expect(analyzeRead('SELECT *, COUNT(*) OVER () N FROM TGFPAR').star).toEqual([
+      {},
+      { inAggregate: true },
+    ]);
+    // An aggregate over a column still references the column.
+    const r = analyzeRead('SELECT COUNT(EMAIL), MAX(NOMEPARC) FROM TGFPAR');
+    expect(r.star).toEqual([]);
+    expect(r.columns).toEqual([{ name: 'EMAIL' }, { name: 'NOMEPARC' }]);
+    // A star nested in a subquery inside an aggregate is a plain star.
+    expect(analyzeRead('SELECT COUNT(*) FROM (SELECT * FROM TGFPAR) X').star).toEqual([
+      { inAggregate: true },
+      {},
+    ]);
   });
 
   it('records stars, quoted and bracketed identifiers', () => {

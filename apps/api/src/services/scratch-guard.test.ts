@@ -121,4 +121,58 @@ describe('analyzeScratchSql', () => {
   it('refuses oversized statements', () => {
     expect(codeOf(`SELECT '${'x'.repeat(100_001)}'`)).toBe('QUERY_LIMIT_EXCEEDED');
   });
+
+  describe('columns of a SELECT', () => {
+    const cols = (sql: string) => analyzeScratchSql(sql).columns;
+
+    it('attributes qualified columns to their table and unqualified ones to every table', () => {
+      expect(cols('SELECT a.email, nome FROM tmp_a a JOIN tmp_b b ON a.id = b.id')).toEqual(
+        expect.arrayContaining([
+          { table: 'tmp_a', name: 'email' },
+          { table: 'tmp_a', name: 'nome' },
+          { table: 'tmp_b', name: 'nome' },
+          { table: 'tmp_a', name: 'id' },
+          { table: 'tmp_b', name: 'id' },
+        ]),
+      );
+      expect(cols('SELECT "email" FROM tmp_a')).toEqual([{ table: 'tmp_a', name: 'email' }]);
+      expect(cols('SELECT a.email FROM tmp_a a JOIN tmp_b b ON true')).not.toContainEqual({
+        table: 'tmp_b',
+        name: 'email',
+      });
+    });
+
+    it('reads every column for a star or a whole-row reference, but not for COUNT(*)', () => {
+      expect(cols('SELECT count(*) FROM tmp_a')).toEqual([]);
+      expect(cols('SELECT * FROM tmp_a')).toEqual([{ table: 'tmp_a', name: '*' }]);
+      expect(cols('SELECT b.* FROM tmp_a a JOIN tmp_b b ON true')).toEqual([
+        { table: 'tmp_b', name: '*' },
+      ]);
+      expect(cols('SELECT row_to_json(a) FROM tmp_a a')).toEqual([{ table: 'tmp_a', name: '*' }]);
+      expect(cols('SELECT tmp_a FROM tmp_a')).toEqual([{ table: 'tmp_a', name: '*' }]);
+      expect(cols('SELECT count(*) FROM (SELECT * FROM tmp_a) x')).toEqual([
+        { table: 'tmp_a', name: '*' },
+      ]);
+    });
+
+    it('attributes CTE and derived-table columns to every table', () => {
+      expect(
+        cols('WITH c AS (SELECT id FROM tmp_a) SELECT c.id FROM c JOIN tmp_b ON true'),
+      ).toEqual(
+        expect.arrayContaining([
+          { table: 'tmp_a', name: 'id' },
+          { table: 'tmp_b', name: 'id' },
+        ]),
+      );
+      expect(cols('SELECT to_json(c) FROM (SELECT id FROM tmp_a) c')).toContainEqual({
+        table: 'tmp_a',
+        name: '*',
+      });
+    });
+
+    it('is left undefined for statements other than SELECT', () => {
+      expect(analyzeScratchSql('INSERT INTO tmp_a SELECT id FROM tmp_b').columns).toBeUndefined();
+      expect(analyzeScratchSql('UPDATE tmp_a SET id = 2').columns).toBeUndefined();
+    });
+  });
 });

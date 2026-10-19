@@ -99,6 +99,12 @@ describe('readTargets', () => {
     ]);
   });
 
+  it('does not expand COUNT(*), which reads no column value', () => {
+    expect(names('SELECT COUNT(*) FROM TGFPAR')).toEqual([]);
+    expect(decide('SELECT COUNT(*) FROM TGFPAR')).toBe('ALLOW');
+    expect(decide('SELECT * FROM TGFPAR')).toBe('DENY');
+  });
+
   it('a column DENY sees the column wherever it is referenced', () => {
     expect(decide('SELECT * FROM TGFPAR')).toBe('DENY');
     expect(decide('SELECT EMAIL FROM TGFPAR')).toBe('DENY');
@@ -108,6 +114,8 @@ describe('readTargets', () => {
     expect(decide('WITH c AS (SELECT EMAIL AS E FROM TGFPAR) SELECT E FROM c')).toBe('DENY');
     expect(decide('SELECT x.* FROM (SELECT * FROM TGFPAR) x')).toBe('DENY');
     expect(decide('SELECT NOMEPARC FROM TGFPAR')).toBe('ALLOW');
+    expect(decide('SELECT COUNT(EMAIL) FROM TGFPAR')).toBe('DENY');
+    expect(decide('SELECT COUNT(*) FROM (SELECT * FROM TGFPAR) x')).toBe('DENY');
     expect(decide('SELECT * FROM TSICID')).toBe('ALLOW');
   });
 });

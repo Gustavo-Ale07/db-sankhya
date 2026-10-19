@@ -39,7 +39,8 @@ export interface ReadTargets {
  * column (or star) whose qualifier names no base table or alias (a CTE, a derived table) and an
  * unqualified column are attributed to every base table of the statement. A star is expanded
  * from the catalog; when the catalog has no columns for a table, it stays `*`, which every column
- * DENY on that table hits. Callers must have checked every table against the catalog.
+ * DENY on that table hits. `COUNT(*)` is not expanded (it reads no column value); `COUNT(col)` is
+ * an ordinary column reference. Callers must have checked every table against the catalog.
  */
 export function readTargets(analysis: ReadAnalysis, catalog: Catalog): ReadTargets {
   const entities = [...new Set(analysis.tables.map((t) => t.name.toUpperCase()))];
@@ -73,6 +74,8 @@ export function readTargets(analysis: ReadAnalysis, catalog: Catalog): ReadTarge
   };
   for (const c of analysis.columns) for (const t of owners(c.table)) push(t, c.name);
   for (const s of analysis.star) {
+    // COUNT(*) counts rows and reads no column value; any other star is expanded.
+    if (s.inAggregate) continue;
     for (const t of owners(s.table)) {
       const cols = catalogColumns.get(t) ?? [];
       if (cols.length === 0) push(t, '*');

@@ -138,7 +138,29 @@ administrators see the audit log of all users.
 Reads and scratch statements are also evaluated by the stored policy rules, after the permission
 check. A rule with an empty connection list applies to every connection, including the
 `env-default` connection defined by `SANKHYA_*` (in its `SANKHYA_ENVIRONMENT`), and scratch
-statements are evaluated as the pseudo connection `scratch` in the `SANDBOX` environment.
+statements are evaluated as the pseudo connection `scratch` in the `SANDBOX` environment. A rule's
+connection list holds connection uuids only, so `env-default` and `scratch` can never be named
+there: they are targeted by environment, or by a rule with no connection list. A rule scoped to
+`SANDBOX` therefore applies both to real SANDBOX connections and to every scratch workspace.
+
+- A read is evaluated with the tables and columns it touches. A star is expanded from the catalog,
+  so a column DENY refuses `SELECT *`; `COUNT(*)` reads no column and is not expanded, while
+  `COUNT(col)` references `col`.
+- A scratch `SELECT` is evaluated with the columns it reads. Scratch has no catalog, so a star or
+  a whole-row reference (`row_to_json(t)`) counts as `*`, which every column rule on that table
+  hits. Every other scratch statement is evaluated as `*` on each table it touches. The policy's
+  `maxReadRows` truncates scratch results, and `maxWriteRows` caps the rows one scratch
+  `INSERT`/`UPDATE`/`DELETE` (or DDL) may change: a larger change is refused and rolled back. The
+  ceilings are `SCRATCH_MAX_ROWS`, clamped to the policy hard maxima (100000 read and 1000 written
+  rows per statement).
+- `GET /api/scratch/tables` evaluates `QUERY.SELECT` in the scratch context with no entities, so
+  only a rule without entities or columns can deny it.
+- Materialization (`POST /api/scratch/materialize`) evaluates `TEMP.MATERIALIZE` in both contexts
+  and needs it allowed in each: on the scratch side (`scratch`, `SANDBOX`, the target table) and on
+  the source side (the Sankhya connection and its environment, then the tables and columns the
+  read touches). `QUERY.SELECT` is evaluated on the source side. A rule such as DENY
+  `TEMP.MATERIALIZE` in `PRODUCTION`, or on `TGF*`, stops copying that data into scratch without
+  stopping reads of it.
 
 ## Write protection
 

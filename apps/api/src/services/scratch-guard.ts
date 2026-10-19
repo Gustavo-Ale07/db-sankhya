@@ -7,6 +7,7 @@
  * Every check fails closed.
  */
 import { AppError } from '@dbx/shared';
+import type { PolicyColumn } from '@dbx/shared';
 import { classifyStatement, type Classified } from '@dbx/sql-engine';
 import parserPkg from 'node-sql-parser';
 
@@ -32,6 +33,11 @@ export interface ScratchStatement {
   /** The table written by INSERT/UPDATE/DELETE/CREATE/ALTER/DROP. */
   target: string | null;
   mutating: boolean;
+  /**
+   * Columns a SELECT reads, for column policy rules (see `selectColumns`). Undefined for every
+   * other command: the policy engine then treats each table as `*`, which every column rule hits.
+   */
+  columns?: PolicyColumn[];
 }
 
 /** Scratch tables are always lowercase `tmp_*` identifiers. */
@@ -123,6 +129,7 @@ export function analyzeScratchSql(input: string): ScratchStatement {
     tables: first.tables,
     target: first.target,
     mutating: first.command !== 'SELECT',
+    ...(first.command === 'SELECT' ? { columns: selectColumns(first.ast, first.tables) } : {}),
   };
 }
 
@@ -245,6 +252,95 @@ function collectCteNames(ast: Node): Set<string> {
     }
   });
   return names;
+}
+
+/**
+ * Columns a SELECT reads, attributed fail closed: a qualifier that is a scratch table or its
+ * alias names that table; any other qualifier (a CTE, a derived table) and an unqualified column
+ * belong to every table of the statement. A star, and a bare name that is a table, alias, CTE or
+ * derived-table name (a whole-row reference such as `row_to_json(t)`), read every column: `*`,
+ * which every column rule hits (scratch has no catalog to expand it). `COUNT(*)` reads none.
+ */
+function selectColumns(ast: Node, tables: string[]): PolicyColumn[] {
+  const byQualifier = new Map<string, Set<string>>();
+  const rowNames = new Set<string>();
+  const addQualifier = (q: string, table: string) => {
+    const set = byQualifier.get(q.toLowerCase()) ?? new Set<string>();
+    set.add(table);
+    byQualifier.set(q.toLowerCase(), set);
+  };
+  for (const cte of collectCteNames(ast)) rowNames.add(cte.toLowerCase());
+  const countStars = new Set<Node>();
+  walk(ast, (node) => {
+    const alias = typeof node.as === 'string' ? node.as : null;
+    if (typeof node.table === 'string' && node.type !== 'column_ref' && !('column' in node)) {
+      rowNames.add(node.table.toLowerCase());
+      if (alias) rowNames.add(alias.toLowerCase());
+      if (tables.includes(node.table)) {
+        addQualifier(node.table, node.table);
+        if (alias) addQualifier(alias, node.table);
+      }
+    } else if (alias && isNode(node.expr) && 'ast' in node.expr) {
+      rowNames.add(alias.toLowerCase());
+    }
+    if (
+      node.type === 'aggr_func' &&
+      typeof node.name === 'string' &&
+      node.name.toUpperCase() === 'COUNT' &&
+      isNode(node.args) &&
+      isNode(node.args.expr) &&
+      node.args.expr.type === 'star'
+    ) {
+      countStars.add(node.args.expr);
+    }
+  });
+  const owners = (qualifier: string | null): string[] => {
+    const hit = qualifier === null ? undefined : byQualifier.get(qualifier.toLowerCase());
+    return hit ? [...hit] : tables;
+  };
+
+  const seen = new Set<string>();
+  const columns: PolicyColumn[] = [];
+  const push = (table: string, name: string) => {
+    const key = `${table}\u0000${name.toLowerCase()}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    columns.push({ table, name });
+  };
+  walk(ast, (node) => {
+    if (node.type === 'star' && !countStars.has(node)) {
+      for (const t of tables) push(t, '*');
+      return;
+    }
+    if (node.type !== 'column_ref') return;
+    const qualifier = identifier(node.table);
+    const column =
+      identifier(node.column) ?? (isNode(node.column) ? identifier(node.column.expr) : null);
+    if (column === null) {
+      // A column the parser shaped in a way this does not know: treat it as reading everything.
+      for (const t of owners(qualifier)) push(t, '*');
+      return;
+    }
+    const wholeRow = column === '*' || (qualifier === null && rowNames.has(column.toLowerCase()));
+    const ownerTables =
+      qualifier === null && wholeRow && column !== '*' ? owners(column) : owners(qualifier);
+    for (const t of ownerTables) push(t, wholeRow ? '*' : column);
+  });
+  return columns;
+}
+
+/** A plain name, or the `{ type: 'default', value }` form the parser uses for identifiers. */
+function identifier(v: unknown): string | null {
+  if (typeof v === 'string') return v;
+  if (
+    isNode(v) &&
+    typeof v.value === 'string' &&
+    (v.type === 'default' ||
+      v.type === 'backticks_quote_string' ||
+      v.type === 'double_quote_string')
+  )
+    return v.value;
+  return null;
 }
 
 const PLAIN_ALIAS = /^[A-Za-z_][A-Za-z0-9_]*$/;

@@ -205,6 +205,18 @@ describe('policies on the Sankhya read path', () => {
     expect(audit.json().items[0]).toMatchObject({ errorCode: 'FORBIDDEN', resource: 'TGFPAR' });
   });
 
+  it('allows COUNT(*) under a column DENY', async () => {
+    const h = await setup();
+    await h.policy({ columns: ['TGFPAR.EMAIL'] });
+    const { cookie } = await h.viewer();
+    const ok = await query(h, cookie, { sql: 'SELECT COUNT(*) FROM TGFPAR' });
+    expect(ok.statusCode, ok.body).toBe(200);
+    for (const sqlText of ['SELECT * FROM TGFPAR', 'SELECT COUNT(EMAIL) FROM TGFPAR']) {
+      const res = await query(h, cookie, { sql: sqlText });
+      expect(res.statusCode, sqlText).toBe(403);
+    }
+  });
+
   it("caps the rows at the policy's maxReadRows", async () => {
     const h = await setup();
     await h.policy({ effect: 'ALLOW', entities: ['TGFPAR'], limits: { maxReadRows: 3 } });
@@ -357,6 +369,70 @@ describe('scratch routes', () => {
     expect(await tables(h, cookie)).toEqual([]);
   });
 
+  it('evaluates scratch reads with their columns', async () => {
+    const h = await setup();
+    await h.policy({ columns: ['tmp_p.email'] });
+    const { cookie } = await h.viewer();
+    expect((await exec(h, cookie, 'CREATE TABLE tmp_p (id int, email text)')).statusCode).toBe(200);
+    expect((await exec(h, cookie, "INSERT INTO tmp_p VALUES (1, 'a@x')")).statusCode).toBe(200);
+    for (const sqlText of ['SELECT id FROM tmp_p', 'SELECT count(*) FROM tmp_p']) {
+      const res = await exec(h, cookie, sqlText);
+      expect(res.statusCode, `${sqlText} ${res.body}`).toBe(200);
+    }
+    for (const sqlText of [
+      'SELECT email FROM tmp_p',
+      'SELECT * FROM tmp_p',
+      'SELECT p.id FROM tmp_p p WHERE p.email IS NOT NULL',
+      'SELECT row_to_json(p) FROM tmp_p p',
+      'SELECT tmp_p FROM tmp_p',
+    ]) {
+      const res = await exec(h, cookie, sqlText);
+      expect(res.statusCode, sqlText).toBe(403);
+      expect(codeOf(res), sqlText).toBe('FORBIDDEN');
+    }
+  });
+
+  it("caps scratch results at the policy's maxReadRows", async () => {
+    const h = await setup();
+    await h.policy({ effect: 'ALLOW', limits: { maxReadRows: 3 } });
+    const { cookie } = await h.viewer();
+    expect((await exec(h, cookie, 'CREATE TABLE tmp_n (a int)')).statusCode).toBe(200);
+    const ins = await exec(h, cookie, 'INSERT INTO tmp_n SELECT g FROM generate_series(1, 10) g');
+    expect(ins.statusCode, ins.body).toBe(200);
+    const res = await exec(h, cookie, 'SELECT a FROM tmp_n ORDER BY a');
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json()).toMatchObject({ rowCount: 10, truncated: true });
+    expect(res.json().rows).toHaveLength(3);
+  });
+
+  it("refuses a scratch write over the policy's maxWriteRows and rolls it back", async () => {
+    const h = await setup();
+    await h.policy({ effect: 'ALLOW', actions: ['TEMP.WRITE'], limits: { maxWriteRows: 5 } });
+    const { cookie } = await h.viewer();
+    expect((await exec(h, cookie, 'CREATE TABLE tmp_n (a int)')).statusCode).toBe(200);
+    const ok = await exec(h, cookie, 'INSERT INTO tmp_n SELECT g FROM generate_series(1, 5) g');
+    expect(ok.statusCode, ok.body).toBe(200);
+    const res = await exec(h, cookie, 'UPDATE tmp_n SET a = a + 1 WHERE a > 0');
+    const big = await exec(h, cookie, 'INSERT INTO tmp_n SELECT g FROM generate_series(1, 6) g');
+    expect(res.statusCode, res.body).toBe(200);
+    expect(big.statusCode).toBe(400);
+    expect(codeOf(big)).toBe('QUERY_LIMIT_EXCEEDED');
+    expect(await tables(h, cookie)).toEqual([{ name: 'tmp_n', rows: 5 }]);
+  });
+
+  it('evaluates the read policy before listing scratch tables', async () => {
+    const h = await setup();
+    const { cookie } = await h.viewer();
+    expect((await exec(h, cookie, 'CREATE TABLE tmp_x (a int)')).statusCode).toBe(200);
+    await h.policy({ environments: ['SANDBOX'] });
+    const res = await h.call(cookie, { method: 'GET', url: '/api/scratch/tables' });
+    expect(res.statusCode).toBe(403);
+    expect(codeOf(res)).toBe('FORBIDDEN');
+    const admin = await h.login();
+    const audit = await h.call(admin, { method: 'GET', url: '/api/audit?action=scratch.denied' });
+    expect(audit.json().items[0]).toMatchObject({ operation: 'TABLES', errorCode: 'FORBIDDEN' });
+  });
+
   it('validates scratch SQL before authorizing it', async () => {
     const h = await setup();
     const nobody = await h.userWith([]);
@@ -412,6 +488,34 @@ describe('materialization route', () => {
     const res = await materialize(h, cookie, READ);
     expect(res.statusCode).toBe(403);
     expect(await tables(h, cookie)).toEqual([]);
+  });
+
+  it('evaluates TEMP.MATERIALIZE against the source environment', async () => {
+    const h = await setup({ SANKHYA_ENVIRONMENT: 'PRODUCTION' });
+    await h.policy({ actions: ['TEMP.MATERIALIZE'], environments: ['PRODUCTION'] });
+    const { cookie } = await h.viewer();
+    const res = await materialize(h, cookie, READ);
+    expect(res.statusCode).toBe(403);
+    expect(codeOf(res)).toBe('FORBIDDEN');
+    expect(await tables(h, cookie)).toEqual([]);
+    expect(reads(h.mock, 'NOMEPARC')).toBe(0);
+    // The same rule does not stop a plain read of that connection.
+    expect((await query(h, cookie, { sql: READ.sql })).statusCode).toBe(200);
+  });
+
+  it('evaluates TEMP.MATERIALIZE against the source entities and columns', async () => {
+    const h = await setup();
+    await h.policy({ actions: ['TEMP.MATERIALIZE'], entities: ['TGF*'] });
+    await h.policy({ actions: ['TEMP.MATERIALIZE'], columns: ['TSICID.NOMECID'] });
+    const { cookie } = await h.viewer();
+    for (const sqlText of [READ.sql, 'SELECT * FROM TSICID']) {
+      const res = await materialize(h, cookie, { sql: sqlText, into: 'tmp_src' });
+      expect(res.statusCode, sqlText).toBe(403);
+      expect(codeOf(res), sqlText).toBe('FORBIDDEN');
+    }
+    expect(await tables(h, cookie)).toEqual([]);
+    const ok = await materialize(h, cookie, { sql: 'SELECT CODCID FROM TSICID', into: 'tmp_src' });
+    expect(ok.statusCode, ok.body).toBe(200);
   });
 
   it('needs replace: true to overwrite an existing table', async () => {
