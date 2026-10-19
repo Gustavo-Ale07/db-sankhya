@@ -31,3 +31,4 @@ export type {
 export { classifyStatement } from './classify';
 export type { Classified, DdlKind, WriteKind as ClassifiedWriteKind } from './classify';
 export { convertWriteNode } from './parser';
+export * from './ddl';

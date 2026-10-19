@@ -1,6 +1,5 @@
 export {
   DDL_DATA_TYPES,
-  DEFAULT_CUSTOM_PREFIXES,
   assertCustomTable,
   assertIdentifier,
   mapDataType,

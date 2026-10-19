@@ -8,6 +8,7 @@
  */
 import parserPkg from 'node-sql-parser';
 import { AppError } from '@dbx/shared';
+import { DEFAULT_CUSTOM_PREFIXES } from '../capability';
 import { classifyStatement } from '../classify';
 
 const { Parser } = parserPkg;
@@ -52,8 +53,6 @@ export interface ModelOptions {
   /** Allowed custom table prefixes (default `['AD_']`). */
   customPrefixes?: readonly string[];
 }
-
-export const DEFAULT_CUSTOM_PREFIXES: readonly string[] = ['AD_'];
 
 /** Checked on the raw value, before upper-casing, so no Unicode case folding sneaks in. */
 const IDENTIFIER_RE = /^[A-Za-z][A-Za-z0-9_]*$/;
