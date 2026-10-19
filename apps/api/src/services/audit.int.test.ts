@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { sql } from 'drizzle-orm';
 import { auditEvents, createDatabase } from '@dbx/database';
 import type { AuditEventRow, DatabaseHandle } from '@dbx/database';
-import { REDACTED, createRedactor } from '@dbx/shared';
+import { REDACTED, createRedactor, utf8ByteLength } from '@dbx/shared';
 import { AUDIT_LIFECYCLE_ACTIONS, AuditService } from './records';
 import type { AuditLifecycleContext } from './records';
 
@@ -244,6 +244,67 @@ describe('AuditService lifecycle events', () => {
     expect(JSON.stringify(row?.snapshot).length).toBeLessThanOrEqual(256 * 1024 + 64);
     expect(before).toMatchObject({ truncated: true, totalRows: 50 });
     expect(before.truncatedBytes).toBeGreaterThan(0);
+  });
+
+  it('shares one 256 KB budget across before and after in the stored row', async () => {
+    const { handle, audit } = await setup();
+    const big = () =>
+      Array.from({ length: 50 }, (_, i) => ({
+        ID: i,
+        ...Object.fromEntries(Array.from({ length: 10 }, (_, c) => [`C${c}`, 'x'.repeat(5000)])),
+      }));
+    await audit.recordPlanExecuted(ctx(), { outcome: 'success', before: big(), after: big() });
+    const [row] = await allRows(handle);
+    const snap = row?.snapshot as {
+      before: { rows: unknown[]; truncated: boolean };
+      after: { rows: unknown[]; truncated: boolean; truncatedBytes: number };
+    };
+    expect(utf8ByteLength(JSON.stringify(snap))).toBeLessThanOrEqual(256 * 1024 + 32);
+    expect(snap.before.rows.length).toBeGreaterThan(0);
+    expect(snap.after).toMatchObject({ truncated: true });
+    expect(snap.after.truncatedBytes).toBeGreaterThan(0);
+  });
+
+  it('stores a value whose clip point splits an astral character (no lone surrogate)', async () => {
+    const { handle, audit } = await setup();
+    const value = `${'a'.repeat(1999)}😀tail`;
+    await audit.recordPlanExecuted(ctx(), {
+      outcome: 'success',
+      before: [{ OBS: value }],
+      details: { note: `bad \uD800 half` },
+    });
+    await audit.record({ action: 'x', status: 'info', after: { OBS: value } });
+    const rows = await allRows(handle);
+    expect(rows).toHaveLength(2);
+    const planRow = rows.find((r) => r.action === 'PLAN_EXECUTED')!;
+    const snap = planRow.snapshot as { before: { rows: Array<{ OBS: string }> } };
+    expect(snap.before.rows[0]?.OBS).toBe(`${'a'.repeat(1999)}…`);
+    expect(planRow.details).toEqual({ note: 'bad � half' });
+    expect(rows.find((r) => r.action === 'x')?.after).toEqual({ OBS: `${'a'.repeat(1999)}…` });
+  });
+
+  it('applies the broad matcher and clipping to before, after, targetIds and gatewayCalls', async () => {
+    const { handle, audit } = await setup();
+    await audit.record({
+      action: 'write.execute',
+      status: 'success',
+      before: { CODPARC: 1, AD_COOKIE_WEB: 'v1', OBS: 'b'.repeat(3000) },
+      after: [{ nested: { senhaAntiga: 'v2' } }],
+      targetIds: [{ id: 1, apiKeyValue: 'v3' }, 'c'.repeat(2500)],
+      gatewayCalls: [{ service: 'x', status: 200, authorizationHeader: 'v4' }],
+    });
+    const [row] = await allRows(handle);
+    expect(JSON.stringify(row)).not.toMatch(/"v[1-4]"/);
+    expect(row?.before).toEqual({
+      CODPARC: 1,
+      AD_COOKIE_WEB: REDACTED,
+      OBS: `${'b'.repeat(2000)}…`,
+    });
+    expect(row?.after).toEqual([{ nested: { senhaAntiga: REDACTED } }]);
+    expect(row?.targetIds).toEqual([{ id: 1, apiKeyValue: REDACTED }, `${'c'.repeat(2000)}…`]);
+    expect(row?.gatewayCalls).toEqual([
+      { service: 'x', status: 200, authorizationHeader: REDACTED },
+    ]);
   });
 });
 

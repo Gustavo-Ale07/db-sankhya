@@ -8,7 +8,7 @@ import type {
   QueryHistoryRow,
   SavedQueryRow,
 } from '@dbx/database';
-import { AppError, redactBroad, redactSnapshot } from '@dbx/shared';
+import { AppError, redactBroad, redactSnapshotPair } from '@dbx/shared';
 import type { Environment } from '@dbx/shared';
 
 type Redactor = (value: unknown) => unknown;
@@ -17,13 +17,18 @@ const MAX_STATEMENT_CHARS = 20_000;
 const MAX_ERROR_CHARS = 2_000;
 
 /** Broad (contains-match) key redaction for audit JSON columns; null/undefined pass through. */
-function broad<T>(value: T): T {
-  return value === undefined || value === null ? value : (redactBroad(value) as T);
+function broad<T>(value: T, clipStrings = false): T {
+  return value === undefined || value === null ? value : (redactBroad(value, { clipStrings }) as T);
 }
 
 function clip(value: string | null | undefined, max: number): string | null {
   if (value === null || value === undefined) return null;
-  return value.length > max ? `${value.slice(0, max)}…` : value;
+  if (value.length <= max) return value;
+  let head = value.slice(0, max);
+  // Never leave half of a surrogate pair at the cut.
+  const last = head.charCodeAt(head.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) head = head.slice(0, -1);
+  return `${head}…`;
 }
 
 // ---------------------------------------------------------------- audit
@@ -97,11 +102,12 @@ export class AuditService {
       ...event,
       statement: clip(r(event.statement) ?? null, MAX_STATEMENT_CHARS),
       errorMessage: clip(r(event.errorMessage) ?? null, MAX_ERROR_CHARS),
-      targetIds: r(event.targetIds),
-      before: r(event.before),
-      after: r(event.after),
-      gatewayCalls: r(event.gatewayCalls),
       // Audit JSON gets the broad matcher: any key containing a sensitive word, at any depth.
+      // Row-shaped columns also get their strings clipped (2000 chars).
+      targetIds: r(broad(event.targetIds, true)),
+      before: r(broad(event.before, true)),
+      after: r(broad(event.after, true)),
+      gatewayCalls: r(broad(event.gatewayCalls, true)),
       details: r(broad(event.details)),
       verification: r(broad(event.verification)),
       policyDecision: r(broad(event.policyDecision)),
@@ -173,9 +179,8 @@ export class AuditService {
     const hasRows = input.before !== undefined || input.after !== undefined;
     let snapshot: Record<string, unknown> | null = null;
     if (snapshotsOn && hasRows) {
-      snapshot = {};
-      if (input.before !== undefined) snapshot.before = redactSnapshot(input.before);
-      if (input.after !== undefined) snapshot.after = redactSnapshot(input.after);
+      // One 256 KB budget per audit row, shared by before and after.
+      snapshot = { ...redactSnapshotPair({ before: input.before, after: input.after }) };
     }
     const details: Record<string, unknown> = {
       ...(input.details ?? {}),

@@ -10,8 +10,72 @@ import {
   redact,
   redactBroad,
   redactSnapshot,
+  redactSnapshotPair,
   utf8ByteLength,
 } from './redact';
+
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+describe('surrogate-safe clipping', () => {
+  it('never leaves a lone surrogate when clipping splits an astral character', () => {
+    const value = `${'a'.repeat(1999)}😀tail`;
+    const out = redactSnapshot([{ OBS: value }]);
+    const obs = (out.rows[0] as { OBS: string }).OBS;
+    expect(LONE_SURROGATE.test(obs)).toBe(false);
+    expect(obs).toBe(`${'a'.repeat(1999)}…`);
+    expect(JSON.parse(JSON.stringify(out))).toEqual(out);
+    expect(JSON.stringify(out)).not.toMatch(/\\ud[89a-f]/i);
+  });
+
+  it('keeps a whole astral character that fits and replaces lone surrogates from the input', () => {
+    const fits = `${'a'.repeat(1998)}😀`;
+    expect((redactSnapshot([{ T: fits }]).rows[0] as { T: string }).T).toBe(fits);
+    const broken = `x\uD800y\uDC00z`;
+    const t = (redactSnapshot([{ T: broken }]).rows[0] as { T: string }).T;
+    expect(t).toBe('x�y�z');
+  });
+
+  it('clips and fixes surrogates in redactBroad when asked to clip', () => {
+    const out = redactBroad(
+      { a: `${'a'.repeat(1999)}😀`, nested: ['b'.repeat(2500)] },
+      {
+        clipStrings: true,
+      },
+    ) as { a: string; nested: string[] };
+    expect(out.a).toBe(`${'a'.repeat(1999)}…`);
+    expect(out.nested[0]).toBe(`${'b'.repeat(2000)}…`);
+    // Without the option strings are untouched.
+    expect((redactBroad({ a: 'b'.repeat(2500) }) as { a: string }).a).toHaveLength(2500);
+  });
+});
+
+describe('redactSnapshotPair', () => {
+  const big = () =>
+    Array.from({ length: 50 }, (_, i) => ({
+      ID: i,
+      ...Object.fromEntries(Array.from({ length: 10 }, (_, c) => [`C${c}`, 'x'.repeat(2000)])),
+    }));
+
+  it('shares one 256 KB budget across before and after', () => {
+    const out = redactSnapshotPair({ before: big(), after: big() });
+    // The pair object adds only the {"before":,"after":} keys on top of the budget.
+    expect(utf8ByteLength(JSON.stringify(out))).toBeLessThanOrEqual(SNAPSHOT_MAX_BYTES + 32);
+    expect(out.before?.rows.length).toBeGreaterThan(0);
+    expect(out.before?.truncated).toBe(true);
+    expect(out.after?.truncated).toBe(true);
+    expect(out.after?.truncatedBytes).toBeGreaterThan(0);
+  });
+
+  it('gives after whatever before left over and omits absent sides', () => {
+    const small = redactSnapshotPair({ before: [{ ID: 1 }], after: big() });
+    expect(small.before).toMatchObject({ rows: [{ ID: 1 }], truncated: false });
+    expect(small.after?.rows.length).toBeGreaterThan(0);
+    expect(utf8ByteLength(JSON.stringify(small))).toBeLessThanOrEqual(SNAPSHOT_MAX_BYTES + 32);
+    expect(redactSnapshotPair({ after: [{ ID: 2 }] })).toEqual({
+      after: { rows: [{ ID: 2 }], totalRows: 1, truncated: false, truncatedBytes: 0 },
+    });
+  });
+});
 
 const MID_WORD_NAMES = [
   'senhaAntiga',

@@ -166,12 +166,24 @@ export function isSensitiveColumn(name: string): boolean {
   return SENSITIVE_COLUMN_FRAGMENTS.some((fragment) => k.includes(fragment));
 }
 
+/** Options for {@link redactBroad}. */
+export interface RedactBroadOptions {
+  /** Clip every string to {@link SNAPSHOT_MAX_STRING_CHARS} characters (plus `…`). */
+  clipStrings?: boolean;
+}
+
 /**
  * Like {@link redact}, but masks every key that merely contains a sensitive word, at any depth.
- * Used for audit JSON (snapshots, details, policy decisions, verification results).
+ * Used for audit JSON (snapshots, details, policy decisions, verification results). Lone UTF-16
+ * surrogates are replaced with U+FFFD, since PostgreSQL jsonb rejects them.
  */
-export function redactBroad<T>(value: T): unknown {
-  return walk(value, scrubPatterns, new WeakSet(), isSensitiveColumn);
+export function redactBroad<T>(value: T, options: RedactBroadOptions = {}): unknown {
+  return walk(
+    value,
+    options.clipStrings ? clipString : scrubAuditString,
+    new WeakSet(),
+    isSensitiveColumn,
+  );
 }
 
 export interface RedactedSnapshot {
@@ -184,14 +196,26 @@ export interface RedactedSnapshot {
   truncatedBytes: number;
 }
 
+const LONE_SURROGATES = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+/** Scrubs credentials and replaces lone surrogates (jsonb cannot store them). */
+const scrubAuditString: StringScrubber = (s) => scrubPatterns(s).replace(LONE_SURROGATES, '�');
+
 const clipString: StringScrubber = (s) => {
-  const scrubbed = scrubPatterns(s);
-  return scrubbed.length > SNAPSHOT_MAX_STRING_CHARS
-    ? `${scrubbed.slice(0, SNAPSHOT_MAX_STRING_CHARS)}…`
-    : scrubbed;
+  const scrubbed = scrubAuditString(s);
+  if (scrubbed.length <= SNAPSHOT_MAX_STRING_CHARS) return scrubbed;
+  let head = scrubbed.slice(0, SNAPSHOT_MAX_STRING_CHARS);
+  // The cut may split a surrogate pair: drop the orphaned high surrogate.
+  const last = head.charCodeAt(head.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) head = head.slice(0, -1);
+  return `${head}…`;
 };
 
-/** UTF-8 byte length of a string (JSON.stringify output has no lone surrogates). */
+/**
+ * UTF-8 byte length of a string, counted per code point. A lone surrogate would count 3 bytes;
+ * audit strings never hold one (they become U+FFFD), and JSON.stringify escapes any other as a
+ * 6-byte `\uXXXX` sequence.
+ */
 export function utf8ByteLength(s: string): number {
   let n = 0;
   for (const ch of s) {
@@ -209,16 +233,17 @@ const SNAPSHOT_ENVELOPE_BYTES = 128;
 /**
  * Copies at most `maxRows` (never more than {@link SNAPSHOT_MAX_ROWS}) rows, masking every key
  * that contains a sensitive word at any depth, scrubbing credential-shaped strings and clipping
- * long strings. Rows that would push the serialized snapshot past {@link SNAPSHOT_MAX_BYTES} are
- * dropped (a single row wider than the cap is dropped too). A row that is not a plain object has
- * no column names to check and is replaced whole (fail closed).
+ * long strings. Rows that would push the serialized snapshot past `maxBytes` (never more than
+ * {@link SNAPSHOT_MAX_BYTES}) are dropped; a single row wider than the cap is dropped too. A row
+ * that is not a plain object has no column names to check and is replaced whole (fail closed).
  */
 export function redactSnapshot(
   rows: readonly Record<string, unknown>[],
   maxRows: number = SNAPSHOT_MAX_ROWS,
+  maxBytes: number = SNAPSHOT_MAX_BYTES,
 ): RedactedSnapshot {
   const cap = Math.max(0, Math.min(Math.floor(maxRows), SNAPSHOT_MAX_ROWS));
-  const budget = SNAPSHOT_MAX_BYTES - SNAPSHOT_ENVELOPE_BYTES;
+  const budget = Math.min(maxBytes, SNAPSHOT_MAX_BYTES) - SNAPSHOT_ENVELOPE_BYTES;
   const kept: unknown[] = [];
   let used = 2; // the array brackets
   let truncatedBytes = 0;
@@ -241,4 +266,29 @@ export function redactSnapshot(
     truncated: rows.length > kept.length,
     truncatedBytes,
   };
+}
+
+export interface RedactedSnapshotPair {
+  before?: RedactedSnapshot;
+  after?: RedactedSnapshot;
+}
+
+/**
+ * Redacts the before and after rows of one audit event under a single
+ * {@link SNAPSHOT_MAX_BYTES} budget (the cap is per audit row): `after` gets whatever `before`
+ * left over. Absent sides are omitted.
+ */
+export function redactSnapshotPair(input: {
+  before?: readonly Record<string, unknown>[];
+  after?: readonly Record<string, unknown>[];
+}): RedactedSnapshotPair {
+  const out: RedactedSnapshotPair = {};
+  let remaining = SNAPSHOT_MAX_BYTES;
+  if (input.before !== undefined) {
+    out.before = redactSnapshot(input.before, SNAPSHOT_MAX_ROWS, remaining);
+    remaining -= byteLength(out.before);
+  }
+  if (input.after !== undefined)
+    out.after = redactSnapshot(input.after, SNAPSHOT_MAX_ROWS, remaining);
+  return out;
 }
