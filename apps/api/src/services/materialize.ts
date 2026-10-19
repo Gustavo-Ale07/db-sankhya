@@ -19,11 +19,15 @@ export interface MaterializeInput {
   workspace: ScratchWorkspace;
   /** A Sankhya read (SELECT); anything else is refused by executeRead. */
   sql: string;
-  /** Target scratch table, `tmp_*`; an existing table of that name is replaced. */
+  /**
+   * Target scratch table, `tmp_*`; an existing table of that name is replaced. Callers that must
+   * not overwrite (the HTTP route without `replace: true`) check for it first.
+   */
   into: string;
   /** Rows copied at most (MATERIALIZE_MAX_ROWS); more rows are cut and reported as truncated. */
   maxRows: number;
-  decide: (analysis: ReadAnalysis) => PolicyDecision;
+  /** The read's authorization (see executeRead); its `maxRows` can only lower `maxRows`. */
+  decide: (analysis: ReadAnalysis) => PolicyDecision | Promise<PolicyDecision>;
   catalog: Catalog;
   signal: AbortSignal;
 }

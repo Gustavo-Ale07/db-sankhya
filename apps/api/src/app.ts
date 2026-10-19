@@ -18,6 +18,7 @@ import type { ConnectionsDeps } from './services/connections';
 import { ExecutionRegistry } from './services/executions';
 import { MetadataService } from './services/metadata';
 import { PolicyService } from './services/policy';
+import { ScratchManager } from './services/scratch';
 import { AuditService, HistoryService, SavedQueriesService } from './services/records';
 import { SessionsService } from './services/sessions';
 import { UsersService } from './services/users';
@@ -30,6 +31,7 @@ import { authRoutes } from './routes/auth';
 import { connectionRoutes } from './routes/connections';
 import { dataRoutes } from './routes/data';
 import { queryRoutes } from './routes/query';
+import { scratchRoutes } from './routes/scratch';
 import { systemRoutes } from './routes/system';
 
 export interface BuildAppOptions {
@@ -79,6 +81,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     connections,
     metadata: new MetadataService(database.db, { getRuntime: (id) => connections.getRuntime(id) }),
     policies: new PolicyService(database.db, app.log),
+    scratch: new ScratchManager({ ...config.scratch }),
     redact: redactor,
     executions: new ExecutionRegistry(),
     startedAt: new Date(),
@@ -187,6 +190,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   await app.register(adminRoutes);
   await app.register(approvalRoutes);
   await app.register(auditRoutes);
+  await app.register(scratchRoutes);
 
   const staticDir = config.staticDir ? resolve(config.staticDir) : undefined;
   if (staticDir && existsSync(staticDir)) {
@@ -219,9 +223,20 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       .send(toErrorPayload(new AppError('NOT_FOUND', 'Route not found'), request.id));
   });
 
+  // Load the rules once at startup, so a corrupt stored rule is logged right away (the service
+  // logs it and denies every policy-evaluated action until it is fixed). A failure here must not
+  // keep the app down: evaluate reloads on demand and fails closed meanwhile.
+  app.addHook('onReady', async () => {
+    try {
+      await services.policies.load();
+    } catch (err) {
+      app.log.error({ err }, 'Policies could not be loaded at startup');
+    }
+  });
+
   app.addHook('onClose', async () => {
     services.executions.abortAll();
-    await services.scratch?.closeAll();
+    await services.scratch.closeAll();
     await services.connections.close();
   });
   return app;

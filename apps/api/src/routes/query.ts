@@ -5,9 +5,17 @@ import { AppError, isAppError } from '@dbx/shared';
 import { MAX_SQL_LENGTH, classifyStatement } from '@dbx/sql-engine';
 import type { Classified, ReadAnalysis } from '@dbx/sql-engine';
 import type { AuthState } from '../context';
+import type { Catalog } from '../services/metadata';
 import { ENV_CONNECTION_ID } from '../services/connections';
 import { executeRead } from '../services/read-executor';
-import type { PolicyDecision } from '../services/read-executor';
+import type { PolicyDecision as ReadDecision } from '../services/read-executor';
+import {
+  authorizeConnection,
+  connectionDenied,
+  evaluateFor,
+  readTargets,
+} from '../services/read-policy';
+import type { PolicyDecision } from '@dbx/shared';
 import {
   clientIp,
   connectionIdSchema,
@@ -51,7 +59,8 @@ function mutationTable(c: Classified): string | null {
 }
 
 export async function queryRoutes(app: FastifyInstance): Promise<void> {
-  const { history, audit, executions, connections, metadata, config, redact } = app.services;
+  const { history, audit, executions, connections, metadata, config, redact, policies, authz } =
+    app.services;
 
   const safeHistory = async (
     request: FastifyRequest,
@@ -170,16 +179,71 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
       throw err;
     }
     const connectionId = requested ?? defaultConnection();
+    // SANKHYA_MAX_ROWS is the ceiling; policy rules can only lower it.
+    const defaults = { maxReadRows: config.sankhya.maxRows };
+    const groupIds = await authz.activeGroupIds(auth.user.id);
+    // The connection (and its environment) is authorized before its runtime or catalog is
+    // touched. An unknown connection gets the same answer as a denied one.
+    const access = await authorizeConnection({
+      policies,
+      auth,
+      groupIds,
+      action: 'QUERY.SELECT',
+      connectionId,
+      connections,
+      defaults,
+    });
+    if (!access.ok) {
+      const err = connectionDenied();
+      await audit.record({
+        ...auditBase(request, auth),
+        action: 'read.denied',
+        status: 'denied',
+        operation: 'SELECT',
+        resource: null,
+        statement: sql,
+        errorCode: err.code,
+        errorMessage: err.message,
+        details: { connectionId, reasons: access.reasons },
+      });
+      await safeHistory(request, {
+        userId: auth.user.id,
+        executionId,
+        sql,
+        status: 'error',
+        operation: null,
+        resource: null,
+        durationMs: Math.round(performance.now() - started),
+        apiCalls: 0,
+        errorCode: err.code,
+      });
+      throw err;
+    }
     let analysis: ReadAnalysis | undefined;
+    let policy: PolicyDecision | undefined;
     let allowed = false;
-    const decide = (a: ReadAnalysis): PolicyDecision => {
-      analysis = a;
-      // Until the policy engine (Stage 9): the RBAC permission to read.
-      allowed = hasPermission(auth, 'QUERY.SELECT');
-      return allowed
-        ? { effect: 'ALLOW' }
-        : { effect: 'DENY', reason: 'Missing permission: QUERY.SELECT' };
-    };
+    const decideWith =
+      (catalog: Catalog) =>
+      async (a: ReadAnalysis): Promise<ReadDecision> => {
+        analysis = a;
+        const targets = readTargets(a, catalog);
+        policy = await evaluateFor({
+          policies,
+          auth,
+          groupIds,
+          action: 'QUERY.SELECT',
+          environment: access.environment,
+          connectionId,
+          entities: targets.entities,
+          columns: targets.columns,
+          defaults,
+        });
+        allowed = policy.effect === 'ALLOW';
+        // The rule internals stay in the audit log; the user gets a generic denial.
+        return allowed
+          ? { effect: 'ALLOW', maxRows: policy.limits.maxReadRows }
+          : { effect: 'DENY', reason: 'The read was denied by policy' };
+      };
     const resourceOf = () => analysis?.tables[0]?.name ?? null;
 
     const controller = executions.start(executionId, auth.user.id);
@@ -197,7 +261,7 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
         sql,
         maxRows: config.sankhya.maxRows,
         signal: controller.signal,
-        decide,
+        decide: decideWith(catalog),
       });
       await safeHistory(request, {
         userId: auth.user.id,
@@ -224,7 +288,7 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
         durationMs: out.durationMs,
         messages:
           out.truncatedBy === 'maxRows'
-            ? [`Result truncated to ${config.sankhya.maxRows} rows.`]
+            ? [`Result truncated to ${out.maxRows} rows.`]
             : out.truncatedBy === 'gateway'
               ? [`Result truncated by the gateway at ${out.rows.length} rows.`]
               : [],
@@ -241,7 +305,16 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
           statement: sql,
           errorCode: code,
           errorMessage: err.message,
-          details: { connectionId },
+          details: {
+            connectionId,
+            ...(policy && policy.effect !== 'ALLOW'
+              ? {
+                  reasons: policy.reasons,
+                  matchedRuleIds: policy.matchedRuleIds,
+                  policyVersion: policy.policyVersion,
+                }
+              : {}),
+          },
         });
       }
       await safeHistory(request, {

@@ -9,6 +9,7 @@ import type { UsersService } from './services/users';
 import type { ExecutionRegistry } from './services/executions';
 import type { MetadataService } from './services/metadata';
 import type { PolicyService } from './services/policy';
+import type { ScratchManager } from './services/scratch';
 
 export interface AppServices {
   config: AppConfig;
@@ -27,6 +28,8 @@ export interface AppServices {
   metadata: MetadataService;
   /** Persisted access policy rules, validated and cached. */
   policies: PolicyService;
+  /** Per-user scratch workspaces (tmp_* tables), never connected to Sankhya. */
+  scratch: ScratchManager;
   /** Masks configured secrets in anything sent back to clients. */
   redact: (value: unknown) => unknown;
   executions: ExecutionRegistry;

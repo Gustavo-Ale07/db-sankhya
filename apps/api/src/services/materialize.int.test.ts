@@ -140,8 +140,8 @@ describe('materialize', () => {
       catalog: CATALOG,
       signal: new AbortController().signal,
     });
-    expect(out.truncated).toBe(true);
-    expect(out.rows).toBeLessThanOrEqual(5);
+    expect(out).toEqual({ table: 'tmp_par', rows: 5, truncated: true });
+    expect(await workspace.tables()).toEqual([{ name: 'tmp_par', rows: 5 }]);
   }, 60_000);
 
   it('a hybrid join between a materialized table and a scratch table works', async () => {
@@ -271,6 +271,79 @@ describe('materialize', () => {
         }),
       ),
     ).toBe('QUERY_CANCELLED');
+    expect(await workspace.tables()).toEqual([]);
+  }, 60_000);
+
+  const READ = { sql: 'SELECT CODPARC FROM TGFPAR', into: 'tmp_par', maxRows: 10 };
+
+  it('an abort while deciding stops before the gateway and creates nothing', async () => {
+    const { runtime, mock, manager } = await setup();
+    const workspace = await manager.workspace('u1');
+    const controller = new AbortController();
+    const before = queries(mock);
+    const code = await codeOf(
+      materialize({
+        ...READ,
+        runtime,
+        workspace,
+        decide: async () => {
+          controller.abort();
+          return { effect: 'ALLOW' };
+        },
+        catalog: CATALOG,
+        signal: controller.signal,
+      }),
+    );
+    expect(code).toBe('QUERY_CANCELLED');
+    expect(queries(mock)).toBe(before);
+    expect(await workspace.tables()).toEqual([]);
+  }, 60_000);
+
+  it('an abort after the read creates nothing', async () => {
+    const { runtime, manager } = await setup();
+    const workspace = await manager.workspace('u1');
+    const controller = new AbortController();
+    const read = runtime.client.executeQuery.bind(runtime.client);
+    runtime.client.executeQuery = async (sql, signal) => {
+      const result = await read(sql, signal);
+      controller.abort();
+      return result;
+    };
+    const code = await codeOf(
+      materialize({
+        ...READ,
+        runtime,
+        workspace,
+        decide: allow,
+        catalog: CATALOG,
+        signal: controller.signal,
+      }),
+    );
+    expect(code).toBe('QUERY_CANCELLED');
+    expect(await workspace.tables()).toEqual([]);
+  }, 60_000);
+
+  it('an abort during the import rolls the table back', async () => {
+    const { runtime, manager } = await setup();
+    const workspace = await manager.workspace('u1');
+    const controller = new AbortController();
+    const importRows = workspace.importRows.bind(workspace);
+    workspace.importRows = (...args) => {
+      const pending = importRows(...args);
+      controller.abort();
+      return pending;
+    };
+    const code = await codeOf(
+      materialize({
+        ...READ,
+        runtime,
+        workspace,
+        decide: allow,
+        catalog: CATALOG,
+        signal: controller.signal,
+      }),
+    );
+    expect(code).toBe('QUERY_CANCELLED');
     expect(await workspace.tables()).toEqual([]);
   }, 60_000);
 });

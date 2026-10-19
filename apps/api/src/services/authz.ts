@@ -125,6 +125,17 @@ export class AuthzService {
     return (await this.grants(userId)).permissions;
   }
 
+  /** Ids of the active groups the user belongs to (policy rules can target groups). */
+  async activeGroupIds(userId: string, db: Db = this.db): Promise<string[]> {
+    const rows = await db
+      .select({ id: groups.id })
+      .from(groupMembers)
+      .innerJoin(groups, eq(groups.id, groupMembers.groupId))
+      .where(and(eq(groupMembers.userId, userId), eq(groups.active, true)))
+      .orderBy(asc(groups.id));
+    return rows.map((r) => r.id);
+  }
+
   /** Keys of the roles assigned directly to the user (not through groups). */
   async directRoles(userId: string, db: Db = this.db): Promise<string[]> {
     const rows = await db

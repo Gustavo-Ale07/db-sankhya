@@ -179,6 +179,54 @@ describe('executeRead', () => {
     expect(executeQuery).not.toHaveBeenCalled();
   });
 
+  it('awaits an async decision and caps the rows at its maxRows', async () => {
+    const { runtime, executeQuery } = fakeRuntime('oracle', { rows: [[1], [2], [3], [4]] });
+    const decide = async (): Promise<PolicyDecision> => ({ effect: 'ALLOW', maxRows: 3 });
+    const out = await executeRead(base(runtime, 'SELECT CODPARC FROM TGFPAR', { decide }));
+    expect(executeQuery.mock.calls[0]![0]).toContain('ROWNUM <= 4');
+    expect(out).toMatchObject({ rows: [[1], [2], [3]], truncated: true, maxRows: 3 });
+
+    // A policy cap never raises the caller's ceiling.
+    const high = async (): Promise<PolicyDecision> => ({ effect: 'ALLOW', maxRows: 500 });
+    const capped = await executeRead(base(runtime, 'SELECT CODPARC FROM TGFPAR', { decide: high }));
+    expect(executeQuery.mock.calls[1]![0]).toContain('ROWNUM <= 11');
+    expect(capped.maxRows).toBe(10);
+  });
+
+  it('fails closed on an async DENY, a rejected decision or a zero row cap', async () => {
+    const { runtime, executeQuery } = fakeRuntime('oracle');
+    const sql = 'SELECT CODPARC FROM TGFPAR';
+    const deny = async (): Promise<PolicyDecision> => ({ effect: 'DENY' });
+    expect((await errorOf(executeRead(base(runtime, sql, { decide: deny })))).code).toBe(
+      'FORBIDDEN',
+    );
+    const zero = async (): Promise<PolicyDecision> => ({ effect: 'ALLOW', maxRows: 0 });
+    expect((await errorOf(executeRead(base(runtime, sql, { decide: zero })))).code).toBe(
+      'FORBIDDEN',
+    );
+    const broken = () => Promise.reject(new Error('policy store down'));
+    await expect(executeRead(base(runtime, sql, { decide: broken }))).rejects.toThrow(
+      'policy store down',
+    );
+    expect(executeQuery).not.toHaveBeenCalled();
+  });
+
+  it('does not reach the gateway when aborted while deciding', async () => {
+    const { runtime, executeQuery } = fakeRuntime('oracle');
+    const controller = new AbortController();
+    const decide = async (): Promise<PolicyDecision> => {
+      controller.abort();
+      return { effect: 'ALLOW' };
+    };
+    const e = await errorOf(
+      executeRead(
+        base(runtime, 'SELECT CODPARC FROM TGFPAR', { decide, signal: controller.signal }),
+      ),
+    );
+    expect(e.code).toBe('QUERY_CANCELLED');
+    expect(executeQuery).not.toHaveBeenCalled();
+  });
+
   it('maps an abort to QUERY_CANCELLED', async () => {
     const { runtime, executeQuery } = fakeRuntime('oracle');
     const controller = new AbortController();

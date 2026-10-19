@@ -1,15 +1,24 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { AppError } from '@dbx/shared';
-import { connectionIdSchema, noStore, parseBody, requireAuth, requirePermission } from '../http';
+import {
+  clientIp,
+  connectionIdSchema,
+  noStore,
+  parseBody,
+  requireAuth,
+  requirePermission,
+} from '../http';
 import { ENV_CONNECTION_ID } from '../services/connections';
+import { authorizeConnection, connectionDenied } from '../services/read-policy';
 
 const schemaQuery = z.object({ connectionId: connectionIdSchema.optional() }).strict();
 
 const READY_TIMEOUT_MS = 2000;
 
 export async function systemRoutes(app: FastifyInstance): Promise<void> {
-  const { config, database, startedAt, metadata, connections, redact } = app.services;
+  const { config, database, startedAt, metadata, connections, redact, policies, authz, audit } =
+    app.services;
 
   // Probes hit these every few seconds; keep them out of the info-level request log.
   const probe = { logLevel: 'warn' } as const;
@@ -48,7 +57,7 @@ export async function systemRoutes(app: FastifyInstance): Promise<void> {
   }));
 
   app.get('/api/schema', async (request, reply) => {
-    requirePermission(request, 'QUERY.SELECT');
+    const auth = requirePermission(request, 'QUERY.SELECT');
     const { connectionId: requested } = parseBody(schemaQuery, request.query);
     let connectionId = requested;
     if (connectionId === undefined) {
@@ -59,6 +68,33 @@ export async function systemRoutes(app: FastifyInstance): Promise<void> {
         );
       }
       connectionId = ENV_CONNECTION_ID;
+    }
+    // The catalog is only loaded for a connection the policy lets this user read; an unknown
+    // connection gets the same answer as a denied one.
+    const access = await authorizeConnection({
+      policies,
+      auth,
+      groupIds: await authz.activeGroupIds(auth.user.id),
+      action: 'QUERY.SELECT',
+      connectionId,
+      connections,
+    });
+    if (!access.ok) {
+      const err = connectionDenied();
+      await audit.record({
+        userId: auth.user.id,
+        userEmail: auth.user.email,
+        ip: clientIp(request),
+        requestId: request.id,
+        action: 'read.denied',
+        status: 'denied',
+        operation: 'SCHEMA',
+        resource: null,
+        errorCode: err.code,
+        errorMessage: err.message,
+        details: { connectionId, reasons: access.reasons },
+      });
+      throw err;
     }
     noStore(reply);
     return redact({ connectionId, catalog: await metadata.get(connectionId) });

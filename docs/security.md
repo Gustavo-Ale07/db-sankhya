@@ -135,6 +135,11 @@ Permission checks happen on the server for every request. History, saved queries
 and write previews are always scoped by the owner's user id (no IDOR through ids in the URL);
 administrators see the audit log of all users.
 
+Reads and scratch statements are also evaluated by the stored policy rules, after the permission
+check. A rule with an empty connection list applies to every connection, including the
+`env-default` connection defined by `SANKHYA_*` (in its `SANKHYA_ENVIRONMENT`), and scratch
+statements are evaluated as the pseudo connection `scratch` in the `SANDBOX` environment.
+
 ## Write protection
 
 Mutations are **not available yet**. Every mutation entry point fails closed:

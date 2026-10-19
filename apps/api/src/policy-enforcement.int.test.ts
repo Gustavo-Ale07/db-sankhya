@@ -1,0 +1,453 @@
+import { Writable } from 'node:stream';
+import { afterEach, describe, expect, it } from 'vitest';
+import { sql } from 'drizzle-orm';
+import type { FastifyInstance, InjectOptions } from 'fastify';
+import { createDatabase } from '@dbx/database';
+import type { DatabaseHandle } from '@dbx/database';
+import { MOCK_CREDENTIALS, createMockSankhya } from '@dbx/sankhya-client/mock';
+import type { MockSankhya } from '@dbx/sankhya-client/mock';
+import type { Permission } from '@dbx/shared';
+import { buildApp } from './app';
+import { loadConfig, secretValues } from './config';
+import { loggerOptions } from './logger';
+import type { PolicyInput } from './services/policy';
+
+const ORIGIN = 'http://localhost:5173';
+const ADMIN = { email: 'admin@example.com', password: 'Adm1n!Strong#Pass' };
+const PASSWORD = 'User!Strong#Pass9';
+const UNKNOWN_CONNECTION = '00000000-0000-4000-8000-00000000dead';
+
+const BASE_ENV = {
+  NODE_ENV: 'test',
+  APP_URL: ORIGIN,
+  DATABASE_URL: 'pglite:memory',
+  SESSION_SECRET: 'integration-test-secret-7Hq2Lm9Xc4Vb8Nz1Kp5Rt3Wy6',
+  BOOTSTRAP_ADMIN_EMAIL: ADMIN.email,
+  BOOTSTRAP_ADMIN_PASSWORD: ADMIN.password,
+  LOG_LEVEL: 'silent',
+  SANKHYA_MODE: 'mock',
+  SANKHYA_BASE_URL: 'https://gateway.example.com',
+  SANKHYA_ALLOWED_HOSTS: 'gateway.example.com',
+  SANKHYA_CLIENT_ID: MOCK_CREDENTIALS.clientId,
+  SANKHYA_CLIENT_SECRET: MOCK_CREDENTIALS.clientSecret,
+  SANKHYA_X_TOKEN: MOCK_CREDENTIALS.xToken,
+  SANKHYA_DIALECT: 'oracle',
+  SCRATCH_MAX_WORKSPACES: '4',
+};
+
+interface Harness {
+  app: FastifyInstance;
+  database: DatabaseHandle;
+  mock: MockSankhya;
+  logs: string[];
+  login(email?: string, password?: string): Promise<string>;
+  /** A user holding exactly `permissions` (through a custom role) and its session cookie. */
+  userWith(permissions: Permission[]): Promise<{ cookie: string; id: string }>;
+  viewer(): Promise<{ cookie: string; id: string }>;
+  call(
+    cookie: string | null,
+    opts: InjectOptions,
+  ): Promise<Awaited<ReturnType<FastifyInstance['inject']>>>;
+  policy(input: Partial<PolicyInput>): Promise<void>;
+}
+
+const open: Harness[] = [];
+
+async function setup(
+  env: Record<string, string> = {},
+  before?: (database: DatabaseHandle) => Promise<void>,
+): Promise<Harness> {
+  const config = loadConfig({ ...BASE_ENV, ...env });
+  const database = await createDatabase(config.databaseUrl);
+  await database.migrate();
+  if (before) await before(database);
+  const logs: string[] = [];
+  const stream = new Writable({
+    write(chunk, _enc, cb) {
+      logs.push(String(chunk));
+      cb();
+    },
+  });
+  const mock = await createMockSankhya();
+  const app = await buildApp({
+    config,
+    database,
+    logger: { ...(loggerOptions('info', secretValues(config)) as object), stream },
+    sankhya: { mockGateway: () => Promise.resolve({ ...mock, close: async () => undefined }) },
+  });
+  await app.services.users.bootstrapAdmin(config.bootstrapAdmin);
+  const admin = await app.services.users.findByEmail(ADMIN.email);
+  if (admin) await app.services.users.setPassword(admin.id, ADMIN.password, false);
+
+  const call: Harness['call'] = (cookie, opts) =>
+    app.inject({
+      ...opts,
+      headers: {
+        origin: ORIGIN,
+        ...(cookie ? { cookie: `${config.session.cookieName}=${cookie}` } : {}),
+        ...(opts.headers ?? {}),
+      },
+    });
+  const login = async (email = ADMIN.email, password = ADMIN.password) => {
+    const res = await call(null, {
+      method: 'POST',
+      url: '/api/auth/login',
+      payload: { email, password },
+    });
+    expect(res.statusCode, res.body).toBe(200);
+    return res.cookies.find((x) => x.name === config.session.cookieName)!.value;
+  };
+  let n = 0;
+  const create = async (roles: string[]) => {
+    const email = `user${++n}@example.com`;
+    const user = await app.services.users.create({
+      email,
+      name: 'User',
+      password: PASSWORD,
+      roles,
+    });
+    return { cookie: await login(email, PASSWORD), id: user.id };
+  };
+  const userWith = async (permissions: Permission[]) => {
+    const key = `CUSTOM_${++n}`;
+    await app.services.authz.createRole({ key, name: key, permissions });
+    return create([key]);
+  };
+  const policy = async (input: Partial<PolicyInput>) => {
+    await app.services.policies.create({
+      name: 'test rule',
+      effect: 'DENY',
+      subjectType: 'everyone',
+      subjectId: null,
+      environments: [],
+      connectionIds: [],
+      actions: ['QUERY.SELECT'],
+      entities: [],
+      columns: [],
+      limits: {},
+      overrideWhereRequired: false,
+      enabled: true,
+      ...input,
+    });
+  };
+  const h: Harness = {
+    app,
+    database,
+    mock,
+    logs,
+    login,
+    userWith,
+    viewer: () => create(['VIEWER']),
+    call,
+    policy,
+  };
+  open.push(h);
+  return h;
+}
+
+afterEach(async () => {
+  while (open.length) {
+    const h = open.pop()!;
+    await h.app.close();
+    await h.database.close();
+    await h.mock.close();
+  }
+});
+
+const codeOf = (res: { json(): unknown }) =>
+  (res.json() as { error?: { code: string } }).error?.code;
+const errorOf = (res: { json(): unknown }) => {
+  const { error } = res.json() as { error: { code: string; message: string } };
+  return { code: error.code, message: error.message };
+};
+const reads = (mock: MockSankhya, needle: string) =>
+  mock.calls.filter(
+    (c) => c.serviceName === 'DbExplorerSP.executeQuery' && JSON.stringify(c).includes(needle),
+  ).length;
+
+const query = (h: Harness, cookie: string, payload: Record<string, unknown>) =>
+  h.call(cookie, { method: 'POST', url: '/api/query', payload });
+const exec = (h: Harness, cookie: string, sqlText: string) =>
+  h.call(cookie, { method: 'POST', url: '/api/scratch/exec', payload: { sql: sqlText } });
+const materialize = (h: Harness, cookie: string, payload: Record<string, unknown>) =>
+  h.call(cookie, { method: 'POST', url: '/api/scratch/materialize', payload });
+const tables = async (h: Harness, cookie: string) => {
+  const res = await h.call(cookie, { method: 'GET', url: '/api/scratch/tables' });
+  expect(res.statusCode, res.body).toBe(200);
+  return (res.json() as { tables: Array<{ name: string; rows: number }> }).tables;
+};
+
+describe('policies on the Sankhya read path', () => {
+  it('a column DENY refuses SELECT * (expanded from the catalog) and allows other columns', async () => {
+    const h = await setup();
+    await h.policy({ columns: ['TGFPAR.EMAIL'] });
+    const { cookie } = await h.viewer();
+    const ok = await query(h, cookie, { sql: 'SELECT NOMEPARC FROM TGFPAR' });
+    expect(ok.statusCode, ok.body).toBe(200);
+    expect(ok.json().rowCount).toBeGreaterThan(0);
+
+    for (const sqlText of [
+      'SELECT * FROM TGFPAR',
+      'SELECT EMAIL FROM TGFPAR',
+      'SELECT p.NOMEPARC FROM TGFPAR p WHERE p.EMAIL IS NOT NULL',
+    ]) {
+      const res = await query(h, cookie, { sql: sqlText });
+      expect(res.statusCode, sqlText).toBe(403);
+      expect(codeOf(res), sqlText).toBe('FORBIDDEN');
+      // Denied before the gateway: no rule internals leak to the user.
+      expect(res.body).not.toContain('test rule');
+    }
+    expect(reads(h.mock, 'EMAIL')).toBe(0);
+
+    const admin = await h.login();
+    const audit = await h.call(admin, { method: 'GET', url: '/api/audit?action=read.denied' });
+    expect(audit.json().total).toBe(3);
+    expect(audit.json().items[0]).toMatchObject({ errorCode: 'FORBIDDEN', resource: 'TGFPAR' });
+  });
+
+  it("caps the rows at the policy's maxReadRows", async () => {
+    const h = await setup();
+    await h.policy({ effect: 'ALLOW', entities: ['TGFPAR'], limits: { maxReadRows: 3 } });
+    const { cookie } = await h.viewer();
+    const res = await query(h, cookie, { sql: 'SELECT CODPARC FROM TGFPAR' });
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json()).toMatchObject({ rowCount: 3, truncated: true });
+    expect(res.json().messages.join(' ')).toContain('3 rows');
+    // The rule only applies to its entities.
+    const other = await query(h, cookie, { sql: 'SELECT CODCID FROM TSICID' });
+    expect(other.json().rowCount).toBeGreaterThan(3);
+  });
+
+  it('keeps SANKHYA_MAX_ROWS as the ceiling rules cannot raise', async () => {
+    const h = await setup({ SANKHYA_MAX_ROWS: '4' });
+    await h.policy({ effect: 'ALLOW', limits: { maxReadRows: 50 } });
+    const { cookie } = await h.viewer();
+    const res = await query(h, cookie, { sql: 'SELECT CODPARC FROM TGFPAR' });
+    expect(res.json()).toMatchObject({ rowCount: 4, truncated: true });
+  });
+});
+
+describe('per-connection authorization (SR1)', () => {
+  it('answers a denied and an unknown connection the same way, before any gateway call', async () => {
+    const h = await setup();
+    const conn = await h.app.services.connections.create({
+      name: 'Demo',
+      environment: 'SANDBOX',
+      mode: 'mock',
+      baseUrl: 'mock://local',
+      dialect: 'oracle',
+      secrets: { ...MOCK_CREDENTIALS },
+    });
+    await h.policy({ connectionIds: [conn.id] });
+    const { cookie } = await h.viewer();
+    const sqlText = 'SELECT CODPARC FROM TGFPAR';
+
+    const denied = await query(h, cookie, { sql: sqlText, connectionId: conn.id });
+    const unknown = await query(h, cookie, { sql: sqlText, connectionId: UNKNOWN_CONNECTION });
+    expect(denied.statusCode).toBe(403);
+    expect(unknown.statusCode).toBe(403);
+    expect(errorOf(denied)).toEqual(errorOf(unknown));
+    expect(errorOf(denied).code).toBe('FORBIDDEN');
+
+    const schemaDenied = await h.call(cookie, {
+      method: 'GET',
+      url: `/api/schema?connectionId=${conn.id}`,
+    });
+    const schemaUnknown = await h.call(cookie, {
+      method: 'GET',
+      url: `/api/schema?connectionId=${UNKNOWN_CONNECTION}`,
+    });
+    expect(schemaDenied.statusCode).toBe(403);
+    expect(errorOf(schemaDenied)).toEqual(errorOf(schemaUnknown));
+    expect(errorOf(schemaDenied)).toEqual(errorOf(denied));
+    expect(h.mock.calls).toHaveLength(0);
+
+    // The rule names one connection: the env-defined one still works.
+    const env = await query(h, cookie, { sql: sqlText });
+    expect(env.statusCode, env.body).toBe(200);
+  });
+
+  it('applies rules without a connection list to env-default, in its SANKHYA_ENVIRONMENT', async () => {
+    const h = await setup({ SANKHYA_ENVIRONMENT: 'HOMOLOGATION' });
+    await h.policy({ environments: ['PRODUCTION'] });
+    const { cookie } = await h.viewer();
+    const ok = await query(h, cookie, { sql: 'SELECT CODPARC FROM TGFPAR' });
+    expect(ok.statusCode, ok.body).toBe(200);
+
+    await h.policy({ environments: ['HOMOLOGATION'] });
+    const before = h.mock.calls.length;
+    const res = await query(h, cookie, { sql: 'SELECT CODPARC FROM TGFPAR' });
+    expect(res.statusCode).toBe(403);
+    expect(codeOf(res)).toBe('FORBIDDEN');
+    const schema = await h.call(cookie, { method: 'GET', url: '/api/schema' });
+    expect(schema.statusCode).toBe(403);
+    expect(h.mock.calls.length).toBe(before);
+  });
+});
+
+describe('policies at startup', () => {
+  it('logs a corrupt stored rule at boot, keeps running and denies reads', async () => {
+    const h = await setup({}, async (database) => {
+      await database.db.execute(sql`
+        insert into policies (name, effect, subject_type, actions, environments, enabled)
+        values ('corrupt', 'DENY', 'everyone', '{}', '{MOON}', true)`);
+    });
+    await h.app.ready();
+    expect(h.logs.join('\n')).toContain('Invalid enabled policy rules');
+    const { cookie } = await h.viewer();
+    const res = await query(h, cookie, { sql: 'SELECT CODPARC FROM TGFPAR' });
+    expect(res.statusCode).toBe(403);
+    const status = await h.call(cookie, { method: 'GET', url: '/api/status' });
+    expect(status.statusCode).toBe(200);
+  });
+
+  it('does not crash when the rules cannot be loaded at boot', async () => {
+    const h = await setup();
+    h.app.services.policies.load = () => Promise.reject(new Error('database unavailable'));
+    await expect(h.app.ready()).resolves.toBeDefined();
+    expect(h.logs.join('\n')).toContain('Policies could not be loaded at startup');
+  });
+});
+
+describe('scratch routes', () => {
+  it('requires a session', async () => {
+    const h = await setup();
+    expect(codeOf(await exec(h, '', 'SELECT 1'))).toBe('AUTH_REQUIRED');
+    const res = await h.call(null, { method: 'GET', url: '/api/scratch/tables' });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('lets a VIEWER create, fill and read a scratch table', async () => {
+    const h = await setup();
+    const { cookie } = await h.viewer();
+    expect((await exec(h, cookie, 'CREATE TABLE tmp_x (a int)')).statusCode).toBe(200);
+    expect((await exec(h, cookie, 'INSERT INTO tmp_x VALUES (1), (2)')).statusCode).toBe(200);
+    const sel = await exec(h, cookie, 'SELECT a FROM tmp_x ORDER BY a');
+    expect(sel.statusCode, sel.body).toBe(200);
+    expect(sel.json()).toMatchObject({ command: 'SELECT', columns: ['a'], rowCount: 2 });
+    expect(await tables(h, cookie)).toEqual([{ name: 'tmp_x', rows: 2 }]);
+    // Workspaces are per user.
+    const other = await h.viewer();
+    expect(await tables(h, other.cookie)).toEqual([]);
+  });
+
+  it('refuses CREATE TABLE tmp_x to a user without TEMP.CREATE and audits it', async () => {
+    const h = await setup();
+    const { cookie } = await h.userWith(['QUERY.SELECT', 'TEMP.WRITE', 'TEMP.DROP']);
+    const res = await exec(h, cookie, 'CREATE TABLE tmp_x (a int)');
+    expect(res.statusCode).toBe(403);
+    expect(codeOf(res)).toBe('FORBIDDEN');
+    expect(await tables(h, cookie)).toEqual([]);
+    const admin = await h.login();
+    const audit = await h.call(admin, { method: 'GET', url: '/api/audit?action=scratch.denied' });
+    expect(audit.json().items[0]).toMatchObject({
+      status: 'denied',
+      operation: 'CREATE TABLE',
+      resource: 'tmp_x',
+      errorCode: 'FORBIDDEN',
+    });
+  });
+
+  it('enforces policy rules on scratch statements', async () => {
+    const h = await setup();
+    await h.policy({ actions: ['TEMP.CREATE'] });
+    const { cookie } = await h.viewer();
+    const res = await exec(h, cookie, 'CREATE TABLE tmp_x (a int)');
+    expect(res.statusCode).toBe(403);
+    expect(await tables(h, cookie)).toEqual([]);
+  });
+
+  it('validates scratch SQL before authorizing it', async () => {
+    const h = await setup();
+    const nobody = await h.userWith([]);
+    const res = await exec(h, nobody.cookie, 'CREATE TABLE erp_x (a int)');
+    expect(res.statusCode).toBe(400);
+  });
+});
+
+describe('materialization route', () => {
+  const READ = { sql: 'SELECT CODPARC, NOMEPARC FROM TGFPAR', into: 'tmp_par' };
+
+  it('materializes a Sankhya read into a scratch table', async () => {
+    const h = await setup();
+    const { cookie } = await h.viewer();
+    const res = await materialize(h, cookie, READ);
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json()).toMatchObject({ table: 'tmp_par', truncated: false });
+    const rows = res.json().rows as number;
+    expect(rows).toBeGreaterThan(0);
+    expect(await tables(h, cookie)).toEqual([{ name: 'tmp_par', rows }]);
+  });
+
+  it('requires both QUERY.SELECT and TEMP.MATERIALIZE', async () => {
+    const h = await setup();
+    for (const permissions of [
+      ['TEMP.MATERIALIZE', 'TEMP.CREATE', 'TEMP.WRITE'],
+      ['QUERY.SELECT', 'TEMP.CREATE', 'TEMP.WRITE'],
+    ] as Permission[][]) {
+      const { cookie, id } = await h.userWith(permissions);
+      const res = await materialize(h, cookie, READ);
+      expect(res.statusCode, permissions.join()).toBe(403);
+      expect(codeOf(res)).toBe('FORBIDDEN');
+      // Read directly: one of these users may not list scratch tables.
+      expect(await (await h.app.services.scratch.workspace(id)).tables()).toEqual([]);
+    }
+    expect(reads(h.mock, 'NOMEPARC')).toBe(0);
+  });
+
+  it('applies the read policy to the source and creates nothing when denied', async () => {
+    const h = await setup();
+    await h.policy({ columns: ['TGFPAR.EMAIL'] });
+    const { cookie } = await h.viewer();
+    const res = await materialize(h, cookie, { sql: 'SELECT * FROM TGFPAR', into: 'tmp_par' });
+    expect(res.statusCode).toBe(403);
+    expect(await tables(h, cookie)).toEqual([]);
+    expect(reads(h.mock, 'EMAIL')).toBe(0);
+  });
+
+  it('refuses a policy-denied TEMP.MATERIALIZE', async () => {
+    const h = await setup();
+    await h.policy({ actions: ['TEMP.MATERIALIZE'] });
+    const { cookie } = await h.viewer();
+    const res = await materialize(h, cookie, READ);
+    expect(res.statusCode).toBe(403);
+    expect(await tables(h, cookie)).toEqual([]);
+  });
+
+  it('needs replace: true to overwrite an existing table', async () => {
+    const h = await setup();
+    const { cookie } = await h.viewer();
+    expect((await materialize(h, cookie, READ)).statusCode).toBe(200);
+    const before = reads(h.mock, 'NOMEPARC');
+    const again = await materialize(h, cookie, {
+      sql: 'SELECT CODPARC FROM TGFPAR',
+      into: 'tmp_par',
+    });
+    expect(again.statusCode).toBe(409);
+    expect(codeOf(again)).toBe('CONFLICT');
+    expect(reads(h.mock, 'NOMEPARC')).toBe(before);
+    const replaced = await materialize(h, cookie, {
+      sql: 'SELECT CODPARC FROM TGFPAR',
+      into: 'tmp_par',
+      replace: true,
+    });
+    expect(replaced.statusCode, replaced.body).toBe(200);
+    const sel = await exec(h, cookie, 'SELECT * FROM tmp_par');
+    expect(sel.json().columns).toEqual(['codparc']);
+  });
+
+  it('caps the copied rows at MATERIALIZE_MAX_ROWS', async () => {
+    const h = await setup({ MATERIALIZE_MAX_ROWS: '7' });
+    const { cookie } = await h.viewer();
+    const res = await materialize(h, cookie, READ);
+    expect(res.json()).toMatchObject({ table: 'tmp_par', rows: 7, truncated: true });
+  });
+
+  it('applies the connection authorization to the source', async () => {
+    const h = await setup();
+    const { cookie } = await h.viewer();
+    const res = await materialize(h, cookie, { ...READ, connectionId: UNKNOWN_CONNECTION });
+    expect(res.statusCode).toBe(403);
+    expect(codeOf(res)).toBe('FORBIDDEN');
+  });
+});

@@ -5,12 +5,13 @@ import type { Catalog } from './metadata';
 import type { SankhyaRuntime } from './sankhya-runtime';
 
 /**
- * Outcome of the authorization check of a read. Minimal on purpose: the policy engine (Stage 9)
- * replaces it.
+ * Outcome of the authorization check of a read, as the caller derives it from the policy engine.
+ * `maxRows` is the policy row cap; it can only lower the caller's `maxRows`.
  */
 export interface PolicyDecision {
   effect: 'ALLOW' | 'DENY';
   reason?: string;
+  maxRows?: number;
 }
 
 export interface ReadInput {
@@ -20,7 +21,8 @@ export interface ReadInput {
   /** Rows returned at most; one more is fetched to know whether the result was cut. */
   maxRows: number;
   signal: AbortSignal;
-  decide: (analysis: ReadAnalysis) => PolicyDecision;
+  /** Authorizes the analyzed read. A rejection propagates and nothing is sent. */
+  decide: (analysis: ReadAnalysis) => PolicyDecision | Promise<PolicyDecision>;
 }
 
 export interface ReadOutput {
@@ -32,6 +34,8 @@ export interface ReadOutput {
    * at its own cap before reaching maxRows (`gateway`). Null when the result is complete.
    */
   truncatedBy: 'maxRows' | 'gateway' | null;
+  /** The row cap applied: the caller's maxRows, lowered by the decision's. */
+  maxRows: number;
   durationMs: number;
 }
 
@@ -41,9 +45,9 @@ export interface ReadOutput {
  * wrapper, then the gateway. Anything that cannot be parsed or recognised is refused.
  */
 export async function executeRead(input: ReadInput): Promise<ReadOutput> {
-  const { runtime, catalog, sql, maxRows, signal, decide } = input;
+  const { runtime, catalog, sql, signal, decide } = input;
   const started = performance.now();
-  if (!Number.isSafeInteger(maxRows) || maxRows < 1)
+  if (!Number.isSafeInteger(input.maxRows) || input.maxRows < 1)
     throw new AppError('INTERNAL_ERROR', 'maxRows must be a positive integer');
   throwIfAborted(signal);
 
@@ -53,9 +57,11 @@ export async function executeRead(input: ReadInput): Promise<ReadOutput> {
   const analysis = analyzeRead(sql, { dialect: runtime.dialect });
   assertTablesKnown(analysis, catalog);
 
-  const decision = decide(analysis);
+  const decision = await decide(analysis);
+  throwIfAborted(signal);
   if (decision.effect !== 'ALLOW')
     throw new AppError('FORBIDDEN', decision.reason ?? 'The read was denied by policy');
+  const maxRows = effectiveMaxRows(input.maxRows, decision.maxRows);
 
   const wrapped = rowCapWrapper(stripTrailingSemicolon(sql), runtime.dialect, maxRows, analysis);
   // The wrapper only adds fixed text and a number, but what reaches the gateway is gated again.
@@ -76,8 +82,17 @@ export async function executeRead(input: ReadInput): Promise<ReadOutput> {
     rows: over ? result.rows.slice(0, maxRows) : result.rows,
     truncated: truncatedBy !== null,
     truncatedBy,
+    maxRows,
     durationMs: Math.round(performance.now() - started),
   };
+}
+
+/** The lower of the two caps; a policy cap that is not a positive integer allows no read. */
+function effectiveMaxRows(ceiling: number, policy: number | undefined): number {
+  if (policy === undefined) return ceiling;
+  if (!Number.isSafeInteger(policy) || policy < 1)
+    throw new AppError('FORBIDDEN', 'The read was denied by policy');
+  return Math.min(ceiling, policy);
 }
 
 function assertTablesKnown(analysis: ReadAnalysis, catalog: Catalog): void {
