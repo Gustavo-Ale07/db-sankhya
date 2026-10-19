@@ -48,6 +48,10 @@ describe('loadConfig', () => {
     expect(c.session.secureCookie).toBe(false);
   });
 
+  it('refuses NODE_ENV=test together with APP_ENV=production', () => {
+    expect(() => loadConfig({ NODE_ENV: 'test', APP_ENV: 'production' })).toThrow(ConfigError);
+  });
+
   it('treats an empty DATABASE_URL (as shipped in .env.example) as unset', () => {
     expect(loadConfig({ DATABASE_URL: '' }).databaseUrl).toBe('pglite:memory');
   });

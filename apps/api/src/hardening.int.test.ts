@@ -44,6 +44,14 @@ describe('health probes', () => {
     expect(res.body).not.toMatch(/ECONNREFUSED|hunter2|10\.0\.0\.5/);
   });
 
+  it('ready times out a hung database ping and answers 503', async () => {
+    const { app: a, database: db } = await setup();
+    vi.spyOn(db, 'ping').mockImplementation(() => new Promise(() => {}));
+    const res = await a.inject({ method: 'GET', url: '/health/ready' });
+    expect(res.statusCode).toBe(503);
+    expect(res.json()).toEqual({ status: 'error', checks: { database: 'error' } });
+  });
+
   it('live and ready expose only status data', async () => {
     const { app: a } = await setup();
     const live = await a.inject({ method: 'GET', url: '/health/live' });

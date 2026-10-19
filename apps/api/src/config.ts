@@ -265,6 +265,9 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
     throw new ConfigError(parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`));
   }
   const e = parsed.data;
+  // NODE_ENV=test enables cheap password hashing; never together with a production marker.
+  if (e.NODE_ENV === 'test' && e.APP_ENV === 'production')
+    throw new ConfigError(['NODE_ENV=test is not allowed when APP_ENV=production']);
   const problems: string[] = [];
   const isProduction = e.NODE_ENV === 'production' || e.APP_ENV === 'production';
   const rawAppUrl = e.APP_URL ?? e.PUBLIC_URL ?? 'http://localhost:5173';

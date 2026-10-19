@@ -12,8 +12,10 @@ const ARGON2_OPTIONS = { algorithm: ARGON2ID, memoryCost: 19_456, timeCost: 2, p
  * Hashes carry their own parameters, so verification works for either; production never takes this branch.
  */
 const TEST_ARGON2_OPTIONS = { ...ARGON2_OPTIONS, memoryCost: 8, timeCost: 1 };
-const underTest = (): boolean =>
-  process.env.NODE_ENV === 'test' && process.env.VITEST !== undefined;
+export const underTest = (): boolean =>
+  process.env.NODE_ENV === 'test' &&
+  process.env.VITEST !== undefined &&
+  process.env.APP_ENV !== 'production';
 
 export function hashPassword(password: string): Promise<string> {
   return hash(password, underTest() ? TEST_ARGON2_OPTIONS : ARGON2_OPTIONS);

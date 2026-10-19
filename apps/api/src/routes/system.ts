@@ -6,6 +6,8 @@ import { ENV_CONNECTION_ID } from '../services/connections';
 
 const schemaQuery = z.object({ connectionId: connectionIdSchema.optional() }).strict();
 
+const READY_TIMEOUT_MS = 2000;
+
 export async function systemRoutes(app: FastifyInstance): Promise<void> {
   const { config, database, startedAt, metadata, connections, redact } = app.services;
 
@@ -16,10 +18,19 @@ export async function systemRoutes(app: FastifyInstance): Promise<void> {
 
   app.get('/health/ready', probe, async (_request, reply) => {
     const checks: Record<string, 'ok' | 'error'> = { database: 'ok' };
+    let timer: NodeJS.Timeout | undefined;
     try {
-      await database.ping();
+      // A hung database must read as not ready, not hang the probe.
+      await Promise.race([
+        database.ping(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('ping timeout')), READY_TIMEOUT_MS);
+        }),
+      ]);
     } catch {
       checks.database = 'error';
+    } finally {
+      if (timer) clearTimeout(timer);
     }
     const ok = Object.values(checks).every((v) => v === 'ok');
     void reply.code(ok ? 200 : 503);

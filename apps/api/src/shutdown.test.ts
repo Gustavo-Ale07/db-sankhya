@@ -2,19 +2,48 @@ import { describe, expect, it, vi } from 'vitest';
 import { createShutdown } from './shutdown';
 
 describe('createShutdown', () => {
-  it('closes the app, then the database, then exits 0; a second signal is ignored', async () => {
+  it('closes the app, then the database, then exits 0', async () => {
     const order: string[] = [];
     const exit = vi.fn();
-    const shutdown = createShutdown({
+    await createShutdown({
       app: { close: async () => void order.push('app') },
       closeDatabase: async () => void order.push('db'),
       timeoutMs: 1000,
       exit,
-    });
-    await Promise.all([shutdown('SIGTERM'), shutdown('SIGINT')]);
+    })('SIGTERM');
     expect(order).toEqual(['app', 'db']);
     expect(exit).toHaveBeenCalledTimes(1);
     expect(exit).toHaveBeenCalledWith(0);
+  });
+
+  it('a second signal while closing warns and forces exit(1)', async () => {
+    const exit = vi.fn();
+    const warn = vi.fn();
+    const shutdown = createShutdown({
+      app: { close: () => new Promise(() => {}) },
+      closeDatabase: async () => {},
+      timeoutMs: 60_000,
+      log: { info: vi.fn(), warn },
+      exit,
+    });
+    void shutdown('SIGTERM');
+    await shutdown('SIGINT');
+    expect(warn).toHaveBeenCalled();
+    expect(exit).toHaveBeenCalledTimes(1);
+    expect(exit).toHaveBeenCalledWith(1);
+  });
+
+  it('exits 1 even when closing the database never resolves', async () => {
+    const exit = vi.fn();
+    await createShutdown({
+      app: { close: async () => {} },
+      closeDatabase: () => new Promise(() => {}),
+      timeoutMs: 1000,
+      dbCloseTimeoutMs: 20,
+      exit,
+    })('SIGTERM');
+    expect(exit).toHaveBeenCalledTimes(1);
+    expect(exit).toHaveBeenCalledWith(1);
   });
 
   it('forces connections closed after the timeout, still closes the database and exits 1', async () => {
