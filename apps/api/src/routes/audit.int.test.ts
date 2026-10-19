@@ -20,7 +20,6 @@ const ENV = {
   DATABASE_URL: 'pglite:memory',
   SESSION_SECRET: 'integration-test-secret-7Hq2Lm9Xc4Vb8Nz1Kp5Rt3Wy6',
   BOOTSTRAP_ADMIN_EMAIL: ADMIN.email,
-  BOOTSTRAP_ADMIN_PASSWORD: ADMIN.password,
   BOOTSTRAP_ADMIN_ROLES: 'ADMIN',
   LOG_LEVEL: 'silent',
 };
@@ -46,9 +45,12 @@ async function setup(): Promise<Harness> {
   await database.migrate();
   const app = await buildApp({ config, database, logger: false });
   open.push({ app, database });
-  await app.services.users.bootstrapAdmin(config.bootstrapAdmin);
-  const admin = await app.services.users.findByEmail(ADMIN.email);
-  if (admin) await app.services.users.setPassword(admin.id, ADMIN.password, false);
+  await app.services.users.create({
+    email: ADMIN.email,
+    name: config.bootstrapAdmin.name,
+    password: ADMIN.password,
+    roles: config.bootstrapAdmin.roles,
+  });
 
   const call = (cookie: string | null, opts: InjectOptions) =>
     app.inject({
@@ -102,11 +104,15 @@ describe('GET /api/audit', () => {
     expect(denied.json().error.details).toMatchObject({ permission: 'AUDIT.READ' });
 
     // A role holding only AUDIT.READ is enough: no role name or admin check is involved.
-    await h.app.services.authz.createRole({
-      key: 'AUDITOR',
-      name: 'Auditor',
-      permissions: ['AUDIT.READ'],
-    });
+    const adminUser = await h.app.services.users.findByEmail(ADMIN.email);
+    await h.app.services.authz.createRole(
+      {
+        key: 'AUDITOR',
+        name: 'Auditor',
+        permissions: ['AUDIT.READ'],
+      },
+      adminUser!.id,
+    );
     await h.app.services.users.create({
       email: 'auditor@example.com',
       name: 'Auditor',
