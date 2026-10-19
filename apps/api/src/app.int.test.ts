@@ -218,6 +218,32 @@ describe('authentication', () => {
     expect(codeOf(unknown)).toBe('INVALID_CREDENTIALS');
   });
 
+  it('refuses non-local accounts like a wrong password and never counts failures', async () => {
+    const h = await setup({ LOGIN_MAX_ATTEMPTS: '2' });
+    const u = await h.app.services.users.create({
+      email: 'oidc@example.com',
+      name: 'Oidc',
+      password: PASSWORD,
+      roles: [],
+    });
+    await h.database.db.execute(
+      `UPDATE users SET identity_provider = 'oidc' WHERE id = '${u.id}'` as never,
+    );
+    const attempt = (email: string, password: string) =>
+      h.call(null, { method: 'POST', url: '/api/auth/login', payload: { email, password } });
+    const wrong = await attempt(ADMIN.email, 'wrong-password');
+    for (let i = 0; i < 4; i++) {
+      const res = await attempt('oidc@example.com', PASSWORD);
+      expect(res.statusCode).toBe(wrong.statusCode);
+      expect(res.json().error.code).toBe(wrong.json().error.code);
+      expect(res.json().error.message).toBe(wrong.json().error.message);
+      expect(res.headers['set-cookie']).toBeUndefined();
+    }
+    const after = await h.app.services.users.findById(u.id);
+    expect(after?.failedLogins).toBe(0);
+    expect(after?.lockedUntil).toBeNull();
+  });
+
   it('rate limits login attempts per IP', async () => {
     const h = await setup({ LOGIN_MAX_ATTEMPTS: '100' });
     const codes: number[] = [];

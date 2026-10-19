@@ -1,7 +1,27 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { UserRow } from '@dbx/database';
+import * as crypto from '../security/crypto';
 import { hashPassword } from '../security/crypto';
-import { createLocalProvider } from './identity';
+import { checkLocalPassword, createLocalProvider } from './identity';
+
+vi.mock('../security/crypto', async (orig) => {
+  const actual = await orig<typeof crypto>();
+  return { ...actual, verifyDummy: vi.fn(actual.verifyDummy) };
+});
+
+describe('checkLocalPassword', () => {
+  it('burns a dummy verification for non-local accounts (no timing side channel)', async () => {
+    const passwordHash = await hashPassword('Correct-Horse-9!');
+    const user = { id: 'u3', passwordHash, identityProvider: 'oidc' } as UserRow;
+    vi.mocked(crypto.verifyDummy).mockClear();
+    expect(await checkLocalPassword(user, 'Correct-Horse-9!')).toBe(false);
+    expect(crypto.verifyDummy).toHaveBeenCalledWith('Correct-Horse-9!');
+    vi.mocked(crypto.verifyDummy).mockClear();
+    const local = { ...user, identityProvider: 'local' } as UserRow;
+    expect(await checkLocalPassword(local, 'Correct-Horse-9!')).toBe(true);
+    expect(crypto.verifyDummy).not.toHaveBeenCalled();
+  });
+});
 
 describe('local identity provider', () => {
   it('local provider authenticates via existing path', async () => {

@@ -1,5 +1,5 @@
 import type { UserRow } from '@dbx/database';
-import { verifyPassword } from '../security/crypto';
+import { verifyDummy, verifyPassword } from '../security/crypto';
 import type { UsersService } from './users';
 
 /**
@@ -23,8 +23,12 @@ function isLocalCredentials(input: unknown): input is LocalCredentials {
 }
 
 /** The existing password check (Argon2id). Only accounts owned by the local provider qualify. */
-export function checkLocalPassword(user: UserRow, password: string): Promise<boolean> {
-  if (user.identityProvider !== 'local') return Promise.resolve(false);
+export async function checkLocalPassword(user: UserRow, password: string): Promise<boolean> {
+  if (user.identityProvider !== 'local') {
+    // Same cost as a real verification, so an external account cannot be told apart by timing.
+    await verifyDummy(password);
+    return false;
+  }
   return verifyPassword(user.passwordHash, password);
 }
 

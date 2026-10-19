@@ -84,6 +84,8 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       }
       const ok = await checkLocalPassword(user, body.password);
       if (!ok) {
+        // Non-local accounts are never authenticated here, so failures must not lock them.
+        if (user.identityProvider !== 'local') return fail('INVALID_CREDENTIALS', 'bad_password');
         const { locked } = await users.recordLoginFailure(
           user.id,
           config.session.loginMaxAttempts,
