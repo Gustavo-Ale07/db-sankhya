@@ -52,6 +52,15 @@ anonymous users.
   absolute expiry (`SESSION_HOURS`). Deactivating a user revokes their sessions; role and
   group changes apply on the user's next request, because permissions are resolved per request.
 
+## Identity providers (OIDC readiness)
+
+- `users.identity_provider` (default `'local'`) records which provider owns an account's
+  credentials. Only `local` accounts can log in with a password; others are refused by the local path.
+- `IdentityProvider` (`apps/api/src/services/identity.ts`) is the extension point:
+  `authenticate(input)` returns a verified `{ externalId, email }` or `null`. The built-in local
+  provider wraps the existing Argon2id password check. No OIDC implementation exists yet; a future
+  provider must feed the same lockout, session and audit logic and must not create accounts implicitly.
+
 ## Authorization
 
 Every route checks one permission from a fixed catalog (`packages/shared/src/permissions.ts`):

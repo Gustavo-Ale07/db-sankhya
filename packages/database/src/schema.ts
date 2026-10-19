@@ -22,6 +22,8 @@ export const users = pgTable(
     email: text('email').notNull(),
     name: text('name').notNull(),
     passwordHash: text('password_hash').notNull(),
+    /** Which identity provider owns this account's credentials ('local' = password in this table). */
+    identityProvider: text('identity_provider').notNull().default('local'),
     active: boolean('active').notNull().default(true),
     failedLogins: integer('failed_logins').notNull().default(0),
     lockedUntil: timestamp('locked_until', { withTimezone: true }),

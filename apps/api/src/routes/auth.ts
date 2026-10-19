@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { AppError } from '@dbx/shared';
 import { isWeakPassword } from '../config';
 import { verifyDummy, verifyPassword } from '../security/crypto';
+import { checkLocalPassword } from '../services/identity';
 import { toPublicUser } from '../services/users';
 import { clientIp, noStore, parseBody, requireAuth } from '../http';
 
@@ -81,7 +82,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         await verifyDummy(body.password);
         return fail('ACCOUNT_LOCKED', 'locked');
       }
-      const ok = await verifyPassword(user.passwordHash, body.password);
+      const ok = await checkLocalPassword(user, body.password);
       if (!ok) {
         const { locked } = await users.recordLoginFailure(
           user.id,
