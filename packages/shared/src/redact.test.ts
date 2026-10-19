@@ -130,6 +130,58 @@ describe('jsonb-safe audit strings and keys', () => {
     expect(redact('password=abc')).toBe(`password=${REDACTED}`);
   });
 
+  it('redacts every value of a cookie header and session-like keys in free text', () => {
+    const cases: Array<[string, string[]]> = [
+      ['Cookie: JSESSIONID=abc123; mgesession=xyz', ['abc123', 'xyz']],
+      ['cookie=a=b; session=c', ['=b', '=c']],
+      ['Set-Cookie: sid=abc; Path=/', ['abc', '=/']],
+      ['Cookie: theme=dark; lang=pt', ['dark', 'pt']],
+      [
+        'sid=s1v4l&pwd=p4ss&appkey=k3y&app_key=k4y&PHPSESSID=q9',
+        ['s1v4l', 'p4ss', 'k3y', 'k4y', 'q9'],
+      ],
+      ['"session": "opaque", jsessionid=j1, mgesession=m1', ['opaque', 'j1', 'm1']],
+    ];
+    for (const [input, secrets] of cases) {
+      const out = redact(input) as string;
+      for (const secret of secrets) expect(out, input).not.toContain(secret);
+      expect(out).toContain(REDACTED);
+    }
+    // `sid` and `pwd` count only as a whole name segment.
+    expect(redact('consider=yes&inside=1')).toBe('consider=yes&inside=1');
+  });
+
+  it('redacts authorization schemes and lowercase bearer credentials', () => {
+    expect(redact('Authorization: Basic dXNlcjpwYXNz')).toBe(`Authorization: Basic ${REDACTED}`);
+    expect(redact('authorization: Bearer xyz')).toBe(`authorization: Bearer ${REDACTED}`);
+    expect(redact('Bearer abcdef')).toBe(`Bearer ${REDACTED}`);
+    expect(redact('Proxy-Authorization: Digest u=1')).not.toContain('u=1');
+    expect(redact('{"Authorization": "Basic dXNlcjpwYXNz"}')).toBe(
+      `{"Authorization": "${REDACTED}"}`,
+    );
+    expect(redact('authorization=abc123')).toBe(`authorization=${REDACTED}`);
+    // Status words stay readable after bearer and after `authorization: `.
+    expect(redact('bearer expired')).toBe('bearer expired');
+    expect(redact('authorization: missing')).toBe('authorization: missing');
+  });
+
+  it('redacts backslash-escaped JSON', () => {
+    expect(redact('{\\"password\\":\\"hunter2\\"}')).toBe(`{\\"password\\":\\"${REDACTED}\\"}`);
+    expect(redact("{\\'token\\': \\'a b\\'}")).toBe(`{\\'token\\': \\'${REDACTED}\\'}`);
+    const out = redact('body={\\"user\\":\\"a\\",\\"client_secret\\":\\"s3cr3t x\\"}') as string;
+    expect(out).not.toMatch(/s3cr3t| x\\/);
+  });
+
+  it('allows exactly one space before a kept status word and never keeps part of a curly-quoted value', () => {
+    expect(redact('password:\texpired')).toBe(`password:\t${REDACTED}`);
+    expect(redact('password:  expired')).toBe(`password:  ${REDACTED}`);
+    expect(redact('password: expired')).toBe('password: expired');
+    expect(redact('password=“fancy quoted”')).toBe(`password=“${REDACTED}”`);
+    expect(redact('password=‘fancy quoted’')).toBe(`password=‘${REDACTED}’`);
+    const open = redact('password=“fancy unterminated') as string;
+    expect(open).not.toContain('fancy');
+  });
+
   it('is idempotent on already redacted pairs', () => {
     const once = redact(`password="x y" token='z' secret=w1`) as string;
     expect(redact(once)).toBe(once);
@@ -148,6 +200,12 @@ describe('jsonb-safe audit strings and keys', () => {
       'password: '.repeat(N / 10),
       'secret='.repeat(N / 7),
       `${'p'.repeat(N)}password`,
+      'token=“'.repeat(N / 7),
+      `Cookie: a=b${'; c=d'.repeat(N / 5)}`,
+      'Authorization: '.repeat(N / 15),
+      `authorization: Basic${' '.repeat(N)}`,
+      '{\\"password\\":\\"'.repeat(N / 16),
+      `${'x_'.repeat(N / 2)}sid`,
     ];
     for (const input of inputs) {
       const start = Date.now();
@@ -388,8 +446,10 @@ describe('redact', () => {
     expect(createRedactor([])('Bearer abc.def')).toBe(`Bearer ${REDACTED}`);
   });
 
-  it('keeps ordinary prose that mentions bearer without a credential', () => {
-    expect(redact('the bearer of this note')).toBe('the bearer of this note');
+  it('keeps only status words after bearer', () => {
+    expect(redact('the bearer expired')).toBe('the bearer expired');
+    // Any other word may be a credential: ordinary prose is redacted too (fail closed).
+    expect(redact('the bearer of this note')).toBe(`the bearer ${REDACTED} this note`);
   });
 
   it('does not mutate the input and keeps non-sensitive keys', () => {
