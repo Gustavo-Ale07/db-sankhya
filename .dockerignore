@@ -1,0 +1,27 @@
+# Keep the build context small and free of secrets.
+.git
+.github
+.vscode
+.idea
+**/node_modules
+**/dist
+**/coverage
+**/*.tsbuildinfo
+test-results
+playwright-report
+blob-report
+docs/screenshots
+data
+.pglite
+logs
+*.log
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials
+credentials.*
+secrets

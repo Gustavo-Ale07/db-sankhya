@@ -1,0 +1,16 @@
+{
+  "name": "@dbx/sql-engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@dbx/shared": "workspace:*",
+    "node-sql-parser": "5.4.0"
+  }
+}

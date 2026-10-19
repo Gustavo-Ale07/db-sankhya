@@ -1,0 +1,10 @@
+# Gitleaks configuration: default rules plus a narrow allowlist for test fixtures.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Fictitious session secrets used only by the config and API integration tests"
+paths = [
+  '''^apps/api/src/config\.test\.ts$''',
+  '''^apps/api/src/app\.int\.test\.ts$''',
+]

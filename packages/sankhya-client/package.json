@@ -1,0 +1,17 @@
+{
+  "name": "@dbx/sankhya-client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./mock": "./src/mock/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@dbx/shared": "workspace:*",
+    "@electric-sql/pglite": "0.5.10"
+  }
+}

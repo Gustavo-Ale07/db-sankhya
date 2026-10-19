@@ -77,3 +77,10 @@ local-data/
 
 # Package-manager local state
 .pnp.*
+
+# Project-specific additions
+credentials.*
+blob-report/
+.vitest/
+data/
+.pglite/

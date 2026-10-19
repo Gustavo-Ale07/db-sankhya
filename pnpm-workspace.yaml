@@ -1,0 +1,15 @@
+packages:
+  - apps/*
+  - packages/*
+  - e2e
+
+allowBuilds:
+  esbuild: true
+
+minimumReleaseAgeExclude:
+  - '@vitest/coverage-v8@5.0.5'
+  - '@vitest/mocker@5.0.5'
+  - '@vitest/spy@5.0.5'
+  - vitest@5.0.5
+  - '@tanstack/react-virtual@3.14.21'
+  - '@tanstack/virtual-core@3.19.6'

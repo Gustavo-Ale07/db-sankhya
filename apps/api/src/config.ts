@@ -1,0 +1,487 @@
+import { createHash } from 'node:crypto';
+import { z } from 'zod';
+
+/** Values shipped in .env.example; production refuses to boot with them. */
+export const PLACEHOLDER_SECRETS = new Set([
+  'change-me-to-a-long-random-string-at-least-32-chars',
+  'change-me',
+  'changeme',
+  'secret',
+  'dev-session-secret-not-for-production-use-0000',
+]);
+export const PLACEHOLDER_PASSWORDS = new Set([
+  'ChangeMe!2026',
+  'change-me',
+  'changeme',
+  'admin',
+  'password',
+  'admin123',
+]);
+
+const bool = (fallback: boolean) =>
+  z
+    .enum(['true', 'false', '1', '0', 'yes', 'no', ''])
+    .optional()
+    .transform((v) =>
+      v === undefined || v === '' ? fallback : v === 'true' || v === '1' || v === 'yes',
+    );
+
+const int = (fallback: number, min: number, max: number) =>
+  z
+    .string()
+    .optional()
+    .transform((v, ctx) => {
+      if (v === undefined || v.trim() === '') return fallback;
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < min || n > max) {
+        ctx.addIssue({ code: 'custom', message: `must be an integer between ${min} and ${max}` });
+        return z.NEVER;
+      }
+      return n;
+    });
+
+const optionalText = z
+  .string()
+  .optional()
+  .transform((v) => (v === undefined || v.trim() === '' ? undefined : v.trim()));
+
+const csv = (fallback: string) =>
+  z
+    .string()
+    .optional()
+    .transform((v) =>
+      (v === undefined || v.trim() === '' ? fallback : v)
+        .split(',')
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0),
+    );
+
+export const ENVIRONMENTS = ['PRODUCTION', 'HOMOLOGATION', 'SANDBOX'] as const;
+export type Environment = (typeof ENVIRONMENTS)[number];
+
+export const DEFAULT_SANKHYA_ALLOWED_HOSTS = 'api.sankhya.com.br,api.sandbox.sankhya.com.br';
+
+/** Development-only key so local connections can be stored without setup. Production refuses it. */
+const DEV_ENCRYPTION_KEY = createHash('sha256')
+  .update('db-sankhya-development-only-encryption-key')
+  .digest();
+
+const envSchema = z.object({
+  NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  APP_ENV: z
+    .enum(['development', 'test', 'production', ''])
+    .optional()
+    .transform((v) => (v === '' ? undefined : v)),
+  HOST: z.string().default('0.0.0.0'),
+  PORT: int(3001, 1, 65535),
+  APP_URL: optionalText,
+  /** Alias of APP_URL (used when APP_URL is empty). */
+  PUBLIC_URL: optionalText,
+  /** Extra origins accepted for state-changing requests (comma-separated). APP_URL is always trusted. */
+  TRUSTED_ORIGINS: csv(''),
+  TRUST_PROXY: z.string().default('false'),
+  /** Host address compose publishes the port on (read only to catch an unsafe TRUST_PROXY). */
+  APP_BIND: optionalText,
+  DATABASE_URL: optionalText.transform((v) => v ?? 'pglite:memory'),
+  MIGRATIONS_DIR: optionalText,
+  STATIC_DIR: optionalText,
+
+  AUTH_SECRET: optionalText,
+  /** Legacy name of AUTH_SECRET. */
+  SESSION_SECRET: optionalText,
+  /** base64 of 32 random bytes: encrypts connection secrets at rest. */
+  ENCRYPTION_KEY: optionalText,
+  SESSION_HOURS: int(12, 1, 24 * 30),
+  LOGIN_MAX_ATTEMPTS: int(5, 1, 100),
+  LOGIN_LOCK_MINUTES: int(15, 1, 24 * 60),
+
+  BOOTSTRAP_ADMIN_EMAIL: optionalText,
+  BOOTSTRAP_ADMIN_PASSWORD: optionalText,
+  BOOTSTRAP_ADMIN_NAME: z.string().default('Administrador'),
+  /** Comma-separated role keys of the bootstrap administrator. */
+  BOOTSTRAP_ADMIN_ROLES: z
+    .string()
+    .default('ADMIN')
+    .transform((v) => [...new Set(v.split(',').map((s) => s.trim().toUpperCase()))].filter(Boolean))
+    .pipe(z.array(z.string().regex(/^[A-Z][A-Z0-9_]{1,39}$/, 'invalid role key')).min(1)),
+
+  SANKHYA_MODE: z
+    .enum(['mock', 'live', ''])
+    .optional()
+    .transform((v) => (v === '' ? undefined : v)),
+  DEMO_MODE: bool(false),
+  SAFE_MODE: bool(true),
+  WRITE_TO_SANKHYA: bool(false),
+  GLOBAL_WRITE_ENABLED: bool(false),
+  PLAN_TTL_SECONDS: int(300, 30, 3600),
+  SANKHYA_BASE_URL: optionalText,
+  SANKHYA_CLIENT_ID: optionalText,
+  SANKHYA_CLIENT_SECRET: optionalText,
+  SANKHYA_X_TOKEN: optionalText,
+  SANKHYA_ENVIRONMENT: z
+    .enum([...ENVIRONMENTS, ''])
+    .optional()
+    .transform((v) => (v === '' || v === undefined ? 'PRODUCTION' : v)),
+  SANKHYA_DIALECT: z
+    .enum(['oracle', 'mssql', ''])
+    .optional()
+    .transform((v) => (v === '' || v === undefined ? 'oracle' : v)),
+  SANKHYA_ALLOWED_HOSTS: csv(DEFAULT_SANKHYA_ALLOWED_HOSTS),
+  SANKHYA_TIMEOUT_MS: int(60_000, 1000, 600_000),
+  SANKHYA_RATE_PER_MINUTE: int(300, 1, 1000),
+  SANKHYA_MAX_ROWS: int(1000, 1, 100_000),
+  SCRATCH_MAX_WORKSPACES: int(20, 1, 1000),
+  SCRATCH_MAX_ROWS: int(100_000, 100, 10_000_000),
+  SCRATCH_MAX_TABLES: int(20, 1, 500),
+  SCRATCH_TTL_MINUTES: int(60, 1, 7 * 24 * 60),
+  SCRATCH_STATEMENT_TIMEOUT_MS: int(10_000, 100, 600_000),
+  MATERIALIZE_MAX_ROWS: int(5000, 1, 1_000_000),
+  CUSTOM_TABLE_PREFIXES: csv('AD_'),
+  BOOTSTRAP_TOKEN_TTL_MINUTES: int(30, 1, 24 * 60),
+
+  LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
+  APP_VERSION: optionalText,
+  GIT_COMMIT: optionalText,
+});
+
+export type Env = z.output<typeof envSchema>;
+
+/** Credentials of the connection defined by SANKHYA_* variables (never persisted). */
+export interface EnvSankhyaConnection {
+  baseUrl: string;
+  clientId: string;
+  clientSecret: string;
+  xToken: string;
+  environment: Environment;
+  dialect: 'oracle' | 'mssql';
+}
+
+export interface SankhyaConfig {
+  mode: 'mock' | 'live';
+  allowedHosts: string[];
+  timeoutMs: number;
+  ratePerMinute: number;
+  /** Rows a read returns at most (the result is flagged as truncated beyond it). */
+  maxRows: number;
+  /** Set only when every SANKHYA_* credential is present. */
+  envConnection?: EnvSankhyaConnection;
+  /**
+   * Why the env connection is unusable (missing or invalid variables). The app still starts and
+   * reports the connection as not configured instead of refusing to boot.
+   */
+  envConnectionProblems: string[];
+}
+
+export interface AppConfig {
+  env: Env['NODE_ENV'];
+  isProduction: boolean;
+  host: string;
+  port: number;
+  appUrl: string;
+  appOrigin: string;
+  /** Origins accepted for state-changing requests: APP_URL's plus TRUSTED_ORIGINS. */
+  trustedOrigins: string[];
+  /** 32-byte key for secrets at rest. */
+  encryptionKey: Buffer;
+  safeMode: boolean;
+  writeToSankhya: boolean;
+  globalWriteEnabled: boolean;
+  demoMode: boolean;
+  planTtlSeconds: number;
+  sankhya: SankhyaConfig;
+  scratch: {
+    maxWorkspaces: number;
+    maxRows: number;
+    maxTables: number;
+    ttlMinutes: number;
+    statementTimeoutMs: number;
+  };
+  materializeMaxRows: number;
+  customTablePrefixes: string[];
+  bootstrapTokenTtlMinutes: number;
+  trustProxy: boolean | string;
+  databaseUrl: string;
+  migrationsDir?: string;
+  staticDir?: string;
+  session: {
+    secret: string;
+    hours: number;
+    cookieName: string;
+    secureCookie: boolean;
+    loginMaxAttempts: number;
+    loginLockMinutes: number;
+  };
+  bootstrapAdmin?: { email: string; password: string; name: string; roles: string[] };
+  logLevel: Env['LOG_LEVEL'];
+  version: string;
+  commit: string;
+}
+
+export class ConfigError extends Error {
+  constructor(readonly problems: string[]) {
+    super(`Invalid configuration:\n - ${problems.join('\n - ')}`);
+    this.name = 'ConfigError';
+  }
+}
+
+function isLoopback(host: string): boolean {
+  const h = host.trim().replace(/^\[|\]$/g, '');
+  return h === 'localhost' || h === '::1' || h.startsWith('127.');
+}
+
+function parseTrustProxy(value: string): boolean | string {
+  const v = value.trim();
+  if (v === '' || v === 'false' || v === '0') return false;
+  if (v === 'true') return true;
+  // Comma-separated trusted addresses, CIDRs or proxy-addr names (loopback, uniquelocal, …).
+  // A hop count is rejected in loadConfig: Fastify ignores it and every client would get the proxy IP.
+  return v;
+}
+
+/** Rough strength check: length plus character variety, so "aaaa…" or a word list fails. */
+export function isWeakSecret(secret: string): boolean {
+  if (secret.length < 32) return true;
+  if (PLACEHOLDER_SECRETS.has(secret)) return true;
+  if (/change[-_ ]?me/i.test(secret)) return true;
+  return new Set(secret).size < 12;
+}
+
+export function isWeakPassword(password: string): boolean {
+  if (password.length < 12) return true;
+  if (PLACEHOLDER_PASSWORDS.has(password)) return true;
+  const classes = [/[a-z]/, /[A-Z]/, /\d/, /[^A-Za-z0-9]/].filter((r) => r.test(password)).length;
+  return classes < 3;
+}
+
+export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
+  const parsed = envSchema.safeParse(source);
+  if (!parsed.success) {
+    throw new ConfigError(parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`));
+  }
+  const e = parsed.data;
+  const problems: string[] = [];
+  const isProduction = e.NODE_ENV === 'production' || e.APP_ENV === 'production';
+  const rawAppUrl = e.APP_URL ?? e.PUBLIC_URL ?? 'http://localhost:5173';
+  const appUrl = parseUrl(rawAppUrl);
+  if (!appUrl) throw new ConfigError(['APP_URL must be an absolute http(s) URL']);
+  const trustedOrigins = [appUrl.origin];
+  for (const value of e.TRUSTED_ORIGINS) {
+    const u = parseUrl(value);
+    if (!u || u.origin !== value.replace(/\/+$/, '')) {
+      problems.push(
+        'TRUSTED_ORIGINS must be a comma-separated list of origins (scheme://host[:port])',
+      );
+      break;
+    }
+    if (isProduction && u.protocol !== 'https:')
+      problems.push('TRUSTED_ORIGINS must use https:// in production');
+    if (!trustedOrigins.includes(u.origin)) trustedOrigins.push(u.origin);
+  }
+  const authSecret =
+    e.AUTH_SECRET ?? e.SESSION_SECRET ?? 'dev-session-secret-not-for-production-use-0000';
+  const encryptionKey = decodeKey(e.ENCRYPTION_KEY);
+  const sankhyaMode = e.DEMO_MODE
+    ? 'mock'
+    : (e.SANKHYA_MODE ?? (isProduction ? undefined : 'mock'));
+  if (!sankhyaMode) problems.push('SANKHYA_MODE (live or mock) is required in production');
+  if (isProduction && sankhyaMode === 'mock' && !e.DEMO_MODE)
+    problems.push('SANKHYA_MODE=mock is only allowed in production together with DEMO_MODE=true');
+  if (isProduction) {
+    if (!e.ENCRYPTION_KEY) problems.push('ENCRYPTION_KEY is required in production');
+    else if (!encryptionKey || isWeakKey(encryptionKey))
+      problems.push(
+        'ENCRYPTION_KEY must be base64 of 32 random bytes (generate with: openssl rand -base64 32)',
+      );
+  } else if (e.ENCRYPTION_KEY && !encryptionKey) {
+    problems.push('ENCRYPTION_KEY must be base64 of 32 bytes');
+  }
+  const envConnection = readEnvConnection(e);
+  const trust = parseTrustProxy(e.TRUST_PROXY);
+  if (typeof trust === 'string' && /^\d+$/.test(trust)) {
+    problems.push(
+      'TRUST_PROXY hop counts are not supported (every client would get the proxy IP): use loopback,uniquelocal behind a local reverse proxy, or the proxy addresses',
+    );
+  }
+
+  if (isProduction) {
+    if (!(e.AUTH_SECRET ?? e.SESSION_SECRET) || isWeakSecret(authSecret)) {
+      problems.push(
+        'AUTH_SECRET (legacy name SESSION_SECRET) is missing, a placeholder or too weak (use at least 32 random characters)',
+      );
+    }
+    if (e.DATABASE_URL.startsWith('pglite:'))
+      problems.push('DATABASE_URL must point to PostgreSQL in production');
+    if (/change-?me/i.test(e.DATABASE_URL))
+      problems.push('DATABASE_URL still contains the placeholder database password');
+    if (appUrl.protocol !== 'https:' && !['localhost', '127.0.0.1'].includes(appUrl.hostname)) {
+      problems.push('APP_URL must use https:// in production');
+    }
+    if (e.BOOTSTRAP_ADMIN_PASSWORD && isWeakPassword(e.BOOTSTRAP_ADMIN_PASSWORD)) {
+      problems.push(
+        'BOOTSTRAP_ADMIN_PASSWORD is a placeholder or too weak (12+ characters mixing upper, lower, digits, symbols)',
+      );
+    }
+    if (e.LOG_LEVEL === 'trace' || e.LOG_LEVEL === 'debug')
+      problems.push('LOG_LEVEL debug/trace is not allowed in production');
+    // Published directly, clients reach the app through Docker's NAT with a private source address,
+    // so trusting everything or the private ranges would let them spoof X-Forwarded-For.
+    if (
+      e.APP_BIND &&
+      !isLoopback(e.APP_BIND) &&
+      (trust === true || (typeof trust === 'string' && /uniquelocal/i.test(trust)))
+    )
+      problems.push(
+        'TRUST_PROXY must be false or a list of proxy addresses when APP_BIND exposes the app directly (clients could spoof their IP)',
+      );
+  }
+
+  if (e.BOOTSTRAP_ADMIN_EMAIL && !z.email().safeParse(e.BOOTSTRAP_ADMIN_EMAIL).success) {
+    problems.push('BOOTSTRAP_ADMIN_EMAIL is not a valid e-mail');
+  }
+  if (Boolean(e.BOOTSTRAP_ADMIN_EMAIL) !== Boolean(e.BOOTSTRAP_ADMIN_PASSWORD)) {
+    problems.push('BOOTSTRAP_ADMIN_EMAIL and BOOTSTRAP_ADMIN_PASSWORD must be set together');
+  }
+  if (problems.length > 0) throw new ConfigError(problems);
+
+  return {
+    env: e.NODE_ENV,
+    isProduction,
+    host: e.HOST,
+    port: e.PORT,
+    appUrl: appUrl.toString().replace(/\/+$/, ''),
+    appOrigin: appUrl.origin,
+    trustedOrigins,
+    encryptionKey: encryptionKey ?? DEV_ENCRYPTION_KEY,
+    safeMode: e.SAFE_MODE,
+    writeToSankhya: e.WRITE_TO_SANKHYA,
+    globalWriteEnabled: e.GLOBAL_WRITE_ENABLED,
+    demoMode: e.DEMO_MODE,
+    planTtlSeconds: e.PLAN_TTL_SECONDS,
+    sankhya: {
+      mode: sankhyaMode ?? 'live',
+      allowedHosts: e.SANKHYA_ALLOWED_HOSTS.map((h) => h.toLowerCase()),
+      timeoutMs: e.SANKHYA_TIMEOUT_MS,
+      ratePerMinute: e.SANKHYA_RATE_PER_MINUTE,
+      maxRows: e.SANKHYA_MAX_ROWS,
+      ...(envConnection.connection ? { envConnection: envConnection.connection } : {}),
+      envConnectionProblems: envConnection.problems,
+    },
+    scratch: {
+      maxWorkspaces: e.SCRATCH_MAX_WORKSPACES,
+      maxRows: e.SCRATCH_MAX_ROWS,
+      maxTables: e.SCRATCH_MAX_TABLES,
+      ttlMinutes: e.SCRATCH_TTL_MINUTES,
+      statementTimeoutMs: e.SCRATCH_STATEMENT_TIMEOUT_MS,
+    },
+    materializeMaxRows: e.MATERIALIZE_MAX_ROWS,
+    customTablePrefixes: e.CUSTOM_TABLE_PREFIXES.map((p) => p.toUpperCase()),
+    bootstrapTokenTtlMinutes: e.BOOTSTRAP_TOKEN_TTL_MINUTES,
+    trustProxy: trust,
+    databaseUrl: e.DATABASE_URL,
+    ...(e.MIGRATIONS_DIR ? { migrationsDir: e.MIGRATIONS_DIR } : {}),
+    ...(e.STATIC_DIR ? { staticDir: e.STATIC_DIR } : {}),
+    session: {
+      secret: authSecret,
+      hours: e.SESSION_HOURS,
+      // __Host- prefix forces Secure, Path=/ and no Domain in browsers.
+      cookieName: isProduction ? '__Host-dbx_session' : 'dbx_session',
+      secureCookie: isProduction,
+      loginMaxAttempts: e.LOGIN_MAX_ATTEMPTS,
+      loginLockMinutes: e.LOGIN_LOCK_MINUTES,
+    },
+    ...(e.BOOTSTRAP_ADMIN_EMAIL && e.BOOTSTRAP_ADMIN_PASSWORD
+      ? {
+          bootstrapAdmin: {
+            email: e.BOOTSTRAP_ADMIN_EMAIL.toLowerCase(),
+            password: e.BOOTSTRAP_ADMIN_PASSWORD,
+            name: e.BOOTSTRAP_ADMIN_NAME,
+            roles: e.BOOTSTRAP_ADMIN_ROLES,
+          },
+        }
+      : {}),
+    logLevel: e.LOG_LEVEL,
+    version: e.APP_VERSION ?? process.env.npm_package_version ?? '0.1.0',
+    commit: e.GIT_COMMIT ?? 'dev',
+  };
+}
+
+/** Every configured secret value, for value-based redaction in logs and traces. */
+export function secretValues(config: AppConfig): string[] {
+  const env = config.sankhya.envConnection;
+  return [
+    config.session.secret,
+    config.encryptionKey.toString('base64'),
+    env?.clientId,
+    env?.clientSecret,
+    env?.xToken,
+    config.bootstrapAdmin?.password,
+  ].filter((v): v is string => typeof v === 'string' && v.length > 0);
+}
+
+/** Masks a secret for display: never more than the last 4 characters. */
+export function maskSecret(secret: string | undefined): string {
+  if (!secret) return '(not set)';
+  return secret.length <= 8 ? '****' : `****${secret.slice(-4)}`;
+}
+
+function parseUrl(value: string): URL | undefined {
+  try {
+    const u = new URL(value);
+    return u.protocol === 'https:' || u.protocol === 'http:' ? u : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function decodeKey(value: string | undefined): Buffer | undefined {
+  if (!value || !/^[A-Za-z0-9+/_-]+={0,2}$/.test(value)) return undefined;
+  const key = Buffer.from(value, 'base64');
+  return key.length === 32 ? key : undefined;
+}
+
+/** A key with little variety (all zeros, a repeated pattern) is a placeholder, not random. */
+function isWeakKey(key: Buffer): boolean {
+  return new Set(key).size < 16;
+}
+
+const ENV_CONNECTION_VARS = [
+  'SANKHYA_BASE_URL',
+  'SANKHYA_CLIENT_ID',
+  'SANKHYA_CLIENT_SECRET',
+  'SANKHYA_X_TOKEN',
+] as const;
+
+/**
+ * The connection defined by environment variables. Missing or invalid values never stop the app:
+ * they are reported so the UI can show the connection as not configured.
+ */
+function readEnvConnection(e: Env): { connection?: EnvSankhyaConnection; problems: string[] } {
+  const missing = ENV_CONNECTION_VARS.filter((name) => !e[name]);
+  if (missing.length === ENV_CONNECTION_VARS.length) return { problems: [] };
+  if (missing.length > 0) return { problems: missing.map((name) => `${name} is not set`) };
+  const url = parseUrl(e.SANKHYA_BASE_URL!);
+  const problems: string[] = [];
+  if (!url) problems.push('SANKHYA_BASE_URL is not a valid URL');
+  else {
+    if (url.protocol !== 'https:') problems.push('SANKHYA_BASE_URL must use https://');
+    if (url.username || url.password)
+      problems.push('SANKHYA_BASE_URL must not contain credentials');
+    if (url.pathname !== '/' || url.search || url.hash)
+      problems.push('SANKHYA_BASE_URL must be an origin only (https://host)');
+    const allowed = e.SANKHYA_ALLOWED_HOSTS.map((h) => h.toLowerCase());
+    if (!allowed.includes(url.hostname.toLowerCase()))
+      problems.push('SANKHYA_BASE_URL host is not in SANKHYA_ALLOWED_HOSTS');
+  }
+  if (problems.length > 0 || !url) return { problems };
+  return {
+    connection: {
+      baseUrl: url.origin,
+      clientId: e.SANKHYA_CLIENT_ID!,
+      clientSecret: e.SANKHYA_CLIENT_SECRET!,
+      xToken: e.SANKHYA_X_TOKEN!,
+      environment: e.SANKHYA_ENVIRONMENT,
+      dialect: e.SANKHYA_DIALECT,
+    },
+    problems: [],
+  };
+}
