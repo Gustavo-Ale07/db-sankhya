@@ -225,6 +225,36 @@ describe('toDbScriptXml', () => {
     expect(codeOf(() => toDbScriptXml(qtd({}), qtd(decimal), { version: 1 }))).toBeUndefined();
   });
 
+  it('refuses an MSSQL base-type change (INT <-> NUMERIC) under a default', () => {
+    const qtd = (f: Partial<FieldModel>): TableModel => ({
+      ...AD_EXEMPLO,
+      fields: [CODIGO, { name: 'QTD', dataType: 'INTEIRO', required: false, ...f }],
+    });
+    // Unsized INTEIRO is INT; sized is NUMERIC(n,0).
+    expect(
+      codeOf(() =>
+        toDbScriptXml(qtd({ default: '0' }), qtd({ size: 12, default: '0' }), { version: 1 }),
+      ),
+    ).toBe('SQL_UNSUPPORTED');
+    expect(
+      codeOf(() =>
+        toDbScriptXml(qtd({ size: 12, default: '0' }), qtd({ default: '0' }), { version: 1 }),
+      ),
+    ).toBe('SQL_UNSUPPORTED');
+    expect(
+      codeOf(() => toDbScriptXml(qtd({ size: 12 }), qtd({ default: '0' }), { version: 1 })),
+    ).toBe('SQL_UNSUPPORTED');
+    // Same base type (NUMERIC -> NUMERIC) with a default, or no default at all, is fine.
+    expect(
+      codeOf(() =>
+        toDbScriptXml(qtd({ size: 8, default: '0' }), qtd({ size: 12, default: '0' }), {
+          version: 1,
+        }),
+      ),
+    ).toBeUndefined();
+    expect(codeOf(() => toDbScriptXml(qtd({}), qtd({ size: 12 }), { version: 1 }))).toBeUndefined();
+  });
+
   it('refuses an MSSQL ALTER COLUMN on a primary-key column unless the key is rebuilt', () => {
     const wide: TableModel = { ...AD_EXEMPLO, fields: [{ ...CODIGO, size: 12 }, NOME] };
     const narrow: TableModel = { ...AD_EXEMPLO, fields: [CODIGO, NOME] };

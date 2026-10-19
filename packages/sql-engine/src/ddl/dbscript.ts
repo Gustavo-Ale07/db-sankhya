@@ -166,6 +166,11 @@ function mssqlDropDefault(table: string, field: string): string {
   );
 }
 
+/** The MSSQL type without its size part: INT, NUMERIC, DECIMAL, VARCHAR, ... */
+function mssqlBaseType(f: FieldModel): string {
+  return mssqlType(f).replace(/\(.*\)$/, '');
+}
+
 const LOB_TYPES: ReadonlySet<string> = new Set(['CAIXA_TEXTO', 'ARQUIVO']);
 
 /** Refuses column alterations that Oracle or SQL Server cannot apply in place. */
@@ -178,12 +183,20 @@ function assertAlterable(change: DdlChange, f: FieldModel, ctx: Context): void {
           'cannot MODIFY a column to or from CLOB/BLOB. Add a new field and migrate the data.',
       );
     }
-    if (before.default !== undefined || f.default !== undefined) {
-      throw unsupported(
-        `Changing the type of ${f.name} is not supported while it has a default: SQL Server ` +
-          'refuses ALTER COLUMN on a column bound to a default constraint. Remove the default first.',
-      );
-    }
+  }
+  if (
+    before &&
+    (change.kind === 'CHANGE_TYPE' ||
+      ((change.kind === 'WIDEN_SIZE' || change.kind === 'NARROW_SIZE') &&
+        mssqlBaseType(before) !== mssqlBaseType(f))) &&
+    (before.default !== undefined || f.default !== undefined)
+  ) {
+    // e.g. an unsized INTEIRO (INT) becoming sized (NUMERIC(n,0)) is a base-type change.
+    throw unsupported(
+      `Changing ${f.name} from SQL Server ${mssqlType(before)} to ${mssqlType(f)} is not ` +
+        'supported while it has a default: SQL Server refuses ALTER COLUMN to another type on a ' +
+        'column bound to a default constraint. Remove the default first.',
+    );
   }
   if (ctx.currentPrimaryKey.includes(f.name) && !ctx.dropsPrimaryKey) {
     throw unsupported(
