@@ -1,0 +1,63 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`toDbScriptXml > renders CREATE TABLE for both dialects 1`] = `
+"<?xml version="1.0" encoding="UTF-8"?>
+<scripts version="1">
+  <sql nomeTabela="AD_EXEMPLO" ordem="1" executar="SE_NAO_EXISTIR" tipoObjeto="TABELA" nomeObjeto="AD_EXEMPLO">
+    <oracle>CREATE TABLE AD_EXEMPLO (CODIGO NUMBER(10) NOT NULL, NOME VARCHAR2(40), VALOR NUMBER(10,2) DEFAULT 0, ATIVO CHAR(1) DEFAULT &apos;S&apos; NOT NULL, DTCAD DATE, OBS CLOB, ARQ BLOB, PRIMARY KEY (CODIGO))</oracle>
+    <mssql>CREATE TABLE AD_EXEMPLO (CODIGO INT NOT NULL, NOME VARCHAR(40), VALOR DECIMAL(10,2) DEFAULT 0, ATIVO CHAR(1) DEFAULT &apos;S&apos; NOT NULL, DTCAD DATETIME, OBS VARCHAR(MAX), ARQ VARBINARY(MAX), PRIMARY KEY (CODIGO))</mssql>
+  </sql>
+</scripts>
+"
+`;
+
+exports[`toDbScriptXml > renders every change kind with no ";" in any body 1`] = `
+"<?xml version="1.0" encoding="UTF-8"?>
+<scripts version="7">
+  <sql nomeTabela="AD_ANTIGA" ordem="1" executar="SE_EXISTIR" tipoObjeto="TABELA" nomeObjeto="AD_ANTIGA">
+    <oracle>ALTER TABLE AD_ANTIGA RENAME TO AD_EXEMPLO</oracle>
+    <mssql>EXEC sp_rename &apos;AD_ANTIGA&apos;, &apos;AD_EXEMPLO&apos;</mssql>
+  </sql>
+  <sql nomeTabela="AD_EXEMPLO" ordem="2" executar="SE_EXISTIR" tipoObjeto="COLUNA" nomeObjeto="VELHO">
+    <oracle>ALTER TABLE AD_EXEMPLO RENAME COLUMN VELHO TO NOVO</oracle>
+    <mssql>EXEC sp_rename &apos;AD_EXEMPLO.VELHO&apos;, &apos;NOVO&apos;, &apos;COLUMN&apos;</mssql>
+  </sql>
+  <sql nomeTabela="AD_EXEMPLO" ordem="3" executar="SEMPRE" tipoObjeto="CONSTRAINT" nomeObjeto="AD_EXEMPLO">
+    <oracle>ALTER TABLE AD_EXEMPLO DROP PRIMARY KEY</oracle>
+    <mssql>DECLARE @pk SYSNAME SELECT @pk = name FROM sys.key_constraints WHERE parent_object_id = OBJECT_ID(&apos;AD_EXEMPLO&apos;) AND type = &apos;PK&apos; IF @pk IS NOT NULL EXEC(&apos;ALTER TABLE AD_EXEMPLO DROP CONSTRAINT &apos; + QUOTENAME(@pk))</mssql>
+  </sql>
+  <sql nomeTabela="AD_EXEMPLO" ordem="4" executar="SE_EXISTIR" tipoObjeto="COLUNA" nomeObjeto="REMOVER">
+    <oracle>ALTER TABLE AD_EXEMPLO DROP COLUMN REMOVER</oracle>
+    <mssql>ALTER TABLE AD_EXEMPLO DROP COLUMN REMOVER</mssql>
+  </sql>
+  <sql nomeTabela="AD_EXEMPLO" ordem="5" executar="SE_NAO_EXISTIR" tipoObjeto="COLUNA" nomeObjeto="EXTRA">
+    <oracle>ALTER TABLE AD_EXEMPLO ADD (EXTRA VARCHAR2(5) DEFAULT &apos;N&apos; NOT NULL)</oracle>
+    <mssql>ALTER TABLE AD_EXEMPLO ADD EXTRA VARCHAR(5) DEFAULT &apos;N&apos; NOT NULL</mssql>
+  </sql>
+  <sql nomeTabela="AD_EXEMPLO" ordem="6" executar="SE_EXISTIR" tipoObjeto="COLUNA" nomeObjeto="NOME">
+    <oracle>ALTER TABLE AD_EXEMPLO MODIFY (NOME VARCHAR2(60))</oracle>
+    <mssql>ALTER TABLE AD_EXEMPLO ALTER COLUMN NOME VARCHAR(60) NOT NULL</mssql>
+  </sql>
+  <sql nomeTabela="AD_EXEMPLO" ordem="7" executar="SE_EXISTIR" tipoObjeto="COLUNA" nomeObjeto="QTD">
+    <oracle>ALTER TABLE AD_EXEMPLO MODIFY (QTD NUMBER(12,2))</oracle>
+    <mssql>ALTER TABLE AD_EXEMPLO ALTER COLUMN QTD DECIMAL(12,2) NULL</mssql>
+  </sql>
+  <sql nomeTabela="AD_EXEMPLO" ordem="8" executar="SE_EXISTIR" tipoObjeto="COLUNA" nomeObjeto="CURTO">
+    <oracle>ALTER TABLE AD_EXEMPLO MODIFY (CURTO VARCHAR2(20))</oracle>
+    <mssql>ALTER TABLE AD_EXEMPLO ALTER COLUMN CURTO VARCHAR(20) NULL</mssql>
+  </sql>
+  <sql nomeTabela="AD_EXEMPLO" ordem="9" executar="SE_EXISTIR" tipoObjeto="COLUNA" nomeObjeto="NOME">
+    <oracle>ALTER TABLE AD_EXEMPLO MODIFY (NOME NOT NULL)</oracle>
+    <mssql>ALTER TABLE AD_EXEMPLO ALTER COLUMN NOME VARCHAR(60) NOT NULL</mssql>
+  </sql>
+  <sql nomeTabela="AD_EXEMPLO" ordem="10" executar="SE_EXISTIR" tipoObjeto="COLUNA" nomeObjeto="NOME">
+    <oracle>ALTER TABLE AD_EXEMPLO MODIFY (NOME DEFAULT &apos;X&apos;)</oracle>
+    <mssql>DECLARE @df SYSNAME SELECT @df = dc.name FROM sys.default_constraints dc JOIN sys.columns c ON c.object_id = dc.parent_object_id AND c.column_id = dc.parent_column_id WHERE dc.parent_object_id = OBJECT_ID(&apos;AD_EXEMPLO&apos;) AND c.name = &apos;NOME&apos; IF @df IS NOT NULL EXEC(&apos;ALTER TABLE AD_EXEMPLO DROP CONSTRAINT &apos; + QUOTENAME(@df)) ALTER TABLE AD_EXEMPLO ADD DEFAULT &apos;X&apos; FOR NOME</mssql>
+  </sql>
+  <sql nomeTabela="AD_EXEMPLO" ordem="11" executar="SEMPRE" tipoObjeto="CONSTRAINT" nomeObjeto="AD_EXEMPLO">
+    <oracle>ALTER TABLE AD_EXEMPLO ADD PRIMARY KEY (CODIGO, NOME)</oracle>
+    <mssql>ALTER TABLE AD_EXEMPLO ADD PRIMARY KEY (CODIGO, NOME)</mssql>
+  </sql>
+</scripts>
+"
+`;

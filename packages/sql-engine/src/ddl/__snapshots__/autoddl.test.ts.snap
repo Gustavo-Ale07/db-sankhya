@@ -1,0 +1,18 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`toAutoDdlXml > renders AD_EXEMPLO 1`] = `
+"<?xml version="1.0" encoding="UTF-8"?>
+<table name="AD_EXEMPLO" description="Tabela de exemplo">
+  <primaryKey>
+    <field name="CODIGO"/>
+  </primaryKey>
+  <fields>
+    <field name="CODIGO" description="Código" dataType="INTEIRO" required="true"/>
+    <field name="NOME" description="Nome" dataType="TEXTO" size="40" required="true"/>
+    <field name="VALOR" description="VALOR" dataType="DECIMAL" size="10" scale="2" required="false" default="0"/>
+    <field name="ATIVO" description="ATIVO" dataType="CHECKBOX" required="true" default="S"/>
+    <field name="DTCAD" description="DTCAD" dataType="DATA" required="false"/>
+  </fields>
+</table>
+"
+`;
