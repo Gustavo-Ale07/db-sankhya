@@ -1,12 +1,24 @@
 import { and, asc, eq, gt, isNull, ne, sql } from 'drizzle-orm';
 import { approvals, groupMembers, groups, plans, users } from '@dbx/database';
 import type { ApprovalRow, Database, PlanRow } from '@dbx/database';
-import { AppError, isPermission } from '@dbx/shared';
-import type { Environment, Permission } from '@dbx/shared';
+import {
+  AppError,
+  evaluatePolicy,
+  isAppError,
+  isPermission,
+  statementPermission,
+} from '@dbx/shared';
+import type {
+  EffectiveLimits,
+  Environment,
+  Permission,
+  PolicyDecision,
+  PolicyRequest,
+} from '@dbx/shared';
 import { classifyStatement } from '@dbx/sql-engine';
 import type { AuthzService } from './authz';
 import type { ConsumePlanInput, ConsumedPlan, PlansService } from './plans';
-import type { PolicyService } from './policy';
+import type { PolicyService, PolicySnapshot } from './policy';
 import { AuditService } from './records';
 
 export type { ApprovalRow };
@@ -19,14 +31,21 @@ export interface ApprovalAuditContext {
   requestId?: string;
 }
 
-/** A pending approval with what the decider needs to judge the plan. */
+/**
+ * A pending approval with what the decider needs to judge the plan. `sql` and `preview` are
+ * present only when the decider may also read every entity of the plan (QUERY.SELECT plus a
+ * policy that does not deny the read); otherwise only the summary is returned.
+ */
 export interface PendingApproval extends ApprovalRow {
   plan: {
     environment: string;
     connectionId: string;
-    sql: string;
     previewKind: string;
-    preview: unknown;
+    action: Permission;
+    entities: string[];
+    targetCount: number | null;
+    sql?: string;
+    preview?: unknown;
   };
 }
 
@@ -39,10 +58,39 @@ export interface ApprovalsDeps {
 }
 
 type Tx = Parameters<Parameters<Database['transaction']>[0]>[0];
+type Db = Database | Tx;
+
+/** What a plan does, re-derived from its stored SQL and checked against its capability. */
+interface PlanScope {
+  /** Every permission the capability needs (includes `primary`). */
+  actions: Permission[];
+  primary: Permission;
+  /** Target table plus the tables the statement reads. */
+  entities: string[];
+  hasWhere: boolean;
+}
+
+/** A user as the checks see them, read once per call. */
+interface Subject {
+  id: string;
+  active: boolean;
+  permissions: ReadonlySet<Permission>;
+  groupIds: string[];
+}
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_REASON = 1000;
 const PENDING_LIMIT = 200;
+const BOOLEAN_GATES = [
+  'requireWhere',
+  'requirePreview',
+  'requireConfirmation',
+  'requireStrongConfirmation',
+  'requireApproval',
+] as const satisfies ReadonlyArray<keyof EffectiveLimits>;
+const NUMERIC_GATES = ['maxReadRows', 'maxWriteRows'] as const satisfies ReadonlyArray<
+  keyof EffectiveLimits
+>;
 
 const notFound = () => new AppError('NOT_FOUND', 'Approval not found');
 const planNotFound = () => new AppError('NOT_FOUND', 'Plan not found');
@@ -54,20 +102,106 @@ const forbidden = (message: string, reason: string) =>
   new AppError('FORBIDDEN', message, { reason });
 
 /**
+ * Re-derives the plan's scope from its SQL. Fails closed (undefined) for anything that is not an
+ * INSERT/UPDATE/DELETE, for generated DDL artifacts, and whenever the classified kind does not
+ * match the frozen capability actions.
+ */
+function scopeOf(plan: PlanRow): PlanScope | undefined {
+  const cap = plan.capability as {
+    class?: unknown;
+    route?: unknown;
+    action?: unknown;
+    actions?: unknown;
+    blocked?: unknown;
+  } | null;
+  if (typeof cap !== 'object' || cap === null || cap.blocked) return undefined;
+  if (cap.class !== 'SUPPORTED' && cap.class !== 'SCRATCH_ONLY') return undefined;
+  if (cap.route !== 'SANKHYA_SAVE' && cap.route !== 'SCRATCH' && cap.route !== 'HYBRID')
+    return undefined;
+  const actions = cap.actions;
+  if (
+    !Array.isArray(actions) ||
+    actions.length === 0 ||
+    !actions.every((a): a is Permission => typeof a === 'string' && isPermission(a))
+  )
+    return undefined;
+  const classified = classifyStatement(plan.sql);
+  if (classified.kind !== 'INSERT' && classified.kind !== 'UPDATE' && classified.kind !== 'DELETE')
+    return undefined;
+  const primary: Permission =
+    cap.route === 'SANKHYA_SAVE' ? statementPermission(classified.kind) : 'TEMP.WRITE';
+  const allowed: Permission[] =
+    cap.route === 'SANKHYA_SAVE' ? [primary] : [primary, 'TEMP.MATERIALIZE', 'QUERY.SELECT'];
+  if (cap.action !== primary || !actions.includes(primary)) return undefined;
+  if (!actions.every((a) => allowed.includes(a))) return undefined;
+  return {
+    actions: [...new Set(actions)],
+    primary,
+    entities: [...new Set([classified.table, ...classified.sourceTables])],
+    hasWhere: classified.hasWhere,
+  };
+}
+
+/**
+ * `evaluatePolicy` over a freshly loaded rule set, failing closed like `PolicyService.evaluate`:
+ * no snapshot, an invalid enabled rule or a throw all deny. Returns the decision only on ALLOW.
+ */
+function allowedBy(
+  snapshot: PolicySnapshot | undefined,
+  req: PolicyRequest,
+  permissions: ReadonlySet<Permission>,
+): PolicyDecision | undefined {
+  if (!snapshot || snapshot.invalid.length > 0) return undefined;
+  try {
+    const decision = evaluatePolicy(req, snapshot.rules, new Set(permissions), {
+      policyVersion: snapshot.version,
+    });
+    return decision.effect === 'ALLOW' ? decision : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * True when the frozen gates are at least as strict as the current ones: every gate the current
+ * policy turns on is on in the plan, and no frozen row ceiling exceeds the current one.
+ */
+function gatesHold(fresh: EffectiveLimits, plan: PlanRow): boolean {
+  const frozen = (plan.decision as { limits?: Record<string, unknown> } | null)?.limits;
+  if (typeof frozen !== 'object' || frozen === null) return false;
+  for (const gate of BOOLEAN_GATES) {
+    if (typeof frozen[gate] !== 'boolean') return false;
+    if (fresh[gate] && frozen[gate] !== true) return false;
+  }
+  for (const gate of NUMERIC_GATES) {
+    const value = frozen[gate];
+    if (typeof value !== 'number' || value > fresh[gate]) return false;
+  }
+  if (fresh.requireStrongConfirmation && plan.strongConfirmationPhrase === null) return false;
+  if (Array.isArray(plan.targets) && plan.targets.length > fresh.maxWriteRows) return false;
+  return true;
+}
+
+/**
  * Four-eyes approvals bound to the plan hash (Task 14.1).
  *
- * - `request`: the plan owner asks for approval of a live plan that requires one. The approval
- *   copies `plan_hash` and the plan's `expires_at`, so it expires together with the plan.
- * - `decide`: the decider needs APPROVAL.DECIDE, a policy ALLOW for the plan's actions and
- *   entities, and must not be the requester. The approval row and the plan move in one
- *   transaction through conditional UPDATEs (decision still empty, hash equal, not expired), so of
- *   two racing deciders exactly one wins; the other gets CONFLICT. APPROVE moves the plan to
- *   APPROVED; REJECT moves it to INVALIDATED, so it can never be consumed.
+ * - `request`: the plan owner asks for approval of a live plan that requires one and whose SQL
+ *   classifies as a write matching its capability. The approval copies `plan_hash` and the plan's
+ *   `expires_at`, so it expires together with the plan.
+ * - `decide`: inside one transaction (approval row locked), the decider must not be the
+ *   requester, must be active, hold APPROVAL.DECIDE and every capability action in their own
+ *   grants, and get a policy ALLOW for each action on each entity from a freshly loaded rule set.
+ *   The approval row and then the plan move through conditional UPDATEs (decision still empty,
+ *   hash equal, not expired), so of two racing deciders exactly one wins; the other gets
+ *   CONFLICT. APPROVE moves the plan to APPROVED (which `PlansService` also ties to this row);
+ *   REJECT moves it to INVALIDATED, so it can never be consumed. Every outcome is audited.
  * - `consumeApproved` is the execution boundary for plans that require approval. Until the
  *   execution orchestrator (Task 11.2) exists, "execute" means a successful `PlansService.consume`.
- *   It maps a rejected or still pending approval to FORBIDDEN, and an approval of another plan or
- *   whose hash no longer equals the plan's to CONFIRMATION_INVALID. Everything else (invalidated,
- *   expired, used plan) is reported by `PlansService.consume` as usual.
+ *   A rejected or still pending approval gives FORBIDDEN; so does a requester who is no longer
+ *   active, lost a capability permission, or whose current policy denies the plan or demands
+ *   stricter gates than the frozen ones (audited). An approval of another plan, or whose hash no
+ *   longer equals the plan's, gives CONFIRMATION_INVALID. Everything else (invalidated, expired,
+ *   used plan) is reported by `PlansService.consume` as usual.
  */
 export class ApprovalsService {
   constructor(
@@ -91,6 +225,8 @@ export class ApprovalsService {
     const { plan } = current;
     if (!plan.requiresApproval)
       throw new AppError('VALIDATION_ERROR', 'This plan does not require approval.');
+    if (!scopeOf(plan))
+      throw new AppError('VALIDATION_ERROR', 'This plan cannot be submitted for approval.');
     if (plan.status === 'EXPIRED' || (plan.status === 'PENDING' && current.expired))
       throw expired();
     if (plan.status !== 'PENDING') throw invalid();
@@ -132,11 +268,11 @@ export class ApprovalsService {
   }
 
   /**
-   * Records the decision, or throws: NOT_FOUND, VALIDATION_ERROR, FORBIDDEN (self-approval, no
-   * APPROVAL.DECIDE, no policy ALLOW), CONFLICT (already decided), CONFIRMATION_EXPIRED or
-   * CONFIRMATION_INVALID (plan no longer live, or its hash differs). Each decision writes an
-   * audit row in the same transaction; a refused attempt by an authorised-looking decider is
-   * audited as `denied`.
+   * Records the decision, or throws: NOT_FOUND, VALIDATION_ERROR, FORBIDDEN (self-approval,
+   * inactive, missing permission, no policy ALLOW), CONFLICT (already decided),
+   * CONFIRMATION_EXPIRED or CONFIRMATION_INVALID (plan no longer live, or its hash differs).
+   * The success audit row is written in the transaction; any refusal other than VALIDATION_ERROR
+   * is audited as `denied` (with its error code) after the transaction rolled back.
    */
   async decide(
     approvalId: string,
@@ -152,25 +288,60 @@ export class ApprovalsService {
       (typeof reason !== 'string' || reason.length > MAX_REASON || reason.includes('\u0000'))
     )
       throw new AppError('VALIDATION_ERROR', `reason must be at most ${MAX_REASON} characters`);
-    if (typeof approvalId !== 'string' || !UUID.test(approvalId)) throw notFound();
-    if (typeof deciderId !== 'string' || !UUID.test(deciderId)) throw notFound();
-
-    const [current] = await this.db
-      .select({ approval: approvals, plan: plans })
-      .from(approvals)
-      .innerJoin(plans, eq(plans.id, approvals.planId))
-      .where(eq(approvals.id, approvalId))
-      .limit(1);
-    if (!current) throw notFound();
-    const { approval, plan } = current;
-    const details = { approvalId, planId: plan.id, planHash: approval.planHash, decision };
-
+    const details: Record<string, unknown> = { approvalId, decision };
     try {
-      await this.assertMayDecide(deciderId, approval, plan);
-    } catch (err) {
-      if (err instanceof AppError && err.code === 'FORBIDDEN') {
-        await this.audit(this.db).record({
+      if (typeof approvalId !== 'string' || !UUID.test(approvalId)) throw notFound();
+      if (typeof deciderId !== 'string' || !UUID.test(deciderId)) throw notFound();
+      // Read before the transaction: an embedded single-connection database cannot serve a
+      // second query while the transaction holds it.
+      const snapshot = await this.freshPolicies();
+      return await this.db.transaction(async (tx) => {
+        const [current] = await tx
+          .select({ approval: approvals, plan: plans })
+          .from(approvals)
+          .innerJoin(plans, eq(plans.id, approvals.planId))
+          .where(eq(approvals.id, approvalId))
+          .limit(1)
+          .for('update');
+        if (!current) throw notFound();
+        const { approval, plan } = current;
+        Object.assign(details, { planId: plan.id, planHash: approval.planHash });
+        if (approval.decision !== null)
+          throw new AppError('CONFLICT', 'This approval was already decided.');
+        const subject = await this.subject(deciderId, tx);
+        this.assertDecider(subject, approval, plan, snapshot);
+
+        const [decided] = await tx
+          .update(approvals)
+          .set({ decision, decidedBy: deciderId, reason, decidedAt: sql`now()` })
+          .where(
+            and(
+              eq(approvals.id, approval.id),
+              isNull(approvals.decision),
+              ne(approvals.requestedBy, deciderId),
+              eq(approvals.planHash, plan.planHash),
+              gt(approvals.expiresAt, sql`now()`),
+            ),
+          )
+          .returning();
+        if (!decided) throw await this.refusal(tx, approval.id, plan);
+        // The plan moves in the same transaction; if it is no longer a live PENDING plan with
+        // the approved hash, the whole decision is rolled back.
+        if (!(await this.deps.plans.decide(plan.id, decided.planHash, decision, tx)))
+          throw await this.planRefusal(tx, plan.id);
+        await this.audit(tx).record({
           ...this.auditBase(deciderId, context),
+          action: 'approval.decide',
+          status: 'success',
+          resource: 'plan',
+          details: { ...details, requestedBy: approval.requestedBy, reason },
+        });
+        return decided;
+      });
+    } catch (err) {
+      if (isAppError(err) && err.code !== 'VALIDATION_ERROR') {
+        await this.audit(this.db).record({
+          ...this.auditBase(UUID.test(String(deciderId)) ? deciderId : null, context),
           action: 'approval.decide',
           status: 'denied',
           resource: 'plan',
@@ -181,40 +352,14 @@ export class ApprovalsService {
       }
       throw err;
     }
-
-    return this.db.transaction(async (tx) => {
-      const [decided] = await tx
-        .update(approvals)
-        .set({ decision, decidedBy: deciderId, reason, decidedAt: sql`now()` })
-        .where(
-          and(
-            eq(approvals.id, approval.id),
-            isNull(approvals.decision),
-            ne(approvals.requestedBy, deciderId),
-            eq(approvals.planHash, plan.planHash),
-            gt(approvals.expiresAt, sql`now()`),
-          ),
-        )
-        .returning();
-      if (!decided) throw await this.refusal(tx, approval.id, plan);
-      // The plan moves in the same transaction; if it is no longer a live PENDING plan with the
-      // approved hash, the whole decision is rolled back.
-      if (!(await this.deps.plans.decide(plan.id, decided.planHash, decision, tx)))
-        throw await this.planRefusal(tx, plan.id);
-      await this.audit(tx).record({
-        ...this.auditBase(deciderId, context),
-        action: 'approval.decide',
-        status: 'success',
-        resource: 'plan',
-        details: { ...details, requestedBy: approval.requestedBy, reason },
-      });
-      return decided;
-    });
   }
 
   /** Undecided, unexpired approvals the user may decide (never their own requests). */
   async listPending(forUserId: string): Promise<PendingApproval[]> {
     if (typeof forUserId !== 'string' || !UUID.test(forUserId)) return [];
+    const subject = await this.subject(forUserId, this.db);
+    if (!subject?.active || !subject.permissions.has('APPROVAL.DECIDE')) return [];
+    const snapshot = await this.freshPolicies();
     const rows = await this.db
       .select({ approval: approvals, plan: plans })
       .from(approvals)
@@ -224,27 +369,34 @@ export class ApprovalsService {
           isNull(approvals.decision),
           gt(approvals.expiresAt, sql`now()`),
           ne(approvals.requestedBy, forUserId),
+          ne(plans.userId, forUserId),
           eq(plans.status, 'PENDING'),
+          gt(plans.expiresAt, sql`now()`),
         ),
       )
-      .orderBy(asc(approvals.createdAt), asc(approvals.id))
-      .limit(PENDING_LIMIT);
+      .orderBy(asc(approvals.createdAt), asc(approvals.id));
+    // Filter first, then limit: approvals the user cannot decide never take a slot.
     const out: PendingApproval[] = [];
     for (const { approval, plan } of rows) {
+      if (out.length >= PENDING_LIMIT) break;
       if (approval.planHash !== plan.planHash) continue;
+      let scope: PlanScope;
       try {
-        await this.assertMayDecide(forUserId, approval, plan);
+        scope = this.assertDecider(subject, approval, plan, snapshot);
       } catch {
         continue;
       }
+      const readable = this.mayRead(subject, plan, scope, snapshot);
       out.push({
         ...approval,
         plan: {
           environment: plan.environment,
           connectionId: plan.connectionId,
-          sql: plan.sql,
           previewKind: plan.previewKind,
-          preview: plan.preview,
+          action: scope.primary,
+          entities: scope.entities,
+          targetCount: Array.isArray(plan.targets) ? plan.targets.length : null,
+          ...(readable ? { sql: plan.sql, preview: plan.preview } : {}),
         },
       });
     }
@@ -253,26 +405,48 @@ export class ApprovalsService {
 
   /**
    * Execution boundary of a plan that requires approval (see the class comment). The approval
-   * must belong to this plan, be APPROVE, and carry the plan's current hash; the plan is then
-   * consumed by `PlansService.consume`, whose result is checked against the hash once more.
+   * must belong to this plan, be APPROVE, and carry the plan's current hash; the requester is
+   * re-checked against current grants and policies; the plan is then consumed by
+   * `PlansService.consume`, whose result is checked against the hash once more.
    */
   async consumeApproved(input: ConsumePlanInput & { approvalId: string }): Promise<ConsumedPlan> {
     const { approvalId, ...consume } = input;
     if (typeof approvalId !== 'string' || !UUID.test(approvalId)) throw invalid();
     if (typeof consume.id !== 'string' || !UUID.test(consume.id)) throw invalid();
     const [current] = await this.db
-      .select({ approval: approvals, planHash: plans.planHash })
+      .select({ approval: approvals, plan: plans })
       .from(approvals)
       .innerJoin(plans, eq(plans.id, approvals.planId))
       .where(eq(approvals.id, approvalId))
       .limit(1);
     if (!current || current.approval.planId !== consume.id) throw invalid();
-    const { approval } = current;
-    if (approval.decision === 'REJECT')
-      throw forbidden('The plan was rejected by the approver.', 'approval_rejected');
-    if (approval.decision !== 'APPROVE')
-      throw forbidden('The plan has not been approved yet.', 'approval_pending');
-    if (approval.planHash !== current.planHash) throw invalid();
+    const { approval, plan } = current;
+    if (approval.planHash !== plan.planHash) throw invalid();
+    try {
+      if (approval.decision === 'REJECT')
+        throw forbidden('The plan was rejected by the approver.', 'approval_rejected');
+      if (approval.decision !== 'APPROVE')
+        throw forbidden('The plan has not been approved yet.', 'approval_pending');
+      await this.assertRequester(plan);
+    } catch (err) {
+      if (isAppError(err) && err.code === 'FORBIDDEN') {
+        await this.audit(this.db).record({
+          ...this.auditBase(plan.userId, {}),
+          action: 'approval.execute',
+          status: 'denied',
+          resource: 'plan',
+          errorCode: err.code,
+          errorMessage: err.message,
+          details: {
+            approvalId,
+            planId: plan.id,
+            planHash: plan.planHash,
+            reason: err.details?.reason,
+          },
+        });
+      }
+      throw err;
+    }
     const result = await this.deps.plans.consume(consume);
     // Fail closed: a plan whose hash differs from the approved one is never executed.
     if (result.plan.planHash !== approval.planHash || result.plan.id !== approval.planId)
@@ -280,74 +454,139 @@ export class ApprovalsService {
     return result;
   }
 
-  /** Throws FORBIDDEN unless the user may decide this approval. Never consults the requester. */
-  private async assertMayDecide(
-    deciderId: string,
+  /**
+   * Throws FORBIDDEN unless the subject may decide this approval; returns the plan scope. The
+   * decider needs APPROVAL.DECIDE and every capability action in their own grants (so a role
+   * without DATA.* never approves ERP writes, whatever an `everyone` rule says), plus a policy
+   * ALLOW for each action on each entity.
+   */
+  private assertDecider(
+    subject: Subject | undefined,
     approval: ApprovalRow,
     plan: PlanRow,
-  ): Promise<void> {
-    if (deciderId === approval.requestedBy || deciderId === plan.userId)
+    snapshot: PolicySnapshot | undefined,
+  ): PlanScope {
+    if (subject?.id === approval.requestedBy || subject?.id === plan.userId)
       throw forbidden('You cannot approve your own request.', 'self_approval');
-    const [user] = await this.db
+    if (!subject?.active) throw forbidden('You cannot decide approvals.', 'inactive_user');
+    if (!subject.permissions.has('APPROVAL.DECIDE'))
+      throw forbidden('You do not have permission to decide approvals.', 'permission_missing');
+    const scope = scopeOf(plan);
+    if (!scope) throw forbidden('This plan cannot be approved.', 'plan_undecidable');
+    if (!scope.actions.every((a) => subject.permissions.has(a)))
+      throw forbidden('You do not hold every permission this plan needs.', 'permission_missing');
+    for (const action of scope.actions) {
+      for (const entity of scope.entities) {
+        if (
+          !allowedBy(
+            snapshot,
+            this.policyRequest(subject, plan, scope, action, [entity]),
+            subject.permissions,
+          )
+        )
+          throw forbidden('No policy allows you to approve this plan.', 'policy_denied');
+      }
+    }
+    return scope;
+  }
+
+  /** The decider may see the statement and preview only if they may read every entity. */
+  private mayRead(
+    subject: Subject,
+    plan: PlanRow,
+    scope: PlanScope,
+    snapshot: PolicySnapshot | undefined,
+  ): boolean {
+    if (!subject.permissions.has('QUERY.SELECT')) return false;
+    return scope.entities.every(
+      (entity) =>
+        allowedBy(
+          snapshot,
+          this.policyRequest(subject, plan, scope, 'QUERY.SELECT', [entity]),
+          subject.permissions,
+        ) !== undefined,
+    );
+  }
+
+  /** Re-checks the plan owner at execution time; throws FORBIDDEN on any failure. */
+  private async assertRequester(plan: PlanRow): Promise<void> {
+    const subject = await this.subject(plan.userId, this.db);
+    if (!subject?.active)
+      throw forbidden('The requester is no longer active.', 'requester_inactive');
+    const scope = scopeOf(plan);
+    if (!scope) throw forbidden('This plan cannot be executed.', 'plan_undecidable');
+    if (!scope.actions.every((a) => subject.permissions.has(a)))
+      throw forbidden(
+        'The requester no longer holds the permissions this plan needs.',
+        'requester_permission_missing',
+      );
+    const snapshot = await this.freshPolicies();
+    for (const action of scope.actions) {
+      const decision = allowedBy(
+        snapshot,
+        this.policyRequest(subject, plan, scope, action, scope.entities),
+        subject.permissions,
+      );
+      if (!decision)
+        throw forbidden(
+          'The current policy no longer allows this plan.',
+          'requester_policy_denied',
+        );
+      if (action === scope.primary && !gatesHold(decision.limits, plan))
+        throw forbidden(
+          'The current policy is stricter than this plan.',
+          'requester_gates_stricter',
+        );
+    }
+  }
+
+  private policyRequest(
+    subject: Subject,
+    plan: PlanRow,
+    scope: PlanScope,
+    action: Permission,
+    entities: string[],
+  ): PolicyRequest {
+    return {
+      userId: subject.id,
+      groupIds: subject.groupIds,
+      action,
+      environment: plan.environment as Environment,
+      connectionId: plan.connectionId,
+      entities,
+      hasWhere: scope.hasWhere,
+    };
+  }
+
+  /** The rule set re-read from the database; undefined (deny everything) when it cannot be. */
+  private async freshPolicies(): Promise<PolicySnapshot | undefined> {
+    try {
+      return await this.deps.policies.load();
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Activity, current grants and active groups (a disabled group grants nothing). */
+  private async subject(userId: string, db: Db): Promise<Subject | undefined> {
+    const [user] = await db
       .select({ active: users.active })
       .from(users)
-      .where(eq(users.id, deciderId))
+      .where(eq(users.id, userId))
       .limit(1);
-    if (!user?.active) throw forbidden('You cannot decide approvals.', 'inactive_user');
-    const grants = await this.deps.authz.grants(deciderId);
-    if (!grants.permissions.has('APPROVAL.DECIDE'))
-      throw forbidden('You do not have permission to decide approvals.', 'permission_missing');
-    if (!(await this.policyAllows(deciderId, plan)))
-      throw forbidden('No policy allows you to approve this plan.', 'policy_denied');
-  }
-
-  /**
-   * The decider needs a policy ALLOW for every action of the plan's capability on the entities
-   * the statement touches (target plus tables it reads). The statement is re-classified from the
-   * stored SQL; anything that does not classify as a write fails closed. The decider's RBAC gate
-   * is APPROVAL.DECIDE, so the evaluation is given the plan's action as the only permission: the
-   * policy rules alone decide whether this person may judge writes to those entities.
-   */
-  private async policyAllows(deciderId: string, plan: PlanRow): Promise<boolean> {
-    const capability = plan.capability as { actions?: unknown } | null;
-    const actions = Array.isArray(capability?.actions) ? capability.actions : [];
-    if (actions.length === 0 || !actions.every((a) => typeof a === 'string' && isPermission(a)))
-      return false;
-    const classified = classifyStatement(plan.sql);
-    if (
-      classified.kind !== 'INSERT' &&
-      classified.kind !== 'UPDATE' &&
-      classified.kind !== 'DELETE'
-    )
-      return false;
-    const entities = [...new Set([classified.table, ...classified.sourceTables])];
-    const groupIds = await this.activeGroupsOf(deciderId);
-    for (const action of actions as Permission[]) {
-      const result = await this.deps.policies.evaluate(
-        {
-          userId: deciderId,
-          groupIds,
-          action,
-          environment: plan.environment as Environment,
-          connectionId: plan.connectionId,
-          entities,
-          hasWhere: classified.hasWhere,
-        },
-        new Set<Permission>([action]),
-      );
-      if (result.effect !== 'ALLOW') return false;
-    }
-    return true;
-  }
-
-  /** Groups that currently grant anything to the user (a disabled group grants nothing). */
-  private async activeGroupsOf(userId: string): Promise<string[]> {
-    const rows = await this.db
+    if (!user) return undefined;
+    const grants = await this.deps.authz.grants(userId, db);
+    const memberships = await db
       .select({ id: groupMembers.groupId })
       .from(groupMembers)
       .innerJoin(groups, eq(groups.id, groupMembers.groupId))
       .where(and(eq(groupMembers.userId, userId), eq(groups.active, true)));
-    return rows.map((r) => r.id);
+    return {
+      id: userId,
+      active: user.active,
+      permissions: grants.permissions,
+      groupIds: memberships.map((m) => m.id),
+    };
   }
 
   /** Why the conditional UPDATE of the approval matched nothing. */
@@ -377,11 +616,11 @@ export class ApprovalsService {
     return invalid();
   }
 
-  private audit(db: Database | Tx): AuditService {
+  private audit(db: Db): AuditService {
     return new AuditService(db as Database, this.deps.redact);
   }
 
-  private auditBase(userId: string, context: ApprovalAuditContext) {
+  private auditBase(userId: string | null, context: ApprovalAuditContext) {
     return {
       userId,
       userEmail: context.userEmail ?? null,

@@ -66,7 +66,8 @@ const codeOf = (res: { json(): unknown }) =>
 describe('approval routes', () => {
   it('requests, lists and decides an approval, auditing the decision', async () => {
     const requester = await userWith('ana@example.com', ['OPERATOR']);
-    const decider = await userWith('bia@example.com', ['ADMIN']);
+    // ADMIN alone holds no DATA.*: approving an ERP write also needs DATA.UPDATE.
+    const decider = await userWith('bia@example.com', ['ADMIN', 'OPERATOR']);
     await app.services.policies.create({
       name: 'bia approves TGFPAR updates',
       effect: 'ALLOW',

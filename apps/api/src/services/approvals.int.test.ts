@@ -7,13 +7,14 @@ import {
   createDatabase,
   plans,
   policies,
+  rolePermissions,
   roles,
   userRoles,
   users,
 } from '@dbx/database';
 import type { DatabaseHandle } from '@dbx/database';
 import { DEFAULT_LIMITS, isAppError } from '@dbx/shared';
-import type { ErrorCode, PolicyDecision } from '@dbx/shared';
+import type { ErrorCode, Permission, PolicyDecision } from '@dbx/shared';
 import type { Capability } from '@dbx/sql-engine';
 import { ApprovalsService } from './approvals';
 import { AuthzService } from './authz';
@@ -38,38 +39,60 @@ let service: ApprovalsService;
 
 const silent = { error: () => undefined, warn: () => undefined };
 
-async function addUser(email: string, roleKey?: string): Promise<string> {
+async function addUser(email: string, ...roleKeys: string[]): Promise<string> {
   const [row] = await database.db
     .insert(users)
     .values({ email, name: email.split('@')[0]!, passwordHash: 'x' })
     .returning({ id: users.id });
-  if (roleKey) {
+  for (const roleKey of roleKeys) {
     const [role] = await database.db.select().from(roles).where(eq(roles.key, roleKey));
     await database.db.insert(userRoles).values({ userId: row!.id, roleId: role!.id });
   }
   return row!.id;
 }
 
-async function allow(userId: string, entities = ['TGFPAR']): Promise<void> {
+/** A custom role holding exactly these permissions. */
+async function addRole(key: string, permissions: Permission[]): Promise<void> {
+  const [role] = await database.db
+    .insert(roles)
+    .values({ key, name: key })
+    .returning({ id: roles.id });
+  await database.db
+    .insert(rolePermissions)
+    .values(permissions.map((permission) => ({ roleId: role!.id, permission })));
+}
+
+async function rule(
+  effect: 'ALLOW' | 'DENY',
+  subjectId: string | null,
+  actions: Permission[],
+  entities = ['TGFPAR'],
+  limits: Record<string, unknown> = {},
+): Promise<void> {
   await database.db.insert(policies).values({
-    name: `allow ${userId}`,
-    effect: 'ALLOW',
-    subjectType: 'user',
-    subjectId: userId,
-    actions: ['DATA.UPDATE'],
+    name: `${effect} ${subjectId ?? 'everyone'} ${actions.join(',')}`,
+    effect,
+    subjectType: subjectId ? 'user' : 'everyone',
+    subjectId,
+    actions,
     entities,
+    limits,
   });
   policyService.invalidate();
 }
+
+const allow = (userId: string, entities = ['TGFPAR']) =>
+  rule('ALLOW', userId, ['DATA.UPDATE'], entities);
 
 beforeEach(async () => {
   database = await createDatabase('pglite:memory');
   await database.migrate();
   // The requester holds APPROVAL.DECIDE and a policy too: only the four-eyes rule stops them.
-  requester = await addUser('ana@example.com', 'ADMIN');
-  decider = await addUser('bia@example.com', 'ADMIN');
-  decider2 = await addUser('caio@example.com', 'ADMIN');
-  noPolicy = await addUser('duda@example.com', 'ADMIN');
+  // ADMIN alone has no DATA.*, so deciders of ERP writes also hold OPERATOR.
+  requester = await addUser('ana@example.com', 'ADMIN', 'OPERATOR');
+  decider = await addUser('bia@example.com', 'ADMIN', 'OPERATOR');
+  decider2 = await addUser('caio@example.com', 'ADMIN', 'OPERATOR');
+  noPolicy = await addUser('duda@example.com', 'ADMIN', 'OPERATOR');
   noPermission = await addUser('edu@example.com', 'OPERATOR');
   sessionId = randomUUID();
   policyService = new PolicyService(database.db, silent);
@@ -103,7 +126,8 @@ const decision = (requireApproval = true): PolicyDecision => ({
   effect: 'ALLOW',
   reasons: [],
   matchedRuleIds: ['r1'],
-  limits: { ...DEFAULT_LIMITS, requireApproval },
+  // What evaluatePolicy freezes for an UPDATE with WHERE (requireWhere), plus the approval gate.
+  limits: { ...DEFAULT_LIMITS, requireWhere: true, requireApproval },
   policyVersion: 'a'.repeat(64),
 });
 
@@ -411,6 +435,140 @@ describe('ApprovalsService.decide', () => {
   });
 });
 
+describe('ApprovalsService.request: plan scope', () => {
+  it('refuses plans whose SQL is not a write matching the capability', async () => {
+    const ddl = await plansService.create(
+      newPlan({
+        sql: 'CREATE TABLE AD_X (ID INT)',
+        capability: {
+          class: 'SUPPORTED_VIA_GENERATED_ARTIFACT',
+          route: 'DDL_ARTIFACT',
+          reason: 'custom table',
+          action: 'DDL.CUSTOM.GENERATE',
+          actions: ['DDL.CUSTOM.GENERATE'],
+        },
+      }),
+    );
+    await expectCode(service.request(ddl.id, requester), 'VALIDATION_ERROR');
+    const garbage = await plansService.create(newPlan({ sql: 'this is not sql' }));
+    await expectCode(service.request(garbage.id, requester), 'VALIDATION_ERROR');
+    // The SQL is an INSERT but the frozen capability says DATA.UPDATE.
+    const mismatch = await plansService.create(
+      newPlan({ sql: "INSERT INTO TGFPAR (CODPARC, NOMEPARC) VALUES (3, 'C')" }),
+    );
+    await expectCode(service.request(mismatch.id, requester), 'VALIDATION_ERROR');
+    expect(await database.db.select().from(approvals)).toHaveLength(0);
+  });
+});
+
+describe('ApprovalsService.decide: the decider holds every capability permission', () => {
+  it('never lets ADMIN alone approve an ERP write, even with an everyone ALLOW rule', async () => {
+    const adminOnly = await addUser('fabi@example.com', 'ADMIN');
+    await rule('ALLOW', null, ['DATA.UPDATE']);
+    const plan = await plansService.create(newPlan());
+    const approval = await service.request(plan.id, requester);
+    await expectCode(service.decide(approval.id, adminOnly, 'APPROVE', null), 'FORBIDDEN');
+    expect(await planStatus(plan.id)).toBe('PENDING');
+    expect(await service.listPending(adminOnly)).toEqual([]);
+    const [row] = await auditRows('approval.decide');
+    expect(row).toMatchObject({ status: 'denied', errorCode: 'FORBIDDEN', userId: adminOnly });
+    expect(row!.details).toMatchObject({ reason: 'permission_missing' });
+  });
+
+  it('requires TEMP and QUERY permissions for a scratch plan reading the ERP', async () => {
+    await addRole('SCRATCH_APPROVER', ['APPROVAL.DECIDE', 'TEMP.WRITE']);
+    const partial = await addUser('gabi@example.com', 'SCRATCH_APPROVER');
+    const plan = await plansService.create(
+      newPlan({
+        sql: 'INSERT INTO tmp_x SELECT CODPARC FROM TGFPAR',
+        capability: {
+          class: 'SCRATCH_ONLY',
+          route: 'HYBRID',
+          reason: 'scratch from ERP rows',
+          action: 'TEMP.WRITE',
+          actions: ['TEMP.WRITE', 'TEMP.MATERIALIZE', 'QUERY.SELECT'],
+        },
+        previewKind: 'INSERT_ROWS',
+      }),
+    );
+    const approval = await service.request(plan.id, requester);
+    await expectCode(service.decide(approval.id, partial, 'APPROVE', null), 'FORBIDDEN');
+    expect(await planStatus(plan.id)).toBe('PENDING');
+    // ADMIN holds QUERY.SELECT and TEMP.*: enough for a scratch plan.
+    const admin = await addUser('hugo@example.com', 'ADMIN');
+    await service.decide(approval.id, admin, 'APPROVE', null);
+    expect(await planStatus(plan.id)).toBe('APPROVED');
+  });
+
+  it('audits refusals other than FORBIDDEN with their error code', async () => {
+    const plan = await plansService.create(newPlan());
+    const approval = await service.request(plan.id, requester);
+    await service.decide(approval.id, decider, 'APPROVE', null);
+    await expectCode(service.decide(approval.id, decider2, 'REJECT', null), 'CONFLICT');
+    await expectCode(service.decide(randomUUID(), decider2, 'APPROVE', null), 'NOT_FOUND');
+    const denied = await database.db
+      .select()
+      .from(auditEvents)
+      .where(and(eq(auditEvents.action, 'approval.decide'), eq(auditEvents.status, 'denied')));
+    expect(denied.map((r) => r.errorCode).sort()).toEqual(['CONFLICT', 'NOT_FOUND']);
+    expect(denied.every((r) => r.userId === decider2)).toBe(true);
+  });
+});
+
+describe('ApprovalsService.consumeApproved: the requester is re-checked', () => {
+  async function approved(): Promise<{ plan: CreatedPlan; approvalId: string }> {
+    const plan = await plansService.create(newPlan());
+    const approval = await service.request(plan.id, requester);
+    await service.decide(approval.id, decider, 'APPROVE', null);
+    return { plan, approvalId: approval.id };
+  }
+
+  async function expectRefused(plan: CreatedPlan, approvalId: string, reason: string) {
+    await expectCode(execute(plan, approvalId), 'FORBIDDEN');
+    expect(await planStatus(plan.id)).toBe('APPROVED');
+    const rows = await auditRows('approval.execute');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ status: 'denied', errorCode: 'FORBIDDEN', userId: requester });
+    expect(rows[0]!.details).toMatchObject({ approvalId, planId: plan.id, reason });
+  }
+
+  it('refuses when the requester lost a capability permission after the approval', async () => {
+    const { plan, approvalId } = await approved();
+    const [operator] = await database.db.select().from(roles).where(eq(roles.key, 'OPERATOR'));
+    await database.db
+      .delete(userRoles)
+      .where(and(eq(userRoles.userId, requester), eq(userRoles.roleId, operator!.id)));
+    await expectRefused(plan, approvalId, 'requester_permission_missing');
+  });
+
+  it('refuses when a DENY rule was added after the approval', async () => {
+    const { plan, approvalId } = await approved();
+    await rule('DENY', requester, ['DATA.UPDATE']);
+    await expectRefused(plan, approvalId, 'requester_policy_denied');
+  });
+
+  it('refuses when the requester was deactivated', async () => {
+    const { plan, approvalId } = await approved();
+    await database.db.update(users).set({ active: false }).where(eq(users.id, requester));
+    await expectRefused(plan, approvalId, 'requester_inactive');
+  });
+
+  it('refuses when the current policy is stricter than the frozen gates', async () => {
+    const { plan, approvalId } = await approved();
+    await rule('ALLOW', requester, ['DATA.UPDATE'], ['TGFPAR'], { maxWriteRows: 1 });
+    await expectRefused(plan, approvalId, 'requester_gates_stricter');
+  });
+
+  it('audits an execution attempt on a rejected approval', async () => {
+    const plan = await plansService.create(newPlan());
+    const approval = await service.request(plan.id, requester);
+    await service.decide(approval.id, decider, 'REJECT', null);
+    await expectCode(execute(plan, approval.id), 'FORBIDDEN');
+    const [row] = await auditRows('approval.execute');
+    expect(row!.details).toMatchObject({ reason: 'approval_rejected' });
+  });
+});
+
 describe('ApprovalsService.listPending', () => {
   it('lists the undecided approvals the user may decide', async () => {
     const plan = await plansService.create(newPlan());
@@ -424,11 +582,35 @@ describe('ApprovalsService.listPending', () => {
     expect(list[0]).toMatchObject({
       planId: plan.id,
       requestedBy: requester,
-      plan: { environment: 'SANDBOX', connectionId: 'env-default', sql: newPlan().sql },
+      plan: {
+        environment: 'SANDBOX',
+        connectionId: 'env-default',
+        action: 'DATA.UPDATE',
+        entities: ['TGFPAR'],
+        targetCount: 2,
+        sql: newPlan().sql,
+        preview: { rows: 2 },
+      },
     });
     // Not their own requests, nothing without a policy or without APPROVAL.DECIDE.
     expect(await service.listPending(requester)).toEqual([]);
     expect(await service.listPending(noPolicy)).toEqual([]);
     expect(await service.listPending(noPermission)).toEqual([]);
+  });
+
+  it('returns only the summary to a decider who may not read the entities', async () => {
+    const plan = await plansService.create(newPlan());
+    await service.request(plan.id, requester);
+    await rule('DENY', decider, ['QUERY.SELECT']);
+    const [item] = await service.listPending(decider);
+    expect(item!.plan).toMatchObject({
+      action: 'DATA.UPDATE',
+      entities: ['TGFPAR'],
+      targetCount: 2,
+    });
+    expect(item!.plan).not.toHaveProperty('sql');
+    expect(item!.plan).not.toHaveProperty('preview');
+    const [full] = await service.listPending(decider2);
+    expect(full!.plan.sql).toBe(newPlan().sql);
   });
 });

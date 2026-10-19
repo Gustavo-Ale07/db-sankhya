@@ -65,6 +65,13 @@ const DEFAULT_APPROVAL_TTL_SECONDS = 3600;
 
 type Tx = Parameters<Parameters<Database['transaction']>[0]>[0];
 
+/**
+ * A plan requiring approval is only APPROVED/consumable with a four-eyes approval row: decision
+ * APPROVE, the same plan_hash, decided by someone other than the plan owner (Task 14.1). Written
+ * with explicit aliases so the correlation can never bind to the subquery's own columns.
+ */
+const HAS_APPROVAL = sql`exists (select 1 from "approvals" a where a."plan_id" = "plans"."id" and a."decision" = 'APPROVE' and a."plan_hash" = "plans"."plan_hash" and a."decided_by" is not null and a."decided_by" <> "plans"."user_id")`;
+
 /** `"<ENVIRONMENT> <ACTION> <N> <ENTITY>"`, for example `PRODUCTION UPDATE 3 TGFPAR`. */
 export function strongConfirmationPhrase(
   environment: Environment,
@@ -344,7 +351,7 @@ export class PlansService {
             eq(plans.sessionId, input.sessionId),
             eq(plans.planHash, row.planHash),
             inArray(plans.status, [...LIVE_STATUSES]),
-            or(eq(plans.status, 'APPROVED'), eq(plans.requiresApproval, false)),
+            or(eq(plans.requiresApproval, false), and(eq(plans.status, 'APPROVED'), HAS_APPROVAL)),
             gt(plans.expiresAt, sql`now()`),
             or(
               isNull(plans.strongConfirmationPhrase),
@@ -366,7 +373,9 @@ export class PlansService {
    * Records a four-eyes decision on a PENDING plan that requires approval (Task 14.1): APPROVE
    * moves it to APPROVED, REJECT to INVALIDATED (never consumable). A single conditional UPDATE
    * that also checks `plan_hash` and expiry, so it fails closed and only one decision can win.
-   * Returns false when nothing matched. `db` lets the caller run it inside its transaction.
+   * APPROVE also needs the approval row (see HAS_APPROVAL), so it must be written first, in the
+   * same transaction. Returns false when nothing matched. `db` lets the caller run it inside its
+   * transaction.
    */
   async decide(
     id: string,
@@ -384,6 +393,7 @@ export class PlansService {
           eq(plans.status, 'PENDING'),
           eq(plans.requiresApproval, true),
           gt(plans.expiresAt, sql`now()`),
+          ...(decision === 'APPROVE' ? [HAS_APPROVAL] : []),
         ),
       )
       .returning({ id: plans.id });

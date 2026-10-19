@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { and, eq, sql } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { createDatabase, plans, users } from '@dbx/database';
 import type { DatabaseHandle } from '@dbx/database';
 import { DEFAULT_LIMITS, canonicalJSON, isAppError } from '@dbx/shared';
@@ -89,6 +89,15 @@ async function expectCode(promise: Promise<unknown>, code: ErrorCode): Promise<v
 const statusOf = async (id: string) =>
   (await database.db.select({ status: plans.status }).from(plans).where(eq(plans.id, id)))[0]
     ?.status;
+
+/** Marks a plan APPROVED together with the four-eyes approval row `consume` requires. */
+async function approveDirectly(planId: string): Promise<void> {
+  await database.db.execute(
+    sql`insert into approvals (plan_id, plan_hash, requested_by, decided_by, decision, decided_at, expires_at)
+        select id, plan_hash, user_id, ${otherUserId}, 'APPROVE', now(), expires_at from plans where id = ${planId}`,
+  );
+  await database.db.update(plans).set({ status: 'APPROVED' }).where(eq(plans.id, planId));
+}
 
 describe('PlansService.create', () => {
   it('stores a PENDING plan and returns a session-bound token', async () => {
@@ -413,10 +422,8 @@ describe('PlansService.consume', () => {
       const plan = await svc.create(make());
       await database.db.execute(sql`update plans set ${change} where id = ${plan.id}`);
       // Approve where needed so only the tampering can be the reason for the refusal.
-      await database.db
-        .update(plans)
-        .set({ status: 'APPROVED' })
-        .where(and(eq(plans.id, plan.id), eq(plans.requiresApproval, true)));
+      const [stored] = await database.db.select().from(plans).where(eq(plans.id, plan.id));
+      if (stored!.requiresApproval) await approveDirectly(plan.id);
       const err = await svc
         .consume({
           id: plan.id,
@@ -434,7 +441,7 @@ describe('PlansService.consume', () => {
 
     // Control: the same gated plan, untouched and approved, is consumable.
     const control = await svc.create(gated());
-    await database.db.update(plans).set({ status: 'APPROVED' }).where(eq(plans.id, control.id));
+    await approveDirectly(control.id);
     const { plan: row } = await svc.consume({
       id: control.id,
       token: control.token,
@@ -565,9 +572,42 @@ describe('PlansService.consume', () => {
     );
     expect(await statusOf(plan.id)).toBe('PENDING');
 
-    // No approval flow yet (Task 14.1): set APPROVED directly.
+    // APPROVED without a four-eyes approval row (e.g. a direct status write) is not consumable.
     await database.db.update(plans).set({ status: 'APPROVED' }).where(eq(plans.id, plan.id));
+    await expectCode(
+      svc.consume({ id: plan.id, token: plan.token, userId, sessionId }),
+      'CONFIRMATION_INVALID',
+    );
+    // Nor is an APPROVE approval recorded for another plan hash.
+    await database.db.execute(
+      sql`insert into approvals (plan_id, plan_hash, requested_by, expires_at) values (${plan.id}, ${plan.planHash}, ${userId}, ${plan.expiresAt.toISOString()})`,
+    );
+    await database.db.execute(
+      sql`update approvals set plan_hash = ${'f'.repeat(64)}, decision = 'APPROVE', decided_by = ${otherUserId}, decided_at = now() where plan_id = ${plan.id}`,
+    );
+    await expectCode(
+      svc.consume({ id: plan.id, token: plan.token, userId, sessionId }),
+      'CONFIRMATION_INVALID',
+    );
+
+    await database.db.execute(
+      sql`update approvals set plan_hash = ${plan.planHash} where plan_id = ${plan.id}`,
+    );
     const { plan: row } = await svc.consume({ id: plan.id, token: plan.token, userId, sessionId });
     expect(row.status).toBe('CONSUMED');
+  });
+
+  it('approves a plan only when an APPROVE approval row exists (decide)', async () => {
+    const svc = service();
+    const plan = await svc.create(newPlan({ decision: decision({ requireApproval: true }) }));
+    expect(await svc.decide(plan.id, plan.planHash, 'APPROVE')).toBe(false);
+    expect(await statusOf(plan.id)).toBe('PENDING');
+    await expectCode(
+      svc.consume({ id: plan.id, token: plan.token, userId, sessionId }),
+      'CONFIRMATION_INVALID',
+    );
+    // A rejection needs no approval row: it only makes the plan unusable.
+    expect(await svc.decide(plan.id, plan.planHash, 'REJECT')).toBe(true);
+    expect(await statusOf(plan.id)).toBe('INVALIDATED');
   });
 });
