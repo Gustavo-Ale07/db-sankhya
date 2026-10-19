@@ -173,6 +173,19 @@ describe('ScratchManager', () => {
     );
   }, 60_000);
 
+  it('rolls back a write whose RETURNING result passes maxResultBytes (R1)', async () => {
+    const ws = await manager({ maxResultBytes: 10_000 }).workspace('u1');
+    await ws.exec('CREATE TABLE tmp_a (v text)');
+    expect(
+      await codeOf(
+        ws.exec(
+          'INSERT INTO tmp_a SELECT md5(g::text) FROM generate_series(1, 1000) g RETURNING v',
+        ),
+      ),
+    ).toBe('QUERY_LIMIT_EXCEEDED');
+    expect((await ws.exec('SELECT count(*)::int AS n FROM tmp_a')).rows).toEqual([[0]]);
+  }, 60_000);
+
   it('enforces the storage quota in bytes and rolls back (F3)', async () => {
     const ws = await manager({ maxBytes: 200_000, maxRows: 1_000_000 }).workspace('u1');
     await ws.exec('CREATE TABLE tmp_a (v text)');

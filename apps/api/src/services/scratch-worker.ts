@@ -117,9 +117,11 @@ async function exec(sql: string, mutating: boolean, limits: Limits) {
   try {
     const res = await db.query<unknown[]>(sql, [], { rowMode: 'array' });
     if (mutating) await enforceQuota(limits);
+    // Every check that can throw runs before COMMIT, so a refused result (e.g. RETURNING over
+    // maxResultBytes) rolls the write back instead of saving it and reporting an error.
+    const out = shape(res.fields, res.rows, limits.maxResultRows, limits.maxResultBytes);
     // Reads never keep side effects (a data-modifying CTE inside a SELECT is undone).
     await db.query(mutating ? 'COMMIT' : 'ROLLBACK');
-    const out = shape(res.fields, res.rows, limits.maxResultRows, limits.maxResultBytes);
     // PGlite reports affectedRows 0 for a read, so a read counts the rows it returned.
     return { ...out, rowCount: mutating ? (res.affectedRows ?? 0) : res.rows.length };
   } catch (err) {
