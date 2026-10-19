@@ -23,7 +23,6 @@ const BASE_ENV = {
   DATABASE_URL: 'pglite:memory',
   SESSION_SECRET: 'integration-test-secret-7Hq2Lm9Xc4Vb8Nz1Kp5Rt3Wy6',
   BOOTSTRAP_ADMIN_EMAIL: ADMIN.email,
-  BOOTSTRAP_ADMIN_PASSWORD: ADMIN.password,
   LOG_LEVEL: 'silent',
   SANKHYA_MODE: 'mock',
   SANKHYA_BASE_URL: 'https://gateway.example.com',
@@ -75,9 +74,13 @@ async function setup(
     logger: { ...(loggerOptions('info', secretValues(config)) as object), stream },
     sankhya: { mockGateway: () => Promise.resolve({ ...mock, close: async () => undefined }) },
   });
-  await app.services.users.bootstrapAdmin(config.bootstrapAdmin);
-  const admin = await app.services.users.findByEmail(ADMIN.email);
-  if (admin) await app.services.users.setPassword(admin.id, ADMIN.password, false);
+  // The first administrator, with the BOOTSTRAP_ADMIN_ROLES roles.
+  const admin = await app.services.users.create({
+    email: ADMIN.email,
+    name: config.bootstrapAdmin.name,
+    password: ADMIN.password,
+    roles: config.bootstrapAdmin.roles,
+  });
 
   const call: Harness['call'] = (cookie, opts) =>
     app.inject({
@@ -110,7 +113,7 @@ async function setup(
   };
   const userWith = async (permissions: Permission[]) => {
     const key = `CUSTOM_${++n}`;
-    await app.services.authz.createRole({ key, name: key, permissions });
+    await app.services.authz.createRole({ key, name: key, permissions }, admin.id);
     return create([key]);
   };
   const policy = async (input: Partial<PolicyInput>) => {

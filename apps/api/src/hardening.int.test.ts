@@ -87,8 +87,7 @@ describe('CORS', () => {
 describe('graceful close', () => {
   it('closes the scratch workspaces on app.close()', async () => {
     const { app: a } = await setup();
-    const closeAll = vi.fn(async () => {});
-    a.services.scratch = { closeAll };
+    const closeAll = vi.spyOn(a.services.scratch, 'closeAll');
     await a.close();
     expect(closeAll).toHaveBeenCalledTimes(1);
   });

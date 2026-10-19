@@ -128,6 +128,7 @@ const decision = (requireApproval = true): PolicyDecision => ({
   matchedRuleIds: ['r1'],
   // What evaluatePolicy freezes for an UPDATE with WHERE (requireWhere), plus the approval gate.
   limits: { ...DEFAULT_LIMITS, requireWhere: true, requireApproval },
+  rowLimitsFromRules: { maxReadRows: false, maxWriteRows: false },
   policyVersion: 'a'.repeat(64),
 });
 

@@ -53,6 +53,7 @@ const decision = (over: Partial<PolicyDecision['limits']> = {}): PolicyDecision 
   reasons: [],
   matchedRuleIds: ['r1'],
   limits: { ...DEFAULT_LIMITS, ...over },
+  rowLimitsFromRules: { maxReadRows: false, maxWriteRows: false },
   policyVersion: 'a'.repeat(64),
 });
 

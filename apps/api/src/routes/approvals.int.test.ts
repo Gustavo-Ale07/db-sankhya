@@ -106,6 +106,7 @@ describe('approval routes', () => {
         reasons: [],
         matchedRuleIds: [],
         limits: { ...DEFAULT_LIMITS, requireApproval: true },
+        rowLimitsFromRules: { maxReadRows: false, maxWriteRows: false },
         policyVersion: 'b'.repeat(64),
       },
       targets: [{ key: { CODPARC: 1 } }],

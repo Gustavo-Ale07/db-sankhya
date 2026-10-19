@@ -33,8 +33,6 @@ export interface AppServices {
   /** Masks configured secrets in anything sent back to clients. */
   redact: (value: unknown) => unknown;
   executions: ExecutionRegistry;
-  /** Scratch workspaces (when wired): closed on shutdown. */
-  scratch?: { closeAll(): Promise<void> };
   startedAt: Date;
 }
 
