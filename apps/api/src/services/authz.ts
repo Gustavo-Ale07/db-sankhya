@@ -295,6 +295,33 @@ export class AuthzService {
     }
   }
 
+  /** Refuses unless the actor covers every given user (same error as the single-user check). */
+  private async assertCoversAll(actorId: string, userIds: Iterable<string>, db: Db) {
+    for (const id of new Set(userIds)) await this.assertCovers(actorId, id, db);
+  }
+
+  /** Users holding the role directly or through any group, active or not. */
+  private async holdersOfRole(roleId: string, db: Db): Promise<string[]> {
+    const direct = await db
+      .select({ userId: userRoles.userId })
+      .from(userRoles)
+      .where(eq(userRoles.roleId, roleId));
+    const viaGroup = await db
+      .select({ userId: groupMembers.userId })
+      .from(groupRoles)
+      .innerJoin(groupMembers, eq(groupMembers.groupId, groupRoles.groupId))
+      .where(eq(groupRoles.roleId, roleId));
+    return [...direct, ...viaGroup].map((r) => r.userId);
+  }
+
+  private async membersOf(groupId: string, db: Db): Promise<string[]> {
+    const rows = await db
+      .select({ userId: groupMembers.userId })
+      .from(groupMembers)
+      .where(eq(groupMembers.groupId, groupId));
+    return rows.map((r) => r.userId);
+  }
+
   private async isMember(groupId: string, userId: string, db: Db): Promise<boolean> {
     const [row] = await db
       .select({ n: count() })
@@ -404,6 +431,9 @@ export class AuthzService {
       if (patch.permissions) {
         if (await this.holdsRole(id, actorId, tx)) throw selfChangeError();
         const before = await this.permissionsOfRoles([id], tx);
+        const after = new Set(patch.permissions);
+        if ([...before].some((p) => !after.has(p)))
+          await this.assertCoversAll(actorId, await this.holdersOfRole(id, tx), tx);
         const added = patch.permissions.filter((p) => !before.has(p));
         await this.assertCanGrant(actorId, added, tx);
       }
@@ -425,6 +455,7 @@ export class AuthzService {
     if (current.system) throw new AppError('CONFLICT', 'System roles cannot be deleted');
     await this.guarded(async (tx) => {
       if (await this.holdsRole(id, actorId, tx)) throw selfChangeError();
+      await this.assertCoversAll(actorId, await this.holdersOfRole(id, tx), tx);
       await tx.delete(roles).where(eq(roles.id, id));
     }, actorId);
   }
@@ -526,11 +557,7 @@ export class AuthzService {
     await this.findGroup(id);
     await this.guarded(async (tx) => {
       if (await this.isMember(id, actorId, tx)) throw selfChangeError();
-      const members = await tx
-        .select({ userId: groupMembers.userId })
-        .from(groupMembers)
-        .where(eq(groupMembers.groupId, id));
-      for (const m of members) await this.assertCovers(actorId, m.userId, tx);
+      await this.assertCoversAll(actorId, await this.membersOf(id, tx), tx);
       await tx.delete(groups).where(eq(groups.id, id));
     }, actorId);
   }
@@ -586,9 +613,12 @@ export class AuthzService {
         .select({ id: groupRoles.roleId })
         .from(groupRoles)
         .where(eq(groupRoles.groupId, id));
+      const ids = await this.roleIdsByKey(roleKeys, tx);
+      const kept = new Set(ids);
+      if (current.some((r) => !kept.has(r.id)))
+        await this.assertCoversAll(actorId, await this.membersOf(id, tx), tx);
       const added = await this.addedRoleIds(roleKeys, current, tx);
       await this.assertCanGrant(actorId, await this.permissionsOfRoles(added, tx), tx);
-      const ids = await this.roleIdsByKey(roleKeys, tx);
       await tx.delete(groupRoles).where(eq(groupRoles.groupId, id));
       if (ids.length > 0)
         await tx.insert(groupRoles).values(ids.map((roleId) => ({ groupId: id, roleId })));

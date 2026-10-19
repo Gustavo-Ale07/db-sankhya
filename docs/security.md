@@ -99,9 +99,13 @@ include every permission that a change would add. This applies when the actor:
 - gives roles to a group;
 - adds members to a group (the actor must hold everything the group grants, active or not);
 - re-enables a group;
-- adds permissions to a role.
+- creates a role or adds permissions to one.
 
-Removing grants is always allowed, subject to the self-change and last-administrator rules.
+An actor can only reduce the grants of users they fully cover. Removing a user's roles or group
+memberships, deleting a group, removing roles from a group, and removing permissions from or deleting
+a role are refused when any affected user, judged before the change, has a permission the actor
+lacks. Otherwise an actor could strip a stronger account and then reset its password. The
+self-change and last-administrator rules apply as well.
 
 Nobody takes over an account that is stronger than their own. Resetting a user's password, or
 reactivating a disabled user, is refused when the target has any permission the actor lacks. This

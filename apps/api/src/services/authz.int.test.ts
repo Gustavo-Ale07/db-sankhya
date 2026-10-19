@@ -3,6 +3,7 @@ import { eq, sql } from 'drizzle-orm';
 import { createDatabase, groupMembers, groupRoles, rolePermissions, roles } from '@dbx/database';
 import type { DatabaseHandle } from '@dbx/database';
 import { PERMISSIONS, SYSTEM_ROLE_PERMISSIONS, SYSTEM_ROLES } from '@dbx/shared';
+import type { AppError, Permission } from '@dbx/shared';
 import { AuthzService, GUARD_LOCK_KEY } from './authz';
 import { UsersService } from './users';
 
@@ -424,7 +425,7 @@ describe('AuthzService', () => {
      */
     const scene = async () => {
       await seedRole('ALL', PERMISSIONS);
-      await seedRole('DATA_ALL', ['DATA.INSERT', 'DATA.UPDATE', 'DATA.DELETE']);
+      const dataRole = await seedRole('DATA_ALL', ['DATA.INSERT', 'DATA.UPDATE', 'DATA.DELETE']);
       await seedRole('USER_ADMIN', ['ADMIN.USERS', 'ADMIN.ROLES', 'ADMIN.GROUPS', 'QUERY.SELECT']);
       const root = await newUser('root@example.com', ['ALL']);
       const a = await newUser('a@example.com', ['USER_ADMIN']);
@@ -432,8 +433,48 @@ describe('AuthzService', () => {
       const group = await authz.createGroup({ name: 'Dados' });
       await authz.setGroupRoles(group.id, ['DATA_ALL'], root);
       await authz.setGroupMembers(group.id, [b], root);
-      return { root, a, b, group: group.id };
+      return { root, a, b, group: group.id, dataRole };
     };
+
+    /** The refusal names no user: neither id nor e-mail appear in the message or details. */
+    const expectAnonymous = (err: unknown, b: string) => {
+      const text = JSON.stringify({ m: (err as Error).message, d: (err as AppError).details });
+      expect(text).not.toContain(b);
+      expect(text).not.toContain('b@example.com');
+    };
+
+    it('refuses removing roles from a group with a stronger member', async () => {
+      const { root, a, b, group } = await scene();
+      const err = await authz.setGroupRoles(group, [], a).catch((e: unknown) => e);
+      expect(err).toMatchObject(forbidden);
+      expectAnonymous(err, b);
+      expect((await authz.findGroup(group)).roleKeys).toEqual(['DATA_ALL']);
+      await authz.setGroupRoles(group, [], root);
+      expect((await authz.findGroup(group)).roleKeys).toEqual([]);
+    });
+
+    it('refuses removing permissions from a role a stronger user holds', async () => {
+      const { root, a, b, dataRole } = await scene();
+      const trimmed = { permissions: ['DATA.INSERT'] as Permission[] };
+      const err = await authz.updateRole(dataRole, trimmed, a).catch((e: unknown) => e);
+      expect(err).toMatchObject(forbidden);
+      expectAnonymous(err, b);
+      expect((await authz.findRole(dataRole)).permissions).toHaveLength(3);
+      // Renaming removes nothing, so it stays allowed.
+      await authz.updateRole(dataRole, { name: 'Dados' }, a);
+      await authz.updateRole(dataRole, trimmed, root);
+      expect((await authz.findRole(dataRole)).permissions).toEqual(['DATA.INSERT']);
+    });
+
+    it('refuses deleting a role a stronger user holds', async () => {
+      const { root, a, b, dataRole } = await scene();
+      const err = await authz.deleteRole(dataRole, a).catch((e: unknown) => e);
+      expect(err).toMatchObject(forbidden);
+      expectAnonymous(err, b);
+      await authz.findRole(dataRole);
+      await authz.deleteRole(dataRole, root);
+      await expect(authz.findRole(dataRole)).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    });
 
     it("refuses removing a stronger target's roles", async () => {
       const { a, b } = await scene();
