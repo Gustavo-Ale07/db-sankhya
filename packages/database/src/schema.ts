@@ -224,28 +224,61 @@ export const auditEvents = pgTable(
   ],
 );
 
+export const PLAN_STATUSES = ['PENDING', 'APPROVED', 'CONSUMED', 'EXPIRED', 'INVALIDATED'] as const;
+export type PlanStatus = (typeof PLAN_STATUSES)[number];
+
 /**
- * Server-side record behind each write confirmation token (single use, short-lived).
- * Unused since Task 5.3; unused until Stage 11 plans replace it.
+ * Immutable execution plan behind each mutation confirmation token (single use, short-lived).
+ * Only `status`, `consumed_at` and `idempotency_key` ever change; `plan_hash` binds the content.
+ * `connection_id` is a saved connection's uuid or the env connection id, so it has no foreign key.
  */
-export const writePreviews = pgTable(
-  'write_previews',
+export const plans = pgTable(
+  'plans',
   {
     id: uuid('id').primaryKey().defaultRandom(),
     userId: uuid('user_id')
       .notNull()
       .references(() => users.id, { onDelete: 'cascade' }),
     sessionId: uuid('session_id').notNull(),
-    statementHash: text('statement_hash').notNull(),
+    connectionId: text('connection_id').notNull(),
+    environment: text('environment', {
+      enum: ['PRODUCTION', 'HOMOLOGATION', 'SANDBOX'],
+    }).notNull(),
+    sql: text('sql').notNull(),
+    sqlHash: text('sql_hash').notNull(),
+    paramsHash: text('params_hash').notNull(),
+    capability: jsonb('capability').$type<unknown>().notNull(),
+    decision: jsonb('decision').$type<unknown>().notNull(),
+    policyVersion: text('policy_version').notNull(),
+    /** Before snapshot of every target (keys plus values). */
+    targets: jsonb('targets').$type<unknown>().notNull(),
     targetsHash: text('targets_hash').notNull(),
-    operation: text('operation').notNull(),
-    resource: text('resource').notNull(),
-    targetCount: integer('target_count').notNull(),
-    createdAt: createdAt(),
+    preview: jsonb('preview').$type<unknown>().notNull(),
+    previewKind: text('preview_kind').notNull(),
+    planHash: text('plan_hash').notNull(),
+    requiresApproval: boolean('requires_approval').notNull().default(false),
+    strongConfirmationPhrase: text('strong_confirmation_phrase'),
+    status: text('status', { enum: PLAN_STATUSES }).notNull().default('PENDING'),
+    /** Set by the consume that used the plan, so a retry with the same key gets the same row. */
+    idempotencyKey: text('idempotency_key'),
     expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    createdAt: createdAt(),
     consumedAt: timestamp('consumed_at', { withTimezone: true }),
   },
-  (t) => [index('write_previews_user_idx').on(t.userId)],
+  (t) => [
+    index('plans_user_idx').on(t.userId),
+    index('plans_connection_status_idx').on(t.connectionId, t.status),
+    uniqueIndex('plans_user_idempotency_key').on(t.userId, t.idempotencyKey),
+    check(
+      'plans_status_check',
+      sql`${t.status} in ('PENDING', 'APPROVED', 'CONSUMED', 'EXPIRED', 'INVALIDATED')`,
+    ),
+    check(
+      'plans_environment_check',
+      sql`${t.environment} in ('PRODUCTION', 'HOMOLOGATION', 'SANDBOX')`,
+    ),
+    check('plans_consumed_check', sql`(${t.status} = 'CONSUMED') = (${t.consumedAt} is not null)`),
+  ],
 );
 
 /**
@@ -346,7 +379,8 @@ export type SavedQueryRow = typeof savedQueries.$inferSelect;
 export type QueryHistoryRow = typeof queryHistory.$inferSelect;
 export type AuditEventRow = typeof auditEvents.$inferSelect;
 export type NewAuditEvent = typeof auditEvents.$inferInsert;
-export type WritePreviewRow = typeof writePreviews.$inferSelect;
+export type PlanRow = typeof plans.$inferSelect;
+export type NewPlanRow = typeof plans.$inferInsert;
 export type MetadataCacheRow = typeof metadataCache.$inferSelect;
 export type ConnectionRow = typeof connections.$inferSelect;
 export type NewConnection = typeof connections.$inferInsert;

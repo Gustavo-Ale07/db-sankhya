@@ -4,6 +4,7 @@ import {
   DEFAULT_LIMITS,
   POLICY_ACTION_CLASS,
   POLICY_HARD_MAX_LIMITS,
+  canonicalJSON,
   evaluatePolicy,
   isPolicyWriteAction,
   policyVersion,
@@ -1269,5 +1270,23 @@ describe('policyVersion', () => {
   it('changes when a rule is added or removed', () => {
     expect(policyVersion([base[0]!])).not.toBe(policyVersion(base));
     expect(policyVersion([])).not.toBe(policyVersion(base));
+  });
+});
+
+describe('canonicalJSON', () => {
+  it('sorts object keys at every depth and keeps array order', () => {
+    expect(canonicalJSON({ b: 1, a: { d: [3, 1], c: 'x' } })).toBe(
+      '{"a":{"c":"x","d":[3,1]},"b":1}',
+    );
+  });
+
+  it('drops undefined object values and writes undefined array items as null', () => {
+    expect(canonicalJSON({ a: undefined, b: [undefined, null] })).toBe('{"b":[null,null]}');
+  });
+
+  it('is equal for objects that differ only in key order', () => {
+    expect(canonicalJSON({ x: 1, y: { p: true, q: null } })).toBe(
+      canonicalJSON({ y: { q: null, p: true }, x: 1 }),
+    );
   });
 });

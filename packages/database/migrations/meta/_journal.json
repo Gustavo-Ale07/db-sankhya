@@ -50,6 +50,13 @@
       "when": 1792425271923,
       "tag": "0006_policies",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1792425272923,
+      "tag": "0007_plans",
+      "breakpoints": true
     }
   ]
 }

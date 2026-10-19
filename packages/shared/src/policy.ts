@@ -749,14 +749,18 @@ function glob(pattern: string, value: string): boolean {
   return true;
 }
 
-/** JSON with object keys sorted, so equal rules hash equally whatever their key order. */
-function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map((v) => canonicalJson(v ?? null)).join(',')}]`;
+/**
+ * Deterministic JSON: object keys sorted at every depth, undefined object values dropped, arrays
+ * kept in order (undefined items written as null). Equal values hash equally whatever their key
+ * order. Feed it plain JSON data: class instances (Date, Map...) are not special-cased.
+ */
+export function canonicalJSON(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((v) => canonicalJSON(v ?? null)).join(',')}]`;
   if (typeof value === 'object' && value !== null) {
     const entries = Object.entries(value)
       .filter(([, v]) => v !== undefined)
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-      .map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`);
+      .map(([k, v]) => `${JSON.stringify(k)}:${canonicalJSON(v)}`);
     return `{${entries.join(',')}}`;
   }
   return JSON.stringify(value) ?? 'null';
@@ -768,7 +772,7 @@ function canonicalJson(value: unknown): string {
  * harmless. It covers every field, disabled rules included, so any change to any rule changes it.
  */
 export function policyVersion(rules: readonly PolicyRule[]): string {
-  const sorted = rules.map((r) => canonicalJson(r)).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const sorted = rules.map((r) => canonicalJSON(r)).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   return sha256HexUtf8(`[${sorted.join(',')}]`);
 }
 

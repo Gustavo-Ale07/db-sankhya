@@ -1,0 +1,411 @@
+import { randomUUID } from 'node:crypto';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { eq, sql } from 'drizzle-orm';
+import { createDatabase, plans, users } from '@dbx/database';
+import type { DatabaseHandle } from '@dbx/database';
+import { DEFAULT_LIMITS, canonicalJSON, isAppError } from '@dbx/shared';
+import type { ErrorCode, PolicyDecision } from '@dbx/shared';
+import type { Capability } from '@dbx/sql-engine';
+import { sha256Hex } from '../security/crypto';
+import { PlansService, strongConfirmationPhrase } from './plans';
+import type { NewPlan } from './plans';
+
+const SECRET = 'plan-test-secret-fixture-0123456789abcdef';
+const TTL = 300;
+
+let database: DatabaseHandle;
+let userId: string;
+let otherUserId: string;
+let sessionId: string;
+
+beforeEach(async () => {
+  database = await createDatabase('pglite:memory');
+  await database.migrate();
+  const inserted = await database.db
+    .insert(users)
+    .values([
+      { email: 'ana@example.com', name: 'Ana', passwordHash: 'x' },
+      { email: 'bia@example.com', name: 'Bia', passwordHash: 'x' },
+    ])
+    .returning({ id: users.id });
+  userId = inserted[0]!.id;
+  otherUserId = inserted[1]!.id;
+  sessionId = randomUUID();
+});
+
+afterEach(async () => {
+  await database.close();
+});
+
+const service = (now?: () => Date) =>
+  new PlansService(database.db, { secret: SECRET, ttlSeconds: TTL, ...(now ? { now } : {}) });
+
+const CAPABILITY: Capability = {
+  class: 'SUPPORTED',
+  route: 'SANKHYA_SAVE',
+  reason: 'update through the gateway',
+  action: 'DATA.UPDATE',
+  actions: ['DATA.UPDATE'],
+};
+
+const decision = (over: Partial<PolicyDecision['limits']> = {}): PolicyDecision => ({
+  effect: 'ALLOW',
+  reasons: [],
+  matchedRuleIds: ['r1'],
+  limits: { ...DEFAULT_LIMITS, ...over },
+  policyVersion: 'a'.repeat(64),
+});
+
+function newPlan(over: Partial<NewPlan> = {}): NewPlan {
+  return {
+    userId,
+    sessionId,
+    connectionId: 'env-default',
+    environment: 'SANDBOX',
+    sql: "UPDATE TGFPAR SET NOMEPARC = 'X' WHERE CODPARC IN (1, 2, 3)",
+    params: [],
+    capability: CAPABILITY,
+    decision: decision(),
+    targets: [
+      { key: { CODPARC: 1 }, before: { NOMEPARC: 'A' } },
+      { key: { CODPARC: 2 }, before: { NOMEPARC: 'B' } },
+      { key: { CODPARC: 3 }, before: { NOMEPARC: 'C' } },
+    ],
+    preview: { rows: 3 },
+    previewKind: 'UPDATE_DIFF',
+    summary: { action: 'UPDATE', count: 3, entity: 'TGFPAR' },
+    ...over,
+  };
+}
+
+async function expectCode(promise: Promise<unknown>, code: ErrorCode): Promise<void> {
+  const err = await promise.then(
+    () => undefined,
+    (e: unknown) => e,
+  );
+  expect(isAppError(err) ? err.code : err).toBe(code);
+}
+
+const statusOf = async (id: string) =>
+  (await database.db.select({ status: plans.status }).from(plans).where(eq(plans.id, id)))[0]
+    ?.status;
+
+describe('PlansService.create', () => {
+  it('stores a PENDING plan and returns a session-bound token', async () => {
+    const before = Date.now();
+    const plan = await service().create(newPlan());
+    expect(plan.token.startsWith(`${plan.id}.`)).toBe(true);
+    expect(plan.planHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(plan.expiresAt.getTime()).toBeGreaterThanOrEqual(before + TTL * 1000);
+    expect(plan.expiresAt.getTime()).toBeLessThanOrEqual(Date.now() + TTL * 1000);
+
+    const [row] = await database.db.select().from(plans).where(eq(plans.id, plan.id));
+    expect(row).toMatchObject({
+      status: 'PENDING',
+      userId,
+      sessionId,
+      connectionId: 'env-default',
+      environment: 'SANDBOX',
+      planHash: plan.planHash,
+      sqlHash: sha256Hex(newPlan().sql),
+      targetsHash: sha256Hex(canonicalJSON(newPlan().targets)),
+      paramsHash: sha256Hex(canonicalJSON([])),
+      policyVersion: 'a'.repeat(64),
+      requiresApproval: false,
+      strongConfirmationPhrase: null,
+      previewKind: 'UPDATE_DIFF',
+      consumedAt: null,
+    });
+    expect(row!.capability).toEqual(CAPABILITY);
+  });
+
+  it('computes planHash from the brief fields with canonical JSON', async () => {
+    const input = newPlan();
+    const plan = await service().create(input);
+    const expected = sha256Hex(
+      canonicalJSON({
+        sqlHash: sha256Hex(input.sql),
+        paramsHash: sha256Hex(canonicalJSON(input.params)),
+        userId,
+        connectionId: input.connectionId,
+        environment: input.environment,
+        policyVersion: input.decision.policyVersion,
+        targetsHash: sha256Hex(canonicalJSON(input.targets)),
+        capability: input.capability,
+      }),
+    );
+    expect(plan.planHash).toBe(expected);
+  });
+
+  it('sets the strong phrase in PRODUCTION and when the decision asks for it', async () => {
+    const prod = await service().create(newPlan({ environment: 'PRODUCTION' }));
+    const strong = await service().create(
+      newPlan({ decision: decision({ requireStrongConfirmation: true }) }),
+    );
+    const rows = await database.db.select().from(plans);
+    const phrase = (id: string) => rows.find((r) => r.id === id)?.strongConfirmationPhrase;
+    expect(phrase(prod.id)).toBe('PRODUCTION UPDATE 3 TGFPAR');
+    expect(phrase(strong.id)).toBe('SANDBOX UPDATE 3 TGFPAR');
+    expect(strongConfirmationPhrase('PRODUCTION', 'update', 3, 'tgfpar')).toBe(
+      'PRODUCTION UPDATE 3 TGFPAR',
+    );
+  });
+
+  it('copies requireApproval from the decision', async () => {
+    const plan = await service().create(newPlan({ decision: decision({ requireApproval: true }) }));
+    const [row] = await database.db.select().from(plans).where(eq(plans.id, plan.id));
+    expect(row!.requiresApproval).toBe(true);
+  });
+
+  it('refuses a denied decision or an unsupported capability', async () => {
+    await expectCode(
+      service().create(newPlan({ decision: { ...decision(), effect: 'DENY' } })),
+      'FORBIDDEN',
+    );
+    await expectCode(
+      service().create(
+        newPlan({ capability: { ...CAPABILITY, class: 'UNSUPPORTED', route: 'NONE' } }),
+      ),
+      'FORBIDDEN',
+    );
+    await expectCode(
+      service().create(
+        newPlan({
+          capability: { ...CAPABILITY, blocked: { code: 'MISSING_WHERE', reason: 'no where' } },
+        }),
+      ),
+      'FORBIDDEN',
+    );
+  });
+
+  it('refuses malformed input', async () => {
+    await expectCode(service().create(newPlan({ sessionId: 'nope' })), 'VALIDATION_ERROR');
+    await expectCode(
+      service().create(newPlan({ environment: 'STAGING' as never })),
+      'VALIDATION_ERROR',
+    );
+    await expectCode(
+      service().create(newPlan({ summary: { action: 'UPDATE', count: -1, entity: 'TGFPAR' } })),
+      'VALIDATION_ERROR',
+    );
+    await expectCode(
+      service().create(
+        newPlan({ summary: { action: 'UPDATE', count: 1, entity: 'TGFPAR; DROP' } }),
+      ),
+      'VALIDATION_ERROR',
+    );
+  });
+});
+
+describe('PlansService.consume', () => {
+  it('consumes a PENDING plan once', async () => {
+    const svc = service();
+    const plan = await svc.create(newPlan());
+    const row = await svc.consume({ id: plan.id, token: plan.token, userId, sessionId });
+    expect(row.status).toBe('CONSUMED');
+    expect(row.consumedAt).toBeInstanceOf(Date);
+    expect(row.id).toBe(plan.id);
+  });
+
+  it('binds the token to the session', async () => {
+    const svc = service();
+    const plan = await svc.create(newPlan());
+    await expectCode(
+      svc.consume({ id: plan.id, token: plan.token, userId, sessionId: randomUUID() }),
+      'CONFIRMATION_INVALID',
+    );
+    expect(await statusOf(plan.id)).toBe('PENDING');
+  });
+
+  it('refuses another user, a forged token or a token for another plan', async () => {
+    const svc = service();
+    const plan = await svc.create(newPlan());
+    const other = await svc.create(newPlan());
+    const [, mac] = plan.token.split('.');
+    for (const attempt of [
+      { id: plan.id, token: plan.token, userId: otherUserId, sessionId },
+      { id: plan.id, token: `${plan.id}.${'A'.repeat(mac!.length)}`, userId, sessionId },
+      { id: plan.id, token: `${plan.id}.short`, userId, sessionId },
+      { id: plan.id, token: other.token, userId, sessionId },
+      { id: plan.id, token: 'garbage', userId, sessionId },
+      { id: 'not-a-uuid', token: 'not-a-uuid.x', userId, sessionId },
+      { id: randomUUID(), token: plan.token, userId, sessionId },
+    ]) {
+      await expectCode(svc.consume(attempt), 'CONFIRMATION_INVALID');
+    }
+    expect(await statusOf(plan.id)).toBe('PENDING');
+  });
+
+  it('expires after PLAN_TTL_SECONDS', async () => {
+    const past = (seconds: number) => () => new Date(Date.now() - seconds * 1000);
+    const expired = await service(past(TTL + 1)).create(newPlan());
+    await expectCode(
+      service().consume({ id: expired.id, token: expired.token, userId, sessionId }),
+      'CONFIRMATION_EXPIRED',
+    );
+    expect(await statusOf(expired.id)).toBe('EXPIRED');
+    // Still expired on a retry, never consumable again.
+    await expectCode(
+      service().consume({ id: expired.id, token: expired.token, userId, sessionId }),
+      'CONFIRMATION_EXPIRED',
+    );
+
+    const fresh = await service(past(TTL - 30)).create(newPlan());
+    const row = await service().consume({ id: fresh.id, token: fresh.token, userId, sessionId });
+    expect(row.status).toBe('CONSUMED');
+  });
+
+  it('refuses a second consume', async () => {
+    const svc = service();
+    const plan = await svc.create(newPlan());
+    await svc.consume({ id: plan.id, token: plan.token, userId, sessionId });
+    await expectCode(
+      svc.consume({ id: plan.id, token: plan.token, userId, sessionId }),
+      'CONFIRMATION_USED',
+    );
+  });
+
+  it('lets exactly one of two concurrent consumes win', async () => {
+    const svc = service();
+    const plan = await svc.create(newPlan());
+    const results = await Promise.allSettled([
+      svc.consume({ id: plan.id, token: plan.token, userId, sessionId }),
+      svc.consume({ id: plan.id, token: plan.token, userId, sessionId }),
+    ]);
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    const rejected = results.find((r) => r.status === 'rejected') as PromiseRejectedResult;
+    expect(isAppError(rejected.reason) && rejected.reason.code).toBe('CONFIRMATION_USED');
+  });
+
+  it('invalidates the plans of a rotated connection', async () => {
+    const svc = service();
+    const a = await svc.create(newPlan({ connectionId: 'c-1' }));
+    const b = await svc.create(newPlan({ connectionId: 'c-1' }));
+    const keep = await svc.create(newPlan({ connectionId: 'c-2' }));
+    const used = await svc.create(newPlan({ connectionId: 'c-1' }));
+    await svc.consume({ id: used.id, token: used.token, userId, sessionId });
+    await database.db.update(plans).set({ status: 'APPROVED' }).where(eq(plans.id, b.id));
+
+    expect(await svc.invalidateForConnection('c-1')).toBe(2);
+    expect(await statusOf(a.id)).toBe('INVALIDATED');
+    expect(await statusOf(b.id)).toBe('INVALIDATED');
+    expect(await statusOf(used.id)).toBe('CONSUMED');
+    expect(await statusOf(keep.id)).toBe('PENDING');
+    await expectCode(
+      svc.consume({ id: a.id, token: a.token, userId, sessionId }),
+      'CONFIRMATION_INVALID',
+    );
+    await expectCode(
+      svc.consume({ id: b.id, token: b.token, userId, sessionId }),
+      'CONFIRMATION_INVALID',
+    );
+  });
+
+  it('refuses a plan whose stored content no longer matches its hash', async () => {
+    const svc = service();
+    for (const change of [
+      sql`environment = 'PRODUCTION'`,
+      sql`connection_id = 'c-other'`,
+      sql`sql = 'UPDATE TGFPAR SET NOMEPARC = ''Y'''`,
+      sql`targets = '[]'::jsonb`,
+      sql`capability = jsonb_set(capability, '{route}', '"SCRATCH"')`,
+    ]) {
+      const plan = await svc.create(newPlan());
+      await database.db.execute(sql`update plans set ${change} where id = ${plan.id}`);
+      await expectCode(
+        svc.consume({ id: plan.id, token: plan.token, userId, sessionId }),
+        'CONFIRMATION_INVALID',
+      );
+      expect(await statusOf(plan.id)).toBe('PENDING');
+    }
+  });
+
+  it('requires the exact strong phrase', async () => {
+    const svc = service();
+    const plan = await svc.create(newPlan({ environment: 'PRODUCTION' }));
+    for (const strongConfirmation of [
+      undefined,
+      '',
+      'PRODUCTION UPDATE 2 TGFPAR',
+      'production update 3 tgfpar',
+    ]) {
+      await expectCode(
+        svc.consume({
+          id: plan.id,
+          token: plan.token,
+          userId,
+          sessionId,
+          ...(strongConfirmation === undefined ? {} : { strongConfirmation }),
+        }),
+        'CONFIRMATION_INVALID',
+      );
+    }
+    expect(await statusOf(plan.id)).toBe('PENDING');
+    const row = await svc.consume({
+      id: plan.id,
+      token: plan.token,
+      userId,
+      sessionId,
+      strongConfirmation: 'PRODUCTION UPDATE 3 TGFPAR',
+    });
+    expect(row.status).toBe('CONSUMED');
+  });
+
+  it('returns the original consumed plan on a retry with the same idempotency key', async () => {
+    const svc = service();
+    const plan = await svc.create(newPlan());
+    const input = { id: plan.id, token: plan.token, userId, sessionId, idempotencyKey: 'k-1' };
+    const first = await svc.consume(input);
+    const retry = await svc.consume(input);
+    expect(retry).toEqual(first);
+    expect(retry.idempotencyKey).toBe('k-1');
+
+    await expectCode(svc.consume({ ...input, idempotencyKey: 'k-2' }), 'CONFIRMATION_USED');
+    const { idempotencyKey: _ignored, ...withoutKey } = input;
+    await expectCode(svc.consume(withoutKey), 'CONFIRMATION_USED');
+    // The retry is still bound to the session.
+    await expectCode(svc.consume({ ...input, sessionId: randomUUID() }), 'CONFIRMATION_INVALID');
+  });
+
+  it('refuses an idempotency key already used for another plan', async () => {
+    const svc = service();
+    const a = await svc.create(newPlan());
+    const b = await svc.create(newPlan());
+    await svc.consume({ id: a.id, token: a.token, userId, sessionId, idempotencyKey: 'k-1' });
+    await expectCode(
+      svc.consume({ id: b.id, token: b.token, userId, sessionId, idempotencyKey: 'k-1' }),
+      'CONFIRMATION_INVALID',
+    );
+    expect(await statusOf(b.id)).toBe('PENDING');
+  });
+
+  it('refuses a malformed idempotency key', async () => {
+    const svc = service();
+    const plan = await svc.create(newPlan());
+    await expectCode(
+      svc.consume({
+        id: plan.id,
+        token: plan.token,
+        userId,
+        sessionId,
+        idempotencyKey: 'x'.repeat(201),
+      }),
+      'CONFIRMATION_INVALID',
+    );
+  });
+
+  it('cannot consume a plan requiring approval while PENDING', async () => {
+    const svc = service();
+    const plan = await svc.create(newPlan({ decision: decision({ requireApproval: true }) }));
+    await expectCode(
+      svc.consume({ id: plan.id, token: plan.token, userId, sessionId }),
+      'CONFIRMATION_INVALID',
+    );
+    expect(await statusOf(plan.id)).toBe('PENDING');
+
+    // No approval flow yet (Task 14.1): set APPROVED directly.
+    await database.db.update(plans).set({ status: 'APPROVED' }).where(eq(plans.id, plan.id));
+    const row = await svc.consume({ id: plan.id, token: plan.token, userId, sessionId });
+    expect(row.status).toBe('CONSUMED');
+  });
+});
