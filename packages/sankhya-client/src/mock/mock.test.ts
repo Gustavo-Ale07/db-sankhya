@@ -255,6 +255,111 @@ describe('mock Sankhya gateway', () => {
     expect(after.status).toBe(200);
   });
 
+  describe('fault scenarios for save verification', () => {
+    const saveName = (codparc: number, name: string) =>
+      call('DatasetSP.save', {
+        entityName: 'Parceiro',
+        fields: ['NOMEPARC'],
+        records: [{ pk: { CODPARC: codparc }, values: { '0': name } }],
+      });
+    const nameOf = async (codparc: number) =>
+      (
+        await mock.db.query<{ nomeparc: string }>(
+          'SELECT NOMEPARC FROM TGFPAR WHERE CODPARC = $1',
+          [codparc],
+        )
+      ).rows[0]!.nomeparc;
+    const loadParceiro = (codparc: number) =>
+      call('CRUDServiceProvider.loadRecords', {
+        dataSet: {
+          rootEntity: 'Parceiro',
+          offsetPage: '0',
+          entity: { fieldset: { list: 'NOMEPARC' } },
+          criteria: {
+            expression: { $: 'this.CODPARC = ?' },
+            parameter: [{ $: String(codparc), type: 'I' }],
+          },
+        },
+      });
+    const saveCalls = () => mock.calls.filter((c) => c.serviceName === 'DatasetSP.save').length;
+
+    it('after: N lets the first N matching calls through, then fires once', async () => {
+      mock.inject({ type: 'serverError', status: 500 }, { service: 'DatasetSP.save', after: 1 });
+      const before = saveCalls();
+      expect((await saveName(5, 'Primeiro')).body.status).toBe('1');
+      expect((await call('DbExplorerSP.executeQuery', { sql: 'SELECT 1' })).status).toBe(200);
+      expect((await saveName(5, 'Segundo')).status).toBe(500);
+      expect((await saveName(5, 'Terceiro')).body.status).toBe('1');
+      expect(saveCalls()).toBe(before + 3);
+      expect(await nameOf(5)).toBe('Terceiro');
+    });
+
+    it('a loadRecords read can be faulted while saves still work', async () => {
+      mock.inject(
+        { type: 'serverError', status: 503 },
+        { service: 'CRUDServiceProvider.loadRecords' },
+      );
+      expect((await saveName(6, 'Gravado')).body.status).toBe('1');
+      expect((await loadParceiro(6)).status).toBe(503);
+      expect((await loadParceiro(6)).body.status).toBe('1');
+    });
+
+    it('ignoreWrite answers success with the requested value but does not persist it', async () => {
+      const original = await nameOf(7);
+      mock.inject({ type: 'ignoreWrite' }, { service: 'DatasetSP.save' });
+      const { body } = await saveName(7, 'Nao Persistido');
+      expect(body.status).toBe('1');
+      expect(body.responseBody.result).toEqual([['Nao Persistido']]);
+      expect(await nameOf(7)).toBe(original);
+      expect(JSON.stringify((await loadParceiro(7)).body)).toContain(original);
+      expect((await saveName(7, 'Persistido')).body.status).toBe('1');
+      expect(await nameOf(7)).toBe('Persistido');
+    });
+
+    it('ignoreWrite with fields only drops the listed fields', async () => {
+      mock.inject({ type: 'ignoreWrite', fields: ['NOMEPARC'] }, { service: 'DatasetSP.save' });
+      const original = await nameOf(8);
+      const { body } = await call('DatasetSP.save', {
+        entityName: 'Parceiro',
+        fields: ['NOMEPARC', 'ATIVO'],
+        records: [{ pk: { CODPARC: 8 }, values: { '0': 'Ignorado', '1': 'N' } }],
+      });
+      expect(body.status).toBe('1');
+      expect(await nameOf(8)).toBe(original);
+      const after = await mock.db.query<{ ativo: string }>(
+        'SELECT ATIVO FROM TGFPAR WHERE CODPARC = 8',
+      );
+      expect(after.rows[0]!.ativo).toBe('N');
+    });
+
+    it('responseLost applies the write and drops the answer', async () => {
+      mock.inject({ type: 'responseLost' }, { service: 'DatasetSP.save' });
+      const res = await mock.handle({
+        method: 'POST',
+        url: '/gateway/v1/mge/service.sbr?serviceName=DatasetSP.save',
+        headers: { authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          requestBody: {
+            entityName: 'Parceiro',
+            fields: ['NOMEPARC'],
+            records: [{ pk: { CODPARC: 9 }, values: { '0': 'Aplicado Sem Resposta' } }],
+          },
+        }),
+      });
+      expect(res.kind).toBe('dropped');
+      expect(await nameOf(9)).toBe('Aplicado Sem Resposta');
+    });
+
+    it('the dataset can be changed directly between calls, and calls record request bodies', async () => {
+      await mock.db.query("UPDATE TGFPAR SET NOMEPARC = 'Alterado Fora' WHERE CODPARC = 10");
+      const read = await loadParceiro(10);
+      expect(JSON.stringify(read.body)).toContain('Alterado Fora');
+      const last = mock.calls.at(-1)!;
+      expect(last.serviceName).toBe('CRUDServiceProvider.loadRecords');
+      expect(last.requestBody).toMatchObject({ dataSet: { rootEntity: 'Parceiro' } });
+    });
+  });
+
   it('answers the Oracle and SQL Server primary key catalog queries', async () => {
     const oracle = await call('DbExplorerSP.executeQuery', {
       sql: "SELECT c.TABLE_NAME, cc.COLUMN_NAME FROM ALL_CONSTRAINTS c JOIN ALL_CONS_COLUMNS cc ON cc.OWNER = c.OWNER AND cc.CONSTRAINT_NAME = c.CONSTRAINT_NAME WHERE c.CONSTRAINT_TYPE = 'P' AND c.OWNER = SYS_CONTEXT('USERENV','CURRENT_SCHEMA') AND c.TABLE_NAME = 'TGFPAR'",

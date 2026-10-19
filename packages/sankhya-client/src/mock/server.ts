@@ -26,13 +26,25 @@ export type MockFault =
   /** Answers normally after `ms`. */
   | { type: 'delay'; ms: number }
   /** Applies the call, then drops the response, so a write's outcome is unknown to the caller. */
-  | { type: 'responseLost' };
+  | { type: 'responseLost' }
+  /**
+   * DatasetSP.save only: answers success, echoes the requested values, but does not persist the
+   * listed `fields` (default: every non-key field of the record). Other fields are saved normally.
+   */
+  | { type: 'ignoreWrite'; fields?: string[] };
 
 /** Narrows a queued fault to the calls it should hit. */
 export interface MockFaultTarget {
   service?: string;
   /** Only executeQuery calls whose SQL contains this text (case-insensitive), e.g. `FROM TDDCAM`. */
   sqlIncludes?: string;
+  /**
+   * Lets this many matching calls through untouched before the fault fires, e.g.
+   * `{ service: 'DatasetSP.save', after: 1 }` hits the 2nd save only. Matching calls are those
+   * that satisfy `service` and `sqlIncludes`. The first matching queued fault decides the call:
+   * while it is still skipping, later queued faults wait behind it.
+   */
+  after?: number;
 }
 
 export interface MockFaults {
@@ -59,7 +71,8 @@ export interface MockSankhya {
   baseUrl: string;
   fetch: typeof fetch;
   db: PGlite;
-  calls: Array<{ serviceName: string }>;
+  /** Every authenticated gateway call, in order (faulted ones included). */
+  calls: Array<{ serviceName: string; requestBody?: unknown }>;
   /** Queues a fault for the next matching gateway call (optionally one service or SQL text). */
   inject(fault: MockFault, opts?: MockFaultTarget): void;
   /** Drops every queued fault that has not fired yet. */
@@ -127,7 +140,8 @@ export async function createMockSankhya(opts: MockSankhyaOptions = {}): Promise<
 
   const tokens = new Map<string, number>();
   const faults: Array<MockFault & MockFaultTarget> = [...(opts.faults?.queue ?? [])];
-  const calls: Array<{ serviceName: string }> = [];
+  const calls: Array<{ serviceName: string; requestBody?: unknown }> = [];
+  const skipped = new Map<object, number>();
 
   const json = (status: number, body: unknown, headers: Record<string, string> = {}) =>
     ({
@@ -168,6 +182,13 @@ export async function createMockSankhya(opts: MockSankhyaOptions = {}): Promise<
         (f.sqlIncludes === undefined || sql.includes(f.sqlIncludes.toUpperCase())),
     );
     if (i < 0) return undefined;
+    const wanted = faults[i]!.after ?? 0;
+    const seen = skipped.get(faults[i]!) ?? 0;
+    if (seen < wanted) {
+      skipped.set(faults[i]!, seen + 1);
+      return undefined;
+    }
+    skipped.delete(faults[i]!);
     const [fault] = faults.splice(i, 1);
     return fault;
   }
@@ -187,7 +208,7 @@ export async function createMockSankhya(opts: MockSankhyaOptions = {}): Promise<
     }
 
     const serviceName = url.searchParams.get('serviceName') ?? '';
-    calls.push({ serviceName });
+    calls.push({ serviceName, requestBody: bodyOf(req.body) });
     const fault = takeFault(serviceName, req.body);
     if (fault) {
       const early = await applyFault(fault, req.signal);
@@ -212,7 +233,7 @@ export async function createMockSankhya(opts: MockSankhyaOptions = {}): Promise<
         return json(400, { error: 'invalid_json' });
       }
       const requestBody = isRecord(parsed) ? parsed.requestBody : undefined;
-      response = await runService(serviceName, requestBody);
+      response = await runService(serviceName, requestBody, fault);
     }
     if (fault?.type === 'responseLost') return { kind: 'dropped' };
     return response;
@@ -245,11 +266,16 @@ export async function createMockSankhya(opts: MockSankhyaOptions = {}): Promise<
         await sleep(fault.ms, signal);
         return undefined;
       case 'responseLost':
+      case 'ignoreWrite':
         return undefined;
     }
   }
 
-  async function runService(serviceName: string, body: unknown): Promise<MockResponse> {
+  async function runService(
+    serviceName: string,
+    body: unknown,
+    fault?: MockFault,
+  ): Promise<MockResponse> {
     try {
       switch (serviceName) {
         case 'DbExplorerSP.executeQuery':
@@ -257,7 +283,7 @@ export async function createMockSankhya(opts: MockSankhyaOptions = {}): Promise<
         case 'CRUDServiceProvider.loadRecords':
           return envelope(serviceName, await loadRecords(body));
         case 'DatasetSP.save': {
-          const result = await save(body);
+          const result = await save(body, fault?.type === 'ignoreWrite' ? fault : undefined);
           return envelope(
             serviceName,
             { result },
@@ -347,7 +373,7 @@ export async function createMockSankhya(opts: MockSankhyaOptions = {}): Promise<
     };
   }
 
-  async function save(body: unknown): Promise<unknown[][]> {
+  async function save(body: unknown, ignore?: { fields?: string[] }): Promise<unknown[][]> {
     if (!isRecord(body) || typeof body.entityName !== 'string' || !Array.isArray(body.fields)) {
       throw new MockServiceError('entityName e fields são obrigatórios');
     }
@@ -369,6 +395,17 @@ export async function createMockSankhya(opts: MockSankhyaOptions = {}): Promise<
             throw new MockServiceError(`Índice de campo inválido: ${key}`);
           }
           values.set(field, value);
+        }
+        const requested = new Map(values);
+        if (ignore) {
+          for (const f of [...values.keys()]) {
+            if (
+              !table.pk.includes(f) &&
+              (ignore.fields === undefined || ignore.fields.includes(f))
+            ) {
+              values.delete(f);
+            }
+          }
         }
         let pk: Record<string, unknown>;
         if (isRecord(rec.pk)) {
@@ -431,7 +468,13 @@ export async function createMockSankhya(opts: MockSankhyaOptions = {}): Promise<
         );
         const saved = row.rows[0];
         if (!saved) throw new MockServiceError('Registro não encontrado');
-        out.push(saved.map((v) => (v === null ? null : String(toWire(v)))));
+        out.push(
+          saved.map((v, i) => {
+            const name = fields[i]!;
+            const shown = ignore && requested.has(name) ? requested.get(name) : v;
+            return shown === null || shown === undefined ? null : String(toWire(shown));
+          }),
+        );
       }
       return out;
     });
@@ -619,6 +662,15 @@ function findNunota(value: unknown, depth = 0): number | undefined {
     if (found !== undefined) return found;
   }
   return undefined;
+}
+
+function bodyOf(raw: string): unknown {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return isRecord(parsed) ? parsed.requestBody : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function toWire(v: unknown): unknown {
