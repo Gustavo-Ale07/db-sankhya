@@ -197,9 +197,89 @@ describe('AuditService lifecycle events', () => {
     });
     expect(JSON.stringify(await allRows(handle))).not.toContain(CONFIGURED_SECRET);
   });
+
+  it('masks mid-word sensitive keys at any depth in details, policyDecision and verification', async () => {
+    const { handle, audit } = await setup();
+    await audit.recordVerification(ctx(), {
+      passed: true,
+      verification: { rows: [{ CODPARC: 1, senhaAntiga: 'v1' }], authorizationHeader: 'v2' },
+      policyDecision: { rules: [{ id: 'r1', client_secret_enc: 'v3' }], SessionCookie: 'v4' },
+      details: { nested: { apiKeyValue: 'v5', list: [{ AD_COOKIE_WEB: 'v6' }] }, kept: 'ok' },
+    });
+    await audit.record({
+      action: 'auth.login',
+      status: 'success',
+      details: { SESSION_KEY: 'v7', x_token_enc: 'v8', AUTHORIZATION_CODE: 'v9' },
+    });
+    const rows = await allRows(handle);
+    const json = JSON.stringify(rows);
+    for (let i = 1; i <= 9; i++) expect(json).not.toContain(`"v${i}"`);
+    const verification = rows.find((r) => r.action === 'VERIFICATION')!;
+    expect(verification.verification).toEqual({
+      rows: [{ CODPARC: 1, senhaAntiga: REDACTED }],
+      authorizationHeader: REDACTED,
+      passed: true,
+    });
+    expect(verification.policyDecision).toEqual({
+      rules: [{ id: 'r1', client_secret_enc: REDACTED }],
+      SessionCookie: REDACTED,
+    });
+    expect(verification.details).toEqual({
+      nested: { apiKeyValue: REDACTED, list: [{ AD_COOKIE_WEB: REDACTED }] },
+      kept: 'ok',
+    });
+  });
+
+  it('bounds the stored snapshot size', async () => {
+    const { handle, audit } = await setup();
+    await audit.recordPlanExecuted(ctx(), {
+      outcome: 'success',
+      before: Array.from({ length: 50 }, (_, i) => ({
+        ID: i,
+        ...Object.fromEntries(Array.from({ length: 10 }, (_, c) => [`C${c}`, 'x'.repeat(5000)])),
+      })),
+    });
+    const [row] = await allRows(handle);
+    const before = (row?.snapshot as { before: Record<string, unknown> }).before;
+    expect(JSON.stringify(row?.snapshot).length).toBeLessThanOrEqual(256 * 1024 + 64);
+    expect(before).toMatchObject({ truncated: true, totalRows: 50 });
+    expect(before.truncatedBytes).toBeGreaterThan(0);
+  });
+});
+
+describe('audit_events environment constraint', () => {
+  it('accepts NULL and the three environments, and rejects anything else', async () => {
+    const { handle } = await setup();
+    for (const env of ['PRODUCTION', 'HOMOLOGATION', 'SANDBOX'])
+      await handle.db.execute(
+        sql`INSERT INTO audit_events (action, status, environment) VALUES ('x', 'info', ${env})`,
+      );
+    await handle.db.execute(sql`INSERT INTO audit_events (action, status) VALUES ('x', 'info')`);
+    for (const env of ['LOCAL', 'sandbox', ''])
+      await expect(
+        handle.db.execute(
+          sql`INSERT INTO audit_events (action, status, environment) VALUES ('x', 'info', ${env})`,
+        ),
+      ).rejects.toThrow();
+    expect(await allRows(handle)).toHaveLength(4);
+  });
 });
 
 describe('AuditService search', () => {
+  it('pages in a stable order when timestamps tie (created_at desc, id desc)', async () => {
+    const { handle, audit } = await setup();
+    for (let i = 0; i < 7; i++)
+      await handle.db.execute(
+        sql`INSERT INTO audit_events (action, status, created_at) VALUES ('tie', 'info', '2026-01-01T00:00:00Z')`,
+      );
+    const all = await handle.db.select({ id: auditEvents.id }).from(auditEvents);
+    const expected = all.map((r) => r.id).sort((a, b) => (a < b ? 1 : a > b ? -1 : 0));
+    const paged: string[] = [];
+    for (let offset = 0; offset < 7; offset += 2)
+      paged.push(...(await audit.list({ action: 'tie', limit: 2, offset })).items.map((i) => i.id));
+    expect(paged).toEqual(expected);
+  });
+
   it('filters by plan id, user, environment, connection, outcome and date range', async () => {
     const { audit } = await setup();
     await audit.recordPlanCreated(ctx(), {});

@@ -241,6 +241,10 @@ export const auditEvents = pgTable(
     index('audit_events_action_idx').on(t.action),
     index('audit_events_plan_idx').on(t.planId),
     index('audit_events_connection_idx').on(t.connectionId, t.createdAt),
+    check(
+      'audit_events_environment_check',
+      sql`${t.environment} IS NULL OR ${t.environment} IN ('PRODUCTION', 'HOMOLOGATION', 'SANDBOX')`,
+    ),
   ],
 );
 

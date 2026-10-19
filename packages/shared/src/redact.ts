@@ -66,21 +66,28 @@ function scrubPatterns(s: string): string {
     .replace(JWT_PATTERN, REDACTED);
 }
 
-function walk(value: unknown, scrub: StringScrubber, seen: WeakSet<object>): unknown {
+type KeyMatcher = (key: string) => boolean;
+
+function walk(
+  value: unknown,
+  scrub: StringScrubber,
+  seen: WeakSet<object>,
+  sensitive: KeyMatcher = isSensitiveKey,
+): unknown {
   if (typeof value === 'string') return scrub(value);
   if (value === null || typeof value !== 'object') return value;
   if (value instanceof Date) return new Date(value.getTime());
   if (seen.has(value)) return '[Circular]';
   seen.add(value);
 
-  if (Array.isArray(value)) return value.map((item) => walk(item, scrub, seen));
+  if (Array.isArray(value)) return value.map((item) => walk(item, scrub, seen, sensitive));
   if (value instanceof Error) {
     // Own enumerable props miss message/stack; keep them (scrubbed).
     const err: Record<string, unknown> = { name: value.name, message: scrub(value.message) };
     if (value.stack) err.stack = scrub(value.stack);
     for (const [key, child] of Object.entries(value)) {
       if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
-      err[key] = isSensitiveKey(key) ? REDACTED : walk(child, scrub, seen);
+      err[key] = sensitive(key) ? REDACTED : walk(child, scrub, seen, sensitive);
     }
     return err;
   }
@@ -88,7 +95,7 @@ function walk(value: unknown, scrub: StringScrubber, seen: WeakSet<object>): unk
   const out: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value)) {
     if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
-    out[key] = isSensitiveKey(key) ? REDACTED : walk(child, scrub, seen);
+    out[key] = sensitive(key) ? REDACTED : walk(child, scrub, seen, sensitive);
   }
   return out;
 }
@@ -125,47 +132,113 @@ export function createRedactor(secretValues: readonly string[]): <T>(value: T) =
 
 /** Most rows a before/after audit snapshot keeps. */
 export const SNAPSHOT_MAX_ROWS = 50;
+/** Longest string value a snapshot keeps; longer ones are clipped and end with `…`. */
+export const SNAPSHOT_MAX_STRING_CHARS = 2000;
+/** Largest serialized (UTF-8 JSON) size of one snapshot. */
+export const SNAPSHOT_MAX_BYTES = 256 * 1024;
 
 /**
- * Fragments that make an ERP column sensitive wherever they appear in its name (e.g.
- * `AD_SENHA_WEB`). Column names are checked more broadly than general keys: an over-masked
- * snapshot value is harmless, a leaked credential is not.
+ * Fragments that make a key sensitive wherever they appear in it (e.g. `AD_SENHA_WEB`,
+ * `authorizationHeader`, `client_secret_enc`). Audit data is checked more broadly than log
+ * keys: an over-masked audit value is harmless, a leaked credential is not.
  */
-const SENSITIVE_COLUMN_FRAGMENTS = ['senha', 'password', 'passwd', 'token', 'secret'];
+const SENSITIVE_COLUMN_FRAGMENTS = [
+  'senha',
+  'password',
+  'passwd',
+  'token',
+  'secret',
+  'cookie',
+  'session',
+  'authorization',
+  'bearer',
+  'apikey',
+  'credential',
+];
 
-/** True when a column's values must never be stored in an audit snapshot (case-insensitive). */
+/**
+ * True when a column's or audit key's values must never be stored (case-insensitive,
+ * separators ignored, matched anywhere in the name).
+ */
 export function isSensitiveColumn(name: string): boolean {
   if (isSensitiveKey(name)) return true;
   const k = normalizeKey(name);
   return SENSITIVE_COLUMN_FRAGMENTS.some((fragment) => k.includes(fragment));
 }
 
-export interface RedactedSnapshot {
-  rows: unknown[];
-  /** Rows offered before the cap was applied. */
-  totalRows: number;
-  /** True when rows beyond the cap were dropped. */
-  truncated: boolean;
+/**
+ * Like {@link redact}, but masks every key that merely contains a sensitive word, at any depth.
+ * Used for audit JSON (snapshots, details, policy decisions, verification results).
+ */
+export function redactBroad<T>(value: T): unknown {
+  return walk(value, scrubPatterns, new WeakSet(), isSensitiveColumn);
 }
 
+export interface RedactedSnapshot {
+  rows: unknown[];
+  /** Rows offered before any cap was applied. */
+  totalRows: number;
+  /** True when rows were dropped by the row cap or the byte cap. */
+  truncated: boolean;
+  /** Serialized bytes of the rows dropped because of the byte cap (0 when none). */
+  truncatedBytes: number;
+}
+
+const clipString: StringScrubber = (s) => {
+  const scrubbed = scrubPatterns(s);
+  return scrubbed.length > SNAPSHOT_MAX_STRING_CHARS
+    ? `${scrubbed.slice(0, SNAPSHOT_MAX_STRING_CHARS)}…`
+    : scrubbed;
+};
+
+/** UTF-8 byte length of a string (JSON.stringify output has no lone surrogates). */
+export function utf8ByteLength(s: string): number {
+  let n = 0;
+  for (const ch of s) {
+    const c = ch.codePointAt(0) ?? 0;
+    n += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+  }
+  return n;
+}
+
+const byteLength = (value: unknown): number => utf8ByteLength(JSON.stringify(value) ?? '');
+
+/** Room kept for the envelope ({rows, totalRows, truncated, truncatedBytes}). */
+const SNAPSHOT_ENVELOPE_BYTES = 128;
+
 /**
- * Copies at most `maxRows` (never more than {@link SNAPSHOT_MAX_ROWS}) rows, masking every
- * sensitive column and scrubbing credential-shaped strings in the rest. A row that is not a
- * plain object has no column names to check and is replaced whole (fail closed).
+ * Copies at most `maxRows` (never more than {@link SNAPSHOT_MAX_ROWS}) rows, masking every key
+ * that contains a sensitive word at any depth, scrubbing credential-shaped strings and clipping
+ * long strings. Rows that would push the serialized snapshot past {@link SNAPSHOT_MAX_BYTES} are
+ * dropped (a single row wider than the cap is dropped too). A row that is not a plain object has
+ * no column names to check and is replaced whole (fail closed).
  */
 export function redactSnapshot(
   rows: readonly Record<string, unknown>[],
   maxRows: number = SNAPSHOT_MAX_ROWS,
 ): RedactedSnapshot {
   const cap = Math.max(0, Math.min(Math.floor(maxRows), SNAPSHOT_MAX_ROWS));
-  const kept = rows.slice(0, cap).map((row) => {
-    if (row === null || typeof row !== 'object' || Array.isArray(row)) return REDACTED;
-    const out: Record<string, unknown> = {};
-    for (const [column, value] of Object.entries(row)) {
-      if (column === '__proto__' || column === 'constructor' || column === 'prototype') continue;
-      out[column] = isSensitiveColumn(column) ? REDACTED : redact(value);
+  const budget = SNAPSHOT_MAX_BYTES - SNAPSHOT_ENVELOPE_BYTES;
+  const kept: unknown[] = [];
+  let used = 2; // the array brackets
+  let truncatedBytes = 0;
+  for (const row of rows.slice(0, cap)) {
+    const copy =
+      row === null || typeof row !== 'object' || Array.isArray(row)
+        ? REDACTED
+        : walk(row, clipString, new WeakSet(), isSensitiveColumn);
+    const size = byteLength(copy) + (kept.length ? 1 : 0); // comma separator
+    if (truncatedBytes > 0 || used + size > budget) {
+      truncatedBytes += size;
+      continue;
     }
-    return out;
-  });
-  return { rows: kept, totalRows: rows.length, truncated: rows.length > kept.length };
+    kept.push(copy);
+    used += size;
+  }
+  return {
+    rows: kept,
+    totalRows: rows.length,
+    truncated: rows.length > kept.length,
+    truncatedBytes,
+  };
 }

@@ -8,13 +8,18 @@ import type {
   QueryHistoryRow,
   SavedQueryRow,
 } from '@dbx/database';
-import { AppError, redactSnapshot } from '@dbx/shared';
+import { AppError, redactBroad, redactSnapshot } from '@dbx/shared';
 import type { Environment } from '@dbx/shared';
 
 type Redactor = (value: unknown) => unknown;
 
 const MAX_STATEMENT_CHARS = 20_000;
 const MAX_ERROR_CHARS = 2_000;
+
+/** Broad (contains-match) key redaction for audit JSON columns; null/undefined pass through. */
+function broad<T>(value: T): T {
+  return value === undefined || value === null ? value : (redactBroad(value) as T);
+}
 
 function clip(value: string | null | undefined, max: number): string | null {
   if (value === null || value === undefined) return null;
@@ -96,10 +101,11 @@ export class AuditService {
       before: r(event.before),
       after: r(event.after),
       gatewayCalls: r(event.gatewayCalls),
-      details: r(event.details),
-      verification: r(event.verification),
-      policyDecision: r(event.policyDecision),
-      snapshot: r(event.snapshot),
+      // Audit JSON gets the broad matcher: any key containing a sensitive word, at any depth.
+      details: r(broad(event.details)),
+      verification: r(broad(event.verification)),
+      policyDecision: r(broad(event.policyDecision)),
+      snapshot: r(broad(event.snapshot)),
     });
   }
 
@@ -218,7 +224,7 @@ export class AuditService {
         .select()
         .from(auditEvents)
         .where(where)
-        .orderBy(desc(auditEvents.createdAt))
+        .orderBy(desc(auditEvents.createdAt), desc(auditEvents.id))
         .limit(filters.limit)
         .offset(filters.offset),
       this.db

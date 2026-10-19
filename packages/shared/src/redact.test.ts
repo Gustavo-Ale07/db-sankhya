@@ -1,13 +1,134 @@
 import { describe, expect, it } from 'vitest';
 import {
   REDACTED,
+  SNAPSHOT_MAX_BYTES,
   SNAPSHOT_MAX_ROWS,
+  SNAPSHOT_MAX_STRING_CHARS,
   createRedactor,
   isSensitiveColumn,
   isSensitiveKey,
   redact,
+  redactBroad,
   redactSnapshot,
+  utf8ByteLength,
 } from './redact';
+
+const MID_WORD_NAMES = [
+  'senhaAntiga',
+  'client_secret_enc',
+  'cookies',
+  'authorizationHeader',
+  'SessionCookie',
+  'passwordConfirm',
+  'x_token_enc',
+  'apiKeyValue',
+  'AD_COOKIE_WEB',
+  'SESSION_KEY',
+  'AUTHORIZATION_CODE',
+];
+
+describe('broad (contains) matching for audit data', () => {
+  it('treats names containing a sensitive word anywhere as sensitive', () => {
+    for (const name of [...MID_WORD_NAMES, 'bearerValue', 'USER_CREDENTIALS'])
+      expect(isSensitiveColumn(name), name).toBe(true);
+  });
+
+  it('masks mid-word names in snapshot rows', () => {
+    const row = Object.fromEntries(MID_WORD_NAMES.map((n) => [n, `value-of-${n}`]));
+    const out = redactSnapshot([{ ID: 1, ...row }]);
+    expect(out.rows[0]).toEqual({
+      ID: 1,
+      ...Object.fromEntries(MID_WORD_NAMES.map((n) => [n, REDACTED])),
+    });
+  });
+
+  it('masks sensitive keys inside nested objects and arrays of snapshot values', () => {
+    const out = redactSnapshot([
+      {
+        ID: 1,
+        META: { owner: 'x', senhaAntiga: 'n1', inner: [{ apiKeyValue: 'n2', ok: 1 }] },
+        LIST: [{ SessionCookie: 'n3' }, 'plain', ['deep', { x_token_enc: 'n4' }]],
+      },
+    ]);
+    expect(out.rows[0]).toEqual({
+      ID: 1,
+      META: { owner: 'x', senhaAntiga: REDACTED, inner: [{ apiKeyValue: REDACTED, ok: 1 }] },
+      LIST: [{ SessionCookie: REDACTED }, 'plain', ['deep', { x_token_enc: REDACTED }]],
+    });
+  });
+
+  it('redactBroad masks nested mid-word keys and scrubs credentials in strings', () => {
+    const out = redactBroad({
+      reason: 'sent Bearer abc.def.ghi1 upstream',
+      rules: [{ id: 'r1', AUTHORIZATION_CODE: 'n1' }],
+      ctx: { cookies: 'n2', nested: { client_secret_enc: 'n3' } },
+    });
+    expect(out).toEqual({
+      reason: `sent Bearer ${REDACTED} upstream`,
+      rules: [{ id: 'r1', AUTHORIZATION_CODE: REDACTED }],
+      ctx: { cookies: REDACTED, nested: { client_secret_enc: REDACTED } },
+    });
+  });
+});
+
+describe('snapshot size bounds', () => {
+  it('clips long string values to 2000 characters with a marker', () => {
+    expect(SNAPSHOT_MAX_STRING_CHARS).toBe(2000);
+    const out = redactSnapshot([{ ID: 1, OBS: 'a'.repeat(5000), NESTED: { t: 'b'.repeat(3000) } }]);
+    const row = out.rows[0] as { OBS: string; NESTED: { t: string } };
+    expect(row.OBS).toBe(`${'a'.repeat(2000)}…`);
+    expect(row.NESTED.t).toBe(`${'b'.repeat(2000)}…`);
+    expect(out.truncated).toBe(false);
+  });
+
+  it('caps the serialized snapshot at 256 KB and records the dropped bytes', () => {
+    expect(SNAPSHOT_MAX_BYTES).toBe(256 * 1024);
+    // 50 rows x 10 columns x 2000 chars is about 1 MB before the byte cap.
+    const rows = Array.from({ length: 50 }, (_, i) => ({
+      ID: i,
+      ...Object.fromEntries(Array.from({ length: 10 }, (_, c) => [`C${c}`, 'x'.repeat(2000)])),
+    }));
+    const out = redactSnapshot(rows);
+    expect(utf8ByteLength(JSON.stringify(out))).toBeLessThanOrEqual(SNAPSHOT_MAX_BYTES);
+    expect(out.rows.length).toBeGreaterThan(0);
+    expect(out.rows.length).toBeLessThan(50);
+    expect(out.truncated).toBe(true);
+    expect(out.truncatedBytes).toBeGreaterThan(0);
+    expect(out.totalRows).toBe(50);
+  });
+
+  it('drops a single row wider than the cap instead of storing it', () => {
+    const wide = Object.fromEntries(
+      Array.from({ length: 300 }, (_, c) => [`COL_${c}`, 'y'.repeat(1999)]),
+    );
+    const out = redactSnapshot([wide]);
+    expect(JSON.stringify(out).length).toBeLessThanOrEqual(SNAPSHOT_MAX_BYTES);
+    expect(out.rows).toEqual([]);
+    expect(out.truncated).toBe(true);
+    expect(out.truncatedBytes).toBeGreaterThan(SNAPSHOT_MAX_BYTES);
+  });
+
+  it('counts multi-byte characters as bytes', () => {
+    // 2000 two-byte characters per value: about 1 MB in UTF-8, under 256 K in UTF-16 units.
+    const rows = Array.from({ length: 50 }, () =>
+      Object.fromEntries(Array.from({ length: 5 }, (_, c) => [`T${c}`, 'ç'.repeat(2000)])),
+    );
+    const out = redactSnapshot(rows);
+    expect(utf8ByteLength(JSON.stringify(out))).toBeLessThanOrEqual(SNAPSHOT_MAX_BYTES);
+  });
+
+  it('measures UTF-8 bytes per code point', () => {
+    expect(utf8ByteLength('a')).toBe(1);
+    expect(utf8ByteLength('ç')).toBe(2);
+    expect(utf8ByteLength('€')).toBe(3);
+    expect(utf8ByteLength('😀')).toBe(4);
+    expect(utf8ByteLength('aç€😀')).toBe(10);
+  });
+
+  it('reports no truncatedBytes when nothing was dropped for size', () => {
+    expect(redactSnapshot([{ ID: 1 }]).truncatedBytes).toBe(0);
+  });
+});
 
 describe('redact', () => {
   it('replaces sensitive keys at any depth, case-insensitively', () => {
@@ -205,6 +326,7 @@ describe('redactSnapshot', () => {
       ],
       totalRows: 2,
       truncated: false,
+      truncatedBytes: 0,
     });
     expect(JSON.stringify(out)).not.toContain('plain-');
   });
