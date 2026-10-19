@@ -1,4 +1,5 @@
-// Bundles the API (and the workspace packages it uses) into dist/server.mjs.
+// Bundles the API (and the workspace packages it uses) into dist/server.mjs and
+// dist/scratch-worker.mjs.
 // Third-party dependencies stay external and are installed in production node_modules.
 import { cp, rm } from 'node:fs/promises';
 import { dirname, isAbsolute, resolve } from 'node:path';
@@ -11,8 +12,13 @@ const dist = resolve(root, 'dist');
 await rm(dist, { recursive: true, force: true });
 
 await build({
-  entryPoints: [resolve(root, 'src/server.ts')],
-  outfile: resolve(dist, 'server.mjs'),
+  // The scratch worker runs in its own thread and is loaded from dist/scratch-worker.mjs.
+  entryPoints: {
+    server: resolve(root, 'src/server.ts'),
+    'scratch-worker': resolve(root, 'src/services/scratch-worker.ts'),
+  },
+  outdir: dist,
+  outExtension: { '.js': '.mjs' },
   bundle: true,
   platform: 'node',
   target: 'node22',
