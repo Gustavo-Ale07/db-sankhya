@@ -69,7 +69,9 @@ test('rejects a wrong password, then logs in and forces the bootstrap password c
 });
 
 test('shows the Sankhya data dictionary in the schema tree', async () => {
+  await expect(page.getByTestId('environment-banner')).toBeVisible();
   const schema = page.getByRole('complementary', { name: 'Schema' });
+  await schema.getByTestId('schema-group-TGF').click();
   await expect(schema.getByTestId('schema-table-TGFPAR')).toBeVisible();
   await expect(schema.getByTestId('schema-table-TGFPRO')).toBeVisible();
   await schema.getByPlaceholder('Filtrar tabelas e colunas…').fill('TSICID');
