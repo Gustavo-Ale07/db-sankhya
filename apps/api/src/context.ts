@@ -7,6 +7,7 @@ import type { SessionsService } from './services/sessions';
 import type { UsersService } from './services/users';
 import type { ExecutionRegistry } from './services/executions';
 import type { MetadataService } from './services/metadata';
+import type { PolicyService } from './services/policy';
 
 export interface AppServices {
   config: AppConfig;
@@ -21,6 +22,8 @@ export interface AppServices {
   connections: ConnectionsService;
   /** Data dictionary catalogs of the Sankhya connections. */
   metadata: MetadataService;
+  /** Persisted access policy rules, validated and cached. */
+  policies: PolicyService;
   /** Masks configured secrets in anything sent back to clients. */
   redact: (value: unknown) => unknown;
   executions: ExecutionRegistry;

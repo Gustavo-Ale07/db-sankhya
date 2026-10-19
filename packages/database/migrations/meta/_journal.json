@@ -43,6 +43,13 @@
       "when": 1792417583780,
       "tag": "0005_identity_bootstrap",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1792425271923,
+      "tag": "0006_policies",
+      "breakpoints": true
     }
   ]
 }

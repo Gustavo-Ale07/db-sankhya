@@ -17,6 +17,7 @@ import { ConnectionsService } from './services/connections';
 import type { ConnectionsDeps } from './services/connections';
 import { ExecutionRegistry } from './services/executions';
 import { MetadataService } from './services/metadata';
+import { PolicyService } from './services/policy';
 import { AuditService, HistoryService, SavedQueriesService } from './services/records';
 import { SessionsService } from './services/sessions';
 import { UsersService } from './services/users';
@@ -72,6 +73,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     saved: new SavedQueriesService(database.db),
     connections,
     metadata: new MetadataService(database.db, { getRuntime: (id) => connections.getRuntime(id) }),
+    policies: new PolicyService(database.db, app.log),
     redact: redactor,
     executions: new ExecutionRegistry(),
     startedAt: new Date(),

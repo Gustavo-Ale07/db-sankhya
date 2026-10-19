@@ -294,6 +294,50 @@ export const metadataCache = pgTable('metadata_cache', {
   fetchedAt: timestamp('fetched_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
+/**
+ * Access policy rules evaluated by `evaluatePolicy` (packages/shared). Empty `environments`,
+ * `connection_ids` and `entities` mean "all". The API validates every rule on save and again on
+ * load; an invalid enabled rule makes every policy-evaluated action fail closed.
+ */
+export const policies = pgTable(
+  'policies',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    name: text('name').notNull(),
+    effect: text('effect', { enum: ['ALLOW', 'DENY'] }).notNull(),
+    subjectType: text('subject_type', { enum: ['user', 'group', 'everyone'] }).notNull(),
+    /** User or group id; null for `everyone`. */
+    subjectId: uuid('subject_id'),
+    environments: text('environments')
+      .array()
+      .notNull()
+      .default(sql`'{}'::text[]`),
+    connectionIds: uuid('connection_ids')
+      .array()
+      .notNull()
+      .default(sql`'{}'::uuid[]`),
+    /** Permissions or permission globs (`DATA.*`). */
+    actions: text('actions').array().notNull(),
+    /** Entity globs (`TGF*`, `SCHEMA.TABLE`). */
+    entities: text('entities')
+      .array()
+      .notNull()
+      .default(sql`'{}'::text[]`),
+    columns: text('columns')
+      .array()
+      .notNull()
+      .default(sql`'{}'::text[]`),
+    limits: jsonb('limits').$type<Record<string, unknown>>().notNull().default({}),
+    overrideWhereRequired: boolean('override_where_required').notNull().default(false),
+    enabled: boolean('enabled').notNull().default(true),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    check('policies_effect_check', sql`${t.effect} in ('ALLOW', 'DENY')`),
+    check('policies_subject_type_check', sql`${t.subjectType} in ('user', 'group', 'everyone')`),
+  ],
+);
+
 export type UserRow = typeof users.$inferSelect;
 export type SessionRow = typeof sessions.$inferSelect;
 export type RoleRow = typeof roles.$inferSelect;
@@ -306,3 +350,5 @@ export type WritePreviewRow = typeof writePreviews.$inferSelect;
 export type MetadataCacheRow = typeof metadataCache.$inferSelect;
 export type ConnectionRow = typeof connections.$inferSelect;
 export type NewConnection = typeof connections.$inferInsert;
+export type PolicyRow = typeof policies.$inferSelect;
+export type NewPolicy = typeof policies.$inferInsert;
