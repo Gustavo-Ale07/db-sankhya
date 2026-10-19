@@ -71,6 +71,13 @@
       "when": 1792430623014,
       "tag": "0009_approvals",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1792438771803,
+      "tag": "0010_audit",
+      "breakpoints": true
     }
   ]
 }
