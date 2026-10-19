@@ -179,6 +179,8 @@ describe('Sankhya runtime configuration', () => {
     expect(c.globalWriteEnabled).toBe(false);
     expect(c.demoMode).toBe(false);
     expect(c.planTtlSeconds).toBe(300);
+    expect(c.approvalTtlMinutes).toBe(60);
+    expect(() => loadConfig({ APPROVAL_TTL_MINUTES: '0' })).toThrow(/APPROVAL_TTL_MINUTES/);
     expect(c.sankhya).toMatchObject({
       mode: 'mock',
       allowedHosts: ['api.sankhya.com.br', 'api.sandbox.sankhya.com.br'],

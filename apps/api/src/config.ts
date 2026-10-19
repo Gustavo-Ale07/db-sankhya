@@ -116,6 +116,8 @@ const envSchema = z.object({
   WRITE_TO_SANKHYA: bool(false),
   GLOBAL_WRITE_ENABLED: bool(false),
   PLAN_TTL_SECONDS: int(300, 30, 3600),
+  /** Lifetime of a plan that requires approval (four eyes), in minutes. */
+  APPROVAL_TTL_MINUTES: int(60, 1, 24 * 60),
   SANKHYA_BASE_URL: optionalText,
   SANKHYA_CLIENT_ID: optionalText,
   SANKHYA_CLIENT_SECRET: optionalText,
@@ -190,6 +192,8 @@ export interface AppConfig {
   globalWriteEnabled: boolean;
   demoMode: boolean;
   planTtlSeconds: number;
+  /** APPROVAL_TTL_MINUTES: lifetime of plans that require approval. */
+  approvalTtlMinutes: number;
   sankhya: SankhyaConfig;
   scratch: {
     maxWorkspaces: number;
@@ -363,6 +367,7 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
     globalWriteEnabled: e.GLOBAL_WRITE_ENABLED,
     demoMode: e.DEMO_MODE,
     planTtlSeconds: e.PLAN_TTL_SECONDS,
+    approvalTtlMinutes: e.APPROVAL_TTL_MINUTES,
     sankhya: {
       mode: sankhyaMode ?? 'live',
       allowedHosts: e.SANKHYA_ALLOWED_HOSTS.map((h) => h.toLowerCase()),

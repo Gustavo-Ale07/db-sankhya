@@ -281,6 +281,45 @@ export const plans = pgTable(
   ],
 );
 
+export const APPROVAL_DECISIONS = ['APPROVE', 'REJECT'] as const;
+export type ApprovalDecision = (typeof APPROVAL_DECISIONS)[number];
+
+/**
+ * Four-eyes approval of a plan that requires one (one approval per plan). `plan_hash` is copied
+ * from the plan when it is requested and must still match when the plan is approved and consumed.
+ * The approval expires together with its plan. Only the decision columns ever change, once.
+ * `decided_by` has no foreign key, so the decider stays on record if the account is removed.
+ */
+export const approvals = pgTable(
+  'approvals',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    planId: uuid('plan_id')
+      .notNull()
+      .references(() => plans.id, { onDelete: 'cascade' }),
+    planHash: text('plan_hash').notNull(),
+    requestedBy: uuid('requested_by')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    decidedBy: uuid('decided_by'),
+    decision: text('decision', { enum: APPROVAL_DECISIONS }),
+    reason: text('reason'),
+    createdAt: createdAt(),
+    decidedAt: timestamp('decided_at', { withTimezone: true }),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+  },
+  (t) => [
+    uniqueIndex('approvals_plan_key').on(t.planId),
+    index('approvals_pending_idx').on(t.decision, t.expiresAt),
+    check('approvals_decision_check', sql`${t.decision} in ('APPROVE', 'REJECT')`),
+    check(
+      'approvals_decided_check',
+      sql`(${t.decision} is null) = (${t.decidedBy} is null) and (${t.decision} is null) = (${t.decidedAt} is null)`,
+    ),
+    check('approvals_four_eyes_check', sql`${t.decidedBy} <> ${t.requestedBy}`),
+  ],
+);
+
 /**
  * Sankhya gateway connections. Credentials are sealed with AES-256-GCM by the API (AAD = id +
  * field name) and never stored or returned in clear text.
@@ -396,6 +435,7 @@ export type AuditEventRow = typeof auditEvents.$inferSelect;
 export type NewAuditEvent = typeof auditEvents.$inferInsert;
 export type PlanRow = typeof plans.$inferSelect;
 export type NewPlanRow = typeof plans.$inferInsert;
+export type ApprovalRow = typeof approvals.$inferSelect;
 export type MetadataCacheRow = typeof metadataCache.$inferSelect;
 export type ConnectionRow = typeof connections.$inferSelect;
 export type NewConnection = typeof connections.$inferInsert;

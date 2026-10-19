@@ -49,6 +49,8 @@ export interface PlansOptions {
   secret: string;
   /** PLAN_TTL_SECONDS. */
   ttlSeconds: number;
+  /** APPROVAL_TTL_MINUTES in seconds: lifetime of plans that require approval (default 3600). */
+  approvalTtlSeconds?: number;
   /** Clock used for created_at / expires_at (tests). Expiry itself is checked with the database clock. */
   now?: () => Date;
 }
@@ -59,6 +61,9 @@ const TOKEN = /^([0-9a-f-]{36})\.([A-Za-z0-9_-]{43})$/i;
 const IDEMPOTENCY_KEY = /^[\x21-\x7e]{1,200}$/;
 const PHRASE_WORD = /^[A-Z][A-Z0-9_]{0,127}$/;
 const LIVE_STATUSES = ['PENDING', 'APPROVED'] as const;
+const DEFAULT_APPROVAL_TTL_SECONDS = 3600;
+
+type Tx = Parameters<Parameters<Database['transaction']>[0]>[0];
 
 /** `"<ENVIRONMENT> <ACTION> <N> <ENTITY>"`, for example `PRODUCTION UPDATE 3 TGFPAR`. */
 export function strongConfirmationPhrase(
@@ -192,6 +197,9 @@ export class PlansService {
   ) {
     if (!Number.isInteger(options.ttlSeconds) || options.ttlSeconds <= 0)
       throw new Error('PlansService: ttlSeconds must be a positive integer');
+    const approvalTtl = options.approvalTtlSeconds;
+    if (approvalTtl !== undefined && (!Number.isInteger(approvalTtl) || approvalTtl <= 0))
+      throw new Error('PlansService: approvalTtlSeconds must be a positive integer');
     if (!options.secret) throw new Error('PlansService: secret is required');
     this.now = options.now ?? (() => new Date());
   }
@@ -224,7 +232,10 @@ export class PlansService {
       ? strongConfirmationPhrase(input.environment, action, count, entity)
       : null;
     const createdAt = this.now();
-    const expiresAt = new Date(createdAt.getTime() + this.options.ttlSeconds * 1000);
+    const ttlSeconds = gates.requiresApproval
+      ? (this.options.approvalTtlSeconds ?? DEFAULT_APPROVAL_TTL_SECONDS)
+      : this.options.ttlSeconds;
+    const expiresAt = new Date(createdAt.getTime() + ttlSeconds * 1000);
     const planHash = planHashOf({
       sqlHash,
       paramsHash,
@@ -349,6 +360,34 @@ export class PlansService {
     }
     if (consumed) return { plan: consumed, replayed: false };
     return { plan: await this.refusal(row.id, key), replayed: true };
+  }
+
+  /**
+   * Records a four-eyes decision on a PENDING plan that requires approval (Task 14.1): APPROVE
+   * moves it to APPROVED, REJECT to INVALIDATED (never consumable). A single conditional UPDATE
+   * that also checks `plan_hash` and expiry, so it fails closed and only one decision can win.
+   * Returns false when nothing matched. `db` lets the caller run it inside its transaction.
+   */
+  async decide(
+    id: string,
+    planHash: string,
+    decision: 'APPROVE' | 'REJECT',
+    db: Database | Tx = this.db,
+  ): Promise<boolean> {
+    const rows = await db
+      .update(plans)
+      .set({ status: decision === 'APPROVE' ? 'APPROVED' : 'INVALIDATED' })
+      .where(
+        and(
+          eq(plans.id, id),
+          eq(plans.planHash, planHash),
+          eq(plans.status, 'PENDING'),
+          eq(plans.requiresApproval, true),
+          gt(plans.expiresAt, sql`now()`),
+        ),
+      )
+      .returning({ id: plans.id });
+    return rows.length === 1;
   }
 
   /** Invalidates the live plans of a connection (secrets rotated, environment changed...). */
