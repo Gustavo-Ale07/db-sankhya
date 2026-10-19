@@ -3,6 +3,12 @@
  * thread (see scratch-worker.ts), so users never share tables and a runaway statement cannot
  * block the API: the host enforces the statement timeout by terminating the worker, which also
  * resets that workspace. Statements go through the AST gate in scratch-guard.ts first.
+ *
+ * Memory: each worker caps its V8 heap at 512 MiB, but PGlite's WASM linear memory lives outside
+ * that cap. Stored data is bounded by `maxBytes` (checked after every write) and a worker whose
+ * WASM memory grows past `maxWasmMemoryBytes` is recycled (its workspace starts empty again).
+ * Worst case per process is therefore about maxWorkspaces x (512 MiB + maxWasmMemoryBytes),
+ * plus one statement's transient overshoot before the check runs.
  */
 import { Worker } from 'node:worker_threads';
 import { AppError } from '@dbx/shared';
@@ -18,15 +24,33 @@ export interface ScratchManagerOptions {
   maxRows: number;
   maxTables: number;
   ttlMinutes: number;
+  /** Deadline of one call, measured from when it is enqueued (queue time included). */
   statementTimeoutMs: number;
   /** Rows returned by one SELECT (default: maxRows). */
   maxResultRows?: number;
+  /** Approximate size of one result or dry-run snapshot; larger ones fail (default 16 MiB). */
+  maxResultBytes?: number;
+  /** Stored bytes across all tables of one workspace (default 64 MiB). */
+  maxBytes?: number;
+  /** WASM memory after which a workspace's worker is recycled (default 1 GiB). */
+  maxWasmMemoryBytes?: number;
+  /** Calls waiting behind the running one, per workspace; beyond it RATE_LIMITED (default 4). */
+  maxQueuedPerWorkspace?: number;
   /** Rows shown on each side of a transactional dry run (default 200). */
   previewRows?: number;
   /** Background eviction period; 0 disables it (default 60 s). */
   sweepIntervalMs?: number;
   now?: () => number;
 }
+
+export const SCRATCH_DEFAULTS = {
+  maxResultBytes: 16 * 1024 * 1024,
+  maxBytes: 64 * 1024 * 1024,
+  maxWasmMemoryBytes: 1024 * 1024 * 1024,
+  maxQueuedPerWorkspace: 4,
+  previewRows: 200,
+  sweepIntervalMs: 60_000,
+} as const;
 
 export interface ScratchResult {
   columns: string[];
@@ -66,29 +90,181 @@ interface Pending {
 interface Slot {
   worker: Worker;
   ready: Promise<void>;
+  isReady: boolean;
   pending: Map<number, Pending>;
 }
 
-/** One worker thread with a serialized request queue and a hard per-request timeout. */
+interface HostConfig {
+  timeoutMs: number;
+  maxQueued: number;
+  maxWasmMemoryBytes: number;
+}
+
+interface Job {
+  op: Op;
+  resolve: (v: unknown) => void;
+  reject: (e: unknown) => void;
+  signal: AbortSignal | undefined;
+  onAbort: () => void;
+  /** Absolute deadline (wall clock); pushed back by the job's own wait for a cold worker. */
+  deadline: number;
+  timer: NodeJS.Timeout | undefined;
+  done: boolean;
+  /** True while this job waits for its worker to start (the deadline is not enforced then). */
+  starting: boolean;
+}
+
+const closedError = () =>
+  new AppError('NOT_FOUND', 'The scratch workspace was closed; open a new one.');
+
+/**
+ * One worker thread with a bounded FIFO queue. Every call has a deadline that starts when it is
+ * enqueued and observes its abort signal from then on. A call that expires while queued is just
+ * dropped; one that expires while running takes the worker (and the workspace data) down with it.
+ * Once closed, the host never starts a worker again.
+ */
 class WorkerHost {
   private slot: Slot | null = null;
-  private queue: Promise<unknown> = Promise.resolve();
+  private closed = false;
+  private readonly waiting: Job[] = [];
+  private current: Job | null = null;
   private nextId = 1;
 
-  constructor(private readonly timeoutMs: number) {}
+  constructor(private readonly cfg: HostConfig) {}
 
   run<T>(op: Op, signal?: AbortSignal): Promise<T> {
-    const task = this.queue.then(() => this.send<T>(op, signal));
-    this.queue = task.catch(() => undefined);
-    return task;
+    if (this.closed) return Promise.reject(closedError());
+    if (signal?.aborted) {
+      return Promise.reject(new AppError('QUERY_CANCELLED', 'The query was cancelled.'));
+    }
+    if (this.waiting.length >= this.cfg.maxQueued) {
+      return Promise.reject(
+        new AppError('RATE_LIMITED', 'Too many scratch statements are waiting. Try again later.'),
+      );
+    }
+    return new Promise<T>((resolve, reject) => {
+      const job: Job = {
+        op,
+        resolve: resolve as (v: unknown) => void,
+        reject,
+        signal,
+        onAbort: () => undefined,
+        deadline: Date.now() + this.cfg.timeoutMs,
+        timer: undefined,
+        done: false,
+        starting: false,
+      };
+      job.onAbort = () => {
+        const running = job === this.current;
+        this.stop(
+          job,
+          new AppError(
+            'QUERY_CANCELLED',
+            running
+              ? 'The query was cancelled; the workspace was reset.'
+              : 'The query was cancelled.',
+          ),
+        );
+      };
+      signal?.addEventListener('abort', job.onAbort, { once: true });
+      this.arm(job);
+      this.waiting.push(job);
+      void this.pump();
+    });
+  }
+
+  /** True while a worker thread exists for this host. */
+  alive(): boolean {
+    return this.slot !== null;
   }
 
   async close(): Promise<void> {
+    this.closed = true;
+    for (const job of this.waiting.splice(0)) this.settle(job, () => job.reject(closedError()));
+    const current = this.current;
+    if (current) this.settle(current, () => current.reject(closedError()));
     const slot = this.slot;
     if (slot) await this.reset(slot);
   }
 
+  private arm(job: Job): void {
+    clearTimeout(job.timer);
+    job.timer = setTimeout(() => this.expire(job), Math.max(0, job.deadline - Date.now()));
+  }
+
+  private expire(job: Job): void {
+    // A cold start has its own timeout; the job's deadline is re-armed once the worker is ready.
+    if (job.starting) return;
+    const running = job === this.current;
+    this.stop(
+      job,
+      new AppError(
+        'QUERY_TIMEOUT',
+        `The scratch statement exceeded ${this.cfg.timeoutMs} ms, queue time included${
+          running ? '; the workspace was reset' : ''
+        }.`,
+      ),
+    );
+  }
+
+  /** Settles a job once; returns false when it was already settled. */
+  private settle(job: Job, fn: () => void): boolean {
+    if (job.done) return false;
+    job.done = true;
+    clearTimeout(job.timer);
+    job.signal?.removeEventListener('abort', job.onAbort);
+    fn();
+    return true;
+  }
+
+  /** Timeout or abort: a queued job is dropped; the running job takes its worker down. */
+  private stop(job: Job, error: AppError): void {
+    if (!this.settle(job, () => job.reject(error))) return;
+    const i = this.waiting.indexOf(job);
+    if (i >= 0) this.waiting.splice(i, 1);
+    if (job === this.current && this.slot) void this.reset(this.slot);
+  }
+
+  private async pump(): Promise<void> {
+    if (this.current) return;
+    for (let job = this.waiting.shift(); job; job = this.waiting.shift()) {
+      const current = job;
+      if (current.done) continue;
+      this.current = current;
+      try {
+        const value = await this.dispatch(current);
+        this.settle(current, () => current.resolve(value));
+      } catch (err) {
+        this.settle(current, () => current.reject(err));
+      } finally {
+        this.current = null;
+      }
+    }
+  }
+
+  private async dispatch(job: Job): Promise<unknown> {
+    const slot = this.start();
+    if (!slot.isReady) {
+      const t0 = Date.now();
+      job.starting = true;
+      try {
+        await slot.ready;
+      } finally {
+        job.starting = false;
+      }
+      if (job.done) return undefined;
+      job.deadline += Date.now() - t0;
+      this.arm(job);
+    }
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      slot.pending.set(id, { resolve, reject });
+      slot.worker.postMessage({ ...job.op, id } as WorkerRequest);
+    });
+  }
+
   private start(): Slot {
+    if (this.closed) throw closedError();
     if (this.slot) return this.slot;
     const worker = new Worker(workerUrl(), { resourceLimits: { maxOldGenerationSizeMb: 512 } });
     worker.unref();
@@ -100,7 +276,7 @@ class WorkerHost {
       failStart = reject;
     });
     ready.catch(() => undefined);
-    const slot: Slot = { worker, ready, pending };
+    const slot: Slot = { worker, ready, isReady: false, pending };
 
     const timer = setTimeout(() => {
       failStart(new AppError('INTERNAL_ERROR', 'The scratch workspace did not start.'));
@@ -111,17 +287,21 @@ class WorkerHost {
     worker.on('message', (msg: WorkerResponse) => {
       if ('ready' in msg) {
         clearTimeout(timer);
+        slot.isReady = true;
         markReady();
         return;
       }
       const entry = pending.get(msg.id);
-      if (!entry) return;
-      pending.delete(msg.id);
-      if (msg.ok) entry.resolve(msg.result);
-      else {
-        const details = msg.error.sqlState ? { sqlState: msg.error.sqlState } : undefined;
-        entry.reject(new AppError(msg.error.code, msg.error.message, details));
+      if (entry) {
+        pending.delete(msg.id);
+        if (msg.ok) entry.resolve(msg.result);
+        else {
+          const details = msg.error.sqlState ? { sqlState: msg.error.sqlState } : undefined;
+          entry.reject(new AppError(msg.error.code, msg.error.message, details));
+        }
       }
+      // WASM memory never shrinks: recycle a worker that grew past the ceiling.
+      if (msg.wasmBytes > this.cfg.maxWasmMemoryBytes) void this.reset(slot);
     });
     const fail = (err: unknown) => {
       clearTimeout(timer);
@@ -141,46 +321,6 @@ class WorkerHost {
     worker.on('exit', () => fail(undefined));
     this.slot = slot;
     return slot;
-  }
-
-  private async send<T>(op: Op, signal?: AbortSignal): Promise<T> {
-    if (signal?.aborted) throw new AppError('QUERY_CANCELLED', 'The query was cancelled.');
-    const slot = this.start();
-    await slot.ready;
-    const id = this.nextId++;
-    return new Promise<T>((resolve, reject) => {
-      const settle = (fn: () => void) => {
-        clearTimeout(timer);
-        signal?.removeEventListener('abort', onAbort);
-        slot.pending.delete(id);
-        fn();
-      };
-      const timer = setTimeout(() => {
-        settle(() =>
-          reject(
-            new AppError(
-              'QUERY_TIMEOUT',
-              `The scratch statement exceeded ${this.timeoutMs} ms; the workspace was reset.`,
-            ),
-          ),
-        );
-        void this.reset(slot);
-      }, this.timeoutMs);
-      const onAbort = () => {
-        settle(() =>
-          reject(
-            new AppError('QUERY_CANCELLED', 'The query was cancelled; the workspace was reset.'),
-          ),
-        );
-        void this.reset(slot);
-      };
-      signal?.addEventListener('abort', onAbort, { once: true });
-      slot.pending.set(id, {
-        resolve: (v) => settle(() => resolve(v as T)),
-        reject: (e) => settle(() => reject(e)),
-      });
-      slot.worker.postMessage({ ...op, id } as WorkerRequest);
-    });
   }
 
   private async reset(slot: Slot): Promise<void> {
@@ -274,9 +414,15 @@ export class ScratchWorkspace {
         sql: stmt.sql,
         target,
         previewRows: this.previewRows,
+        limits: this.limits,
       }),
     );
     return { table: target, ...res };
+  }
+
+  /** @internal True while this workspace has a live worker thread. */
+  workerAlive(): boolean {
+    return this.host.alive();
   }
 
   /** @internal */
@@ -309,15 +455,22 @@ export class ScratchManager {
   private readonly workspaces = new Map<string, ScratchWorkspace>();
   private readonly now: () => number;
   private readonly sweeper: NodeJS.Timeout | null;
+  private closed = false;
 
   constructor(private readonly opts: ScratchManagerOptions) {
     this.now = opts.now ?? Date.now;
-    const every = opts.sweepIntervalMs ?? 60_000;
-    this.sweeper = every > 0 ? setInterval(() => void this.evictIdle(), every) : null;
+    const every = opts.sweepIntervalMs ?? SCRATCH_DEFAULTS.sweepIntervalMs;
+    this.sweeper =
+      every > 0
+        ? setInterval(() => {
+            this.evictIdle().catch(() => undefined);
+          }, every)
+        : null;
     this.sweeper?.unref();
   }
 
   async workspace(userId: string): Promise<ScratchWorkspace> {
+    if (this.closed) throw new AppError('NOT_FOUND', 'Scratch workspaces are shut down.');
     if (!userId) throw new AppError('VALIDATION_ERROR', 'A scratch workspace needs a user.');
     const existing = this.workspaces.get(userId);
     if (existing) return existing;
@@ -326,18 +479,26 @@ export class ScratchManager {
       // Another request for this user may have created it while eviction ran.
       const created = this.workspaces.get(userId);
       if (created) return created;
+      if (this.closed) throw new AppError('NOT_FOUND', 'Scratch workspaces are shut down.');
     }
     if (this.workspaces.size >= this.opts.maxWorkspaces) {
       throw new AppError('RATE_LIMITED', 'All scratch workspaces are in use. Try again later.');
     }
+    const o = this.opts;
     const ws = new ScratchWorkspace(
-      new WorkerHost(this.opts.statementTimeoutMs),
+      new WorkerHost({
+        timeoutMs: o.statementTimeoutMs,
+        maxQueued: o.maxQueuedPerWorkspace ?? SCRATCH_DEFAULTS.maxQueuedPerWorkspace,
+        maxWasmMemoryBytes: o.maxWasmMemoryBytes ?? SCRATCH_DEFAULTS.maxWasmMemoryBytes,
+      }),
       {
-        maxRows: this.opts.maxRows,
-        maxTables: this.opts.maxTables,
-        maxResultRows: this.opts.maxResultRows ?? this.opts.maxRows,
+        maxRows: o.maxRows,
+        maxTables: o.maxTables,
+        maxResultRows: o.maxResultRows ?? o.maxRows,
+        maxResultBytes: o.maxResultBytes ?? SCRATCH_DEFAULTS.maxResultBytes,
+        maxBytes: o.maxBytes ?? SCRATCH_DEFAULTS.maxBytes,
       },
-      this.opts.previewRows ?? 200,
+      o.previewRows ?? SCRATCH_DEFAULTS.previewRows,
       this.now,
     );
     this.workspaces.set(userId, ws);
@@ -367,7 +528,9 @@ export class ScratchManager {
     await ws.close();
   }
 
+  /** Closes every workspace; the manager refuses new workspaces afterwards. */
   async closeAll(): Promise<void> {
+    this.closed = true;
     if (this.sweeper) clearInterval(this.sweeper);
     const all = [...this.workspaces.values()];
     this.workspaces.clear();

@@ -61,8 +61,18 @@ describe('ScratchManager', () => {
     const a = await m.workspace('user-a');
     const b = await m.workspace('user-b');
     await a.exec('CREATE TEMP TABLE tmp_a (id int)');
-    expect(await codeOf(b.exec('SELECT * FROM tmp_a'))).toBe('VALIDATION_ERROR');
+    await a.exec('INSERT INTO tmp_a VALUES (1)');
+    const missing = await b.exec('SELECT * FROM tmp_a').then(
+      () => undefined,
+      (err: unknown) => err,
+    );
+    expect(missing).toMatchObject({ code: 'VALIDATION_ERROR', details: { sqlState: '42P01' } });
     expect(await b.tables()).toEqual([]);
+    // Same name, separate data.
+    await b.exec('CREATE TEMP TABLE tmp_a (id int)');
+    await b.exec('INSERT INTO tmp_a VALUES (2), (3)');
+    expect((await a.exec('SELECT id FROM tmp_a ORDER BY id')).rows).toEqual([[1]]);
+    expect((await b.exec('SELECT id FROM tmp_a ORDER BY id')).rows).toEqual([[2], [3]]);
   });
 
   it('refuses table names without the tmp_ prefix', async () => {
@@ -128,6 +138,107 @@ describe('ScratchManager', () => {
     expect(m.stats()).toEqual({ workspaces: 1 });
   });
 
+  it('discard rejects a queued op and leaves no live worker (F1)', async () => {
+    const m = manager();
+    const ws = await m.workspace('u1');
+    await ws.exec('SELECT 1');
+    const running = codeOf(ws.exec('SELECT count(*) FROM generate_series(1, 50000000) g'));
+    const queued = codeOf(ws.exec('SELECT 42 AS n'));
+    await m.discard('u1');
+    expect(await running).toBe('NOT_FOUND');
+    expect(await queued).toBe('NOT_FOUND');
+    expect(ws.workerAlive()).toBe(false);
+  }, 60_000);
+
+  it('closeAll rejects queued ops and refuses new workspaces (F1, F8)', async () => {
+    const m = manager();
+    const ws = await m.workspace('u1');
+    const queued = [codeOf(ws.exec('SELECT 1')), codeOf(ws.exec('SELECT 2'))];
+    await m.closeAll();
+    for (const p of queued) expect(await p).toBe('NOT_FOUND');
+    expect(ws.workerAlive()).toBe(false);
+    expect(await codeOf(m.workspace('u2'))).toBe('NOT_FOUND');
+  }, 60_000);
+
+  it('refuses a result larger than maxResultBytes instead of shipping it (F2)', async () => {
+    const ws = await manager({ maxResultBytes: 10_000 }).workspace('u1');
+    expect(await codeOf(ws.exec("SELECT repeat('x', 1000) FROM generate_series(1, 20)"))).toBe(
+      'QUERY_LIMIT_EXCEEDED',
+    );
+    expect((await ws.exec("SELECT repeat('x', 100) AS s")).rows).toHaveLength(1);
+    await ws.exec('CREATE TABLE tmp_a (v text)');
+    await ws.exec("INSERT INTO tmp_a SELECT repeat('y', 1000) FROM generate_series(1, 20)");
+    expect(await codeOf(ws.transactionalDryRun("UPDATE tmp_a SET v = 'z' WHERE true"))).toBe(
+      'QUERY_LIMIT_EXCEEDED',
+    );
+  }, 60_000);
+
+  it('enforces the storage quota in bytes and rolls back (F3)', async () => {
+    const ws = await manager({ maxBytes: 200_000, maxRows: 1_000_000 }).workspace('u1');
+    await ws.exec('CREATE TABLE tmp_a (v text)');
+    expect(
+      await codeOf(
+        ws.exec('INSERT INTO tmp_a SELECT md5(g::text) FROM generate_series(1, 20000) g'),
+      ),
+    ).toBe('QUERY_LIMIT_EXCEEDED');
+    expect(await ws.tables()).toEqual([{ name: 'tmp_a', rows: 0 }]);
+  }, 60_000);
+
+  it('recycles a worker whose wasm memory passes the ceiling (F3)', async () => {
+    const ws = await manager({ maxWasmMemoryBytes: 1 }).workspace('u1');
+    await ws.exec('CREATE TABLE tmp_a (id int)');
+    // The worker was recycled after the statement, so the workspace starts empty again.
+    expect(await ws.tables()).toEqual([]);
+  }, 60_000);
+
+  it('the deadline includes time spent in the queue (F4)', async () => {
+    const ws = await manager({ statementTimeoutMs: 1_500 }).workspace('u1');
+    await ws.exec('SELECT 1');
+    const started = Date.now();
+    const runaway = codeOf(ws.exec('SELECT count(*) FROM generate_series(1, 1000000000) g'));
+    const queued = codeOf(ws.exec('SELECT count(*) FROM generate_series(1, 1000000000) g'));
+    expect(await runaway).toBe('QUERY_TIMEOUT');
+    expect(await queued).toBe('QUERY_TIMEOUT');
+    expect(Date.now() - started).toBeLessThan(1_500 + 2_000);
+  }, 60_000);
+
+  it('a queued op observes its abort signal while waiting (F4)', async () => {
+    const ws = await manager({ statementTimeoutMs: 10_000 }).workspace('u1');
+    await ws.exec('SELECT 1');
+    const runaway = ws.exec('SELECT count(*) FROM generate_series(1, 1000000000) g');
+    const controller = new AbortController();
+    const queued = ws.exec('SELECT 1', controller.signal);
+    const started = Date.now();
+    setTimeout(() => controller.abort(), 100);
+    expect(await codeOf(queued)).toBe('QUERY_CANCELLED');
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(await codeOf(runaway)).toBe('QUERY_TIMEOUT');
+  }, 60_000);
+
+  it('observes the abort signal while the worker starts (F4)', async () => {
+    const ws = await manager().workspace('u1');
+    const controller = new AbortController();
+    const p = ws.exec('SELECT 1', controller.signal);
+    setTimeout(() => controller.abort(), 5);
+    expect(await codeOf(p)).toBe('QUERY_CANCELLED');
+    expect((await ws.exec('SELECT 2 AS two')).rows).toEqual([[2]]);
+  }, 60_000);
+
+  it('caps the queue at 4 waiting ops per workspace (F4)', async () => {
+    const ws = await manager({ statementTimeoutMs: 3_000 }).workspace('u1');
+    await ws.exec('SELECT 1');
+    const runaway = ws.exec('SELECT count(*) FROM generate_series(1, 1000000000) g');
+    const waiting = [1, 2, 3, 4].map(() => ws.exec('SELECT 1'));
+    expect(await codeOf(ws.exec('SELECT 1'))).toBe('RATE_LIMITED');
+    await Promise.allSettled([runaway, ...waiting]);
+  }, 60_000);
+
+  it('maps PostgreSQL resource errors to QUERY_LIMIT_EXCEEDED (F7)', async () => {
+    const ws = await manager().workspace('u1');
+    // SQLSTATE 54000 (program_limit_exceeded): requested length too large.
+    expect(await codeOf(ws.exec("SELECT repeat('x', 1100000000)"))).toBe('QUERY_LIMIT_EXCEEDED');
+  }, 60_000);
+
   it('refuses an empty user id', async () => {
     expect(await codeOf(manager().workspace(''))).toBe('VALIDATION_ERROR');
   });
@@ -180,9 +291,16 @@ describe('ScratchManager', () => {
     const ws = await manager().workspace('u1');
     await ws.exec('CREATE TABLE tmp_a (id int)');
     await ws.exec('INSERT INTO tmp_a VALUES (1), (2)');
-    await ws
-      .exec('WITH d AS (DELETE FROM tmp_a RETURNING id) SELECT * FROM d')
-      .catch(() => undefined);
+    // The guard refuses this; bypass it to exercise the worker's ROLLBACK-for-reads path.
+    const res = await ws.execStatement({
+      command: 'SELECT',
+      action: 'QUERY.SELECT',
+      sql: 'WITH d AS (DELETE FROM tmp_a RETURNING id) SELECT * FROM d',
+      tables: ['tmp_a'],
+      target: null,
+      mutating: false,
+    });
+    expect(res.rowCount).toBe(2);
     expect(await ws.tables()).toEqual([{ name: 'tmp_a', rows: 2 }]);
   });
 

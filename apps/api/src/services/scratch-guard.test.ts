@@ -76,6 +76,17 @@ describe('analyzeScratchSql', () => {
     ["SELECT current_setting('data_directory')", 'SQL_FORBIDDEN'],
     ['INSERT INTO tmp_a VALUES (1) RETURNING pg_backend_pid()', 'SQL_FORBIDDEN'],
     ['CREATE TABLE tmp_a (id int DEFAULT pg_backend_pid())', 'SQL_FORBIDDEN'],
+    ['SELECT loread(0, 1)', 'SQL_FORBIDDEN'],
+    ["SELECT lowrite(0, 'x')", 'SQL_FORBIDDEN'],
+    // sqlify would mangle these (F6): CASCADE/RESTRICT become an alias, parameters and variables.
+    ['DROP TABLE tmp_a CASCADE', 'SQL_UNSUPPORTED'],
+    ['DROP TABLE tmp_a RESTRICT', 'SQL_UNSUPPORTED'],
+    ['SELECT :x', 'SQL_UNSUPPORTED'],
+    ['SELECT @@version', 'SQL_UNSUPPORTED'],
+    ['SELECT @x', 'SQL_UNSUPPORTED'],
+    ['SELECT $1', 'SQL_UNSUPPORTED'],
+    ['SELECT * FROM tmp_a WHERE id = :id', 'SQL_UNSUPPORTED'],
+    ['SELECT 1 FROM tmp_a t(pg_sleep)', 'SQL_UNSUPPORTED'],
     // Statements the sql-engine classifier does not recognise are refused (fail closed).
     ['CREATE EXTENSION dblink', 'SQL_UNSUPPORTED'],
     ['WITH d AS (DELETE FROM tmp_a RETURNING id) SELECT * FROM d', 'SQL_UNSUPPORTED'],
@@ -92,6 +103,20 @@ describe('analyzeScratchSql', () => {
       expect(['SQL_PARSE_ERROR', 'SQL_UNSUPPORTED']).toContain(codeOf(sql));
     },
   );
+
+  it.each([
+    'SELECT a.id, b.v FROM tmp_a a JOIN tmp_b AS b ON a.id = b.id WHERE a.id > 1 ORDER BY 1',
+    'WITH x AS (SELECT id FROM tmp_a) SELECT * FROM x',
+    "INSERT INTO tmp_a (id, v) VALUES (1, 'x')",
+    'UPDATE tmp_a SET v = upper(v) WHERE id = 1',
+    'CREATE TEMP TABLE tmp_c AS SELECT * FROM tmp_a',
+    'ALTER TABLE tmp_a ADD COLUMN n text',
+    'DROP TABLE tmp_a',
+    'SELECT $$a;b$$ AS s',
+  ])('the regenerated SQL is a fixed point: %s', (sql) => {
+    const first = analyzeScratchSql(sql);
+    expect(analyzeScratchSql(first.sql)).toEqual(first);
+  });
 
   it('refuses oversized statements', () => {
     expect(codeOf(`SELECT '${'x'.repeat(100_001)}'`)).toBe('QUERY_LIMIT_EXCEEDED');

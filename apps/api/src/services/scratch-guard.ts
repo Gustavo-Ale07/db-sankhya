@@ -41,6 +41,8 @@ export const SCRATCH_TABLE_NAME = /^tmp_[a-z0-9_]{1,59}$/;
 const DENIED_FUNCTION_PREFIXES = ['pg_', 'dblink', 'lo_', 'txid_'];
 const DENIED_FUNCTIONS = new Set([
   'copy',
+  'loread',
+  'lowrite',
   'set_config',
   'current_setting',
   'ts_stat',
@@ -91,7 +93,48 @@ export function analyzeScratchSql(input: string): ScratchStatement {
   if (input.length > MAX_SCRATCH_SQL_LENGTH) {
     throw new AppError('QUERY_LIMIT_EXCEEDED', 'The statement is too long.');
   }
+  const first = check(input);
 
+  // Execute exactly what was checked: regenerate the SQL from the AST, then check the regenerated
+  // text again and require the same statement, so a lossy sqlify cannot smuggle in something else.
+  let sql: string;
+  try {
+    sql = parser.sqlify(first.ast as never, OPTIONS);
+  } catch {
+    throw new AppError('SQL_UNSUPPORTED', 'The scratch statement is not supported.');
+  }
+  let second: Checked;
+  try {
+    second = check(sql);
+  } catch {
+    throw new AppError('SQL_UNSUPPORTED', 'The scratch statement could not be regenerated safely.');
+  }
+  if (
+    second.command !== first.command ||
+    second.target !== first.target ||
+    second.tables.join(',') !== first.tables.join(',')
+  ) {
+    throw new AppError('SQL_UNSUPPORTED', 'The scratch statement could not be regenerated safely.');
+  }
+  return {
+    command: first.command,
+    action: first.action,
+    sql,
+    tables: first.tables,
+    target: first.target,
+    mutating: first.command !== 'SELECT',
+  };
+}
+
+interface Checked {
+  command: ScratchCommand;
+  action: ScratchAction;
+  tables: string[];
+  target: string | null;
+  ast: Node;
+}
+
+function check(input: string): Checked {
   // 1. What is it? The engine's classifier decides; UNKNOWN is refused.
   const classified = classifyStatement(input);
   if (classified.kind === 'UNKNOWN') {
@@ -118,7 +161,8 @@ export function analyzeScratchSql(input: string): ScratchStatement {
     throw new AppError('SQL_UNSUPPORTED', 'The scratch statement could not be classified.');
   }
 
-  checkFunctions(ast);
+  checkNodes(ast);
+  checkDdlTargets(ast);
 
   // 3. Every table the statement touches must be a scratch table.
   const cteNames = collectCteNames(ast);
@@ -148,22 +192,7 @@ export function analyzeScratchSql(input: string): ScratchStatement {
     target = classified.table;
     accept(target);
   }
-
-  // 4. Execute exactly what was checked.
-  let sql: string;
-  try {
-    sql = parser.sqlify(ast as never, OPTIONS);
-  } catch {
-    throw new AppError('SQL_UNSUPPORTED', 'The scratch statement is not supported.');
-  }
-  return {
-    command,
-    action,
-    sql,
-    tables: [...tables].sort(),
-    target,
-    mutating: command !== 'SELECT',
-  };
+  return { command, action, tables: [...tables].sort(), target, ast };
 }
 
 /** Cross-check of the classifier against the PostgreSQL AST root. */
@@ -218,8 +247,39 @@ function collectCteNames(ast: Node): Set<string> {
   return names;
 }
 
-function checkFunctions(ast: Node): void {
+const PLAIN_ALIAS = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const DOLLAR_QUOTE = /^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$$/;
+
+/**
+ * Denied functions, plus nodes the regenerated SQL cannot represent faithfully: bind parameters
+ * and variables (`:x`, `$1`, `@x`, `@@version`) and table aliases that are not plain identifiers
+ * (`tmp_a t(pg_sleep)` parses as alias "t(pg_sleep)").
+ */
+function checkNodes(ast: Node): void {
   walk(ast, (node) => {
+    // The parser represents dollar-quoted strings ($$..$$, $tag$..$tag$) as `var` too; those are
+    // literals and stay allowed.
+    const dollarQuoted =
+      node.type === 'var' &&
+      typeof node.prefix === 'string' &&
+      DOLLAR_QUOTE.test(node.prefix) &&
+      node.suffix === node.prefix;
+    if (node.type === 'param' || (node.type === 'var' && !dollarQuoted)) {
+      throw new AppError(
+        'SQL_UNSUPPORTED',
+        'Parameters and variables are not supported in scratch; write the value inline.',
+      );
+    }
+    if (
+      typeof node.table === 'string' &&
+      node.type !== 'column_ref' &&
+      !('column' in node) &&
+      node.as !== null &&
+      node.as !== undefined &&
+      (typeof node.as !== 'string' || !PLAIN_ALIAS.test(node.as))
+    ) {
+      throw new AppError('SQL_UNSUPPORTED', 'Table aliases must be plain identifiers in scratch.');
+    }
     if (node.type !== 'function') return;
     const parts = nameParts(node.name);
     if (parts.length !== 1) {
@@ -230,6 +290,23 @@ function checkFunctions(ast: Node): void {
       throw new AppError('SQL_FORBIDDEN', `The function ${name} is not allowed in scratch.`);
     }
   });
+}
+
+/**
+ * DDL targets never carry an alias. The parser reads `DROP TABLE tmp_a CASCADE` (or RESTRICT) as
+ * an alias, which sqlify would turn into something else, so any alias there is refused.
+ */
+function checkDdlTargets(ast: Node): void {
+  const targets =
+    ast.type === 'drop' ? ast.name : ast.type === 'create' || ast.type === 'alter' ? ast.table : [];
+  for (const t of Array.isArray(targets) ? targets : [targets]) {
+    if (isNode(t) && t.as !== null && t.as !== undefined) {
+      throw new AppError(
+        'SQL_UNSUPPORTED',
+        'CASCADE, RESTRICT and aliases are not supported on scratch DDL targets.',
+      );
+    }
+  }
 }
 
 function nameParts(name: unknown): string[] {

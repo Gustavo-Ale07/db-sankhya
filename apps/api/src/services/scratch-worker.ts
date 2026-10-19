@@ -23,23 +23,35 @@ export type WorkerRequest =
       rows: unknown[][];
       limits: Limits;
     }
-  | { id: number; op: 'dryRun'; sql: string; target: string; previewRows: number };
+  | {
+      id: number;
+      op: 'dryRun';
+      sql: string;
+      target: string;
+      previewRows: number;
+      limits: Limits;
+    };
 
 export interface Limits {
   maxRows: number;
   maxTables: number;
   maxResultRows: number;
+  /** Approximate serialized size of one result (or one dry-run snapshot). */
+  maxResultBytes: number;
+  /** Stored bytes (pg_total_relation_size) across all tables. */
+  maxBytes: number;
 }
 
 export interface WorkerError {
-  code: 'QUERY_LIMIT_EXCEEDED' | 'VALIDATION_ERROR' | 'INTERNAL_ERROR';
+  code: 'QUERY_LIMIT_EXCEEDED' | 'QUERY_CANCELLED' | 'VALIDATION_ERROR' | 'INTERNAL_ERROR';
   message: string;
   sqlState?: string;
 }
 
+/** Every reply carries the WASM memory size so the host can recycle a bloated worker. */
 export type WorkerResponse =
-  | { id: number; ok: true; result: unknown }
-  | { id: number; ok: false; error: WorkerError }
+  | { id: number; ok: true; result: unknown; wasmBytes: number }
+  | { id: number; ok: false; error: WorkerError; wasmBytes: number }
   | { ready: true };
 
 interface Rows {
@@ -71,11 +83,20 @@ if (port) {
 async function handle(msg: WorkerRequest): Promise<void> {
   let response: WorkerResponse;
   try {
-    response = { id: msg.id, ok: true, result: await dispatch(msg) };
+    const result = await dispatch(msg);
+    response = { id: msg.id, ok: true, result, wasmBytes: wasmBytes() };
   } catch (err) {
-    response = { id: msg.id, ok: false, error: toWorkerError(err) };
+    response = { id: msg.id, ok: false, error: toWorkerError(err), wasmBytes: wasmBytes() };
   }
   port?.postMessage(response);
+}
+
+function wasmBytes(): number {
+  try {
+    return db.Module.wasmMemory.buffer.byteLength;
+  } catch {
+    return 0;
+  }
 }
 
 async function dispatch(msg: WorkerRequest): Promise<unknown> {
@@ -83,11 +104,11 @@ async function dispatch(msg: WorkerRequest): Promise<unknown> {
     case 'exec':
       return exec(msg.sql, msg.mutating, msg.limits);
     case 'tables':
-      return listTables(true);
+      return (await listTables(true)).map(({ name, rows }) => ({ name, rows }));
     case 'import':
       return importRows(msg.table, msg.columns, msg.rows, msg.limits);
     case 'dryRun':
-      return dryRun(msg.sql, msg.target, msg.previewRows);
+      return dryRun(msg.sql, msg.target, msg.previewRows, msg.limits.maxResultBytes);
   }
 }
 
@@ -98,7 +119,7 @@ async function exec(sql: string, mutating: boolean, limits: Limits) {
     if (mutating) await enforceQuota(limits);
     // Reads never keep side effects (a data-modifying CTE inside a SELECT is undone).
     await db.query(mutating ? 'COMMIT' : 'ROLLBACK');
-    const out = shape(res.fields, res.rows, limits.maxResultRows);
+    const out = shape(res.fields, res.rows, limits.maxResultRows, limits.maxResultBytes);
     // PGlite reports affectedRows 0 for a read, so a read counts the rows it returned.
     return { ...out, rowCount: mutating ? (res.affectedRows ?? 0) : res.rows.length };
   } catch (err) {
@@ -146,35 +167,36 @@ async function importRows(
   }
 }
 
-async function dryRun(sql: string, target: string, previewRows: number) {
+async function dryRun(sql: string, target: string, previewRows: number, maxBytes: number) {
   await db.query('BEGIN');
   try {
-    const before = await snapshot(target, previewRows);
+    const before = await snapshot(target, previewRows, maxBytes);
     const res = await db.query(sql);
-    const after = await snapshot(target, previewRows);
+    const after = await snapshot(target, previewRows, maxBytes);
     return { before, after, rowCount: res.affectedRows ?? 0 };
   } finally {
     await rollback();
   }
 }
 
-async function snapshot(table: string, limit: number): Promise<Rows> {
+async function snapshot(table: string, limit: number, maxBytes: number): Promise<Rows> {
   const res = await db.query<unknown[]>(`SELECT * FROM ${quote(table)} LIMIT ${limit + 1}`, [], {
     rowMode: 'array',
   });
-  return shape(res.fields, res.rows, limit);
+  return shape(res.fields, res.rows, limit, maxBytes);
 }
 
 async function listTables(withCounts: boolean) {
-  const res = await db.query<{ schema: string; name: string }>(
-    `SELECT n.nspname AS schema, c.relname AS name
+  const res = await db.query<{ schema: string; name: string; bytes: number }>(
+    `SELECT n.nspname AS schema, c.relname AS name,
+            pg_total_relation_size(c.oid)::float8 AS bytes
        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
       WHERE c.relkind IN ('r', 'p')
         AND n.nspname NOT IN ('pg_catalog', 'information_schema')
         AND n.nspname NOT LIKE 'pg_toast%'
       ORDER BY c.relname`,
   );
-  const out: Array<{ name: string; rows: number }> = [];
+  const out: Array<{ name: string; rows: number; bytes: number }> = [];
   for (const t of res.rows) {
     let rows = 0;
     if (withCounts) {
@@ -183,7 +205,7 @@ async function listTables(withCounts: boolean) {
       );
       rows = c.rows[0]?.n ?? 0;
     }
-    out.push({ name: t.name, rows });
+    out.push({ name: t.name, rows, bytes: t.bytes });
   }
   return out;
 }
@@ -197,6 +219,10 @@ async function enforceQuota(limits: Limits) {
   if (total > limits.maxRows) {
     throw new LimitError(`The workspace is limited to ${limits.maxRows} rows in total.`);
   }
+  const bytes = tables.reduce((sum, t) => sum + t.bytes, 0);
+  if (bytes > limits.maxBytes) {
+    throw new LimitError(`The workspace is limited to ${limits.maxBytes} bytes of storage.`);
+  }
 }
 
 async function rollback() {
@@ -207,14 +233,43 @@ async function rollback() {
   }
 }
 
-function shape(fields: Array<{ name: string }>, rows: unknown[][], limit: number): Rows {
+/**
+ * Converts rows for the host. Rows beyond `limit` are cut (flagged `truncated`); a result whose
+ * approximate serialized size passes `maxBytes` is refused rather than shipped or cut silently.
+ */
+function shape(
+  fields: Array<{ name: string }>,
+  rows: unknown[][],
+  limit: number,
+  maxBytes: number,
+): Rows {
   const truncated = rows.length > limit;
   const kept = truncated ? rows.slice(0, limit) : rows;
-  return {
-    columns: fields.map((f) => f.name),
-    rows: kept.map((r) => r.map(plain)),
-    truncated,
-  };
+  let budget = maxBytes;
+  const out: unknown[][] = [];
+  for (const row of kept) {
+    const converted = row.map(plain);
+    for (const value of converted) budget -= sizeOf(value);
+    if (budget < 0) {
+      throw new LimitError(
+        `The result is larger than ${maxBytes} bytes; select fewer rows or columns.`,
+      );
+    }
+    out.push(converted);
+  }
+  return { columns: fields.map((f) => f.name), rows: out, truncated };
+}
+
+/** Approximate JSON size of one cell (strings at 1 byte per UTF-16 unit, plus quotes/comma). */
+function sizeOf(value: unknown): number {
+  if (value === null || value === undefined) return 5;
+  if (typeof value === 'string') return value.length + 3;
+  if (typeof value === 'number' || typeof value === 'boolean') return 8;
+  try {
+    return (JSON.stringify(value)?.length ?? 0) + 1;
+  } catch {
+    return 8;
+  }
 }
 
 /** Values that survive structured cloning and later JSON serialization. */
@@ -234,6 +289,12 @@ function toWorkerError(err: unknown): WorkerError {
   if (err instanceof Error) {
     const sqlState = (err as { code?: unknown }).code;
     if (typeof sqlState === 'string') {
+      const message = err.message.slice(0, 500);
+      // 53xxx insufficient resources, 54xxx program limit exceeded, 57014 query_canceled.
+      if (sqlState.startsWith('53') || sqlState.startsWith('54')) {
+        return { code: 'QUERY_LIMIT_EXCEEDED', message, sqlState };
+      }
+      if (sqlState === '57014') return { code: 'QUERY_CANCELLED', message, sqlState };
       // A PostgreSQL error about the user's own scratch data.
       return { code: 'VALIDATION_ERROR', message: err.message.slice(0, 500), sqlState };
     }
