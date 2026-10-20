@@ -23,6 +23,7 @@ export const RESERVED_CODPARC = {
   'mutation.spec.ts': [1],
   'lifecycle.spec.ts': [7, 11, 12, 13],
   'four-eyes.spec.ts': [21],
+  'preview.spec.ts': [31],
 } as const;
 
 /** Role seeded by start-server.mjs: OPERATOR plus APPROVAL.DECIDE (keep the key in sync). */
