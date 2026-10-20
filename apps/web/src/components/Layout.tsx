@@ -18,6 +18,11 @@ import { SavedQueriesPage } from '../pages/SavedQueriesPage';
 import { ChangePasswordPage } from '../pages/ChangePasswordPage';
 import { UsersPage } from '../admin/UsersPage';
 import { AuditPage } from '../admin/AuditPage';
+import { GroupsPage } from '../admin/GroupsPage';
+import { RolesPage } from '../admin/RolesPage';
+import { PoliciesPage } from '../admin/PoliciesPage';
+import { ConnectionsPage } from '../admin/ConnectionsPage';
+import { SecurityPage } from '../admin/SecurityPage';
 import { ApprovalsPage } from '../admin/ApprovalsPage';
 import { StatusPage } from '../admin/StatusPage';
 import { ScratchPage } from '../scratch/ScratchPage';
@@ -29,6 +34,11 @@ export type View =
   | 'saved'
   | 'scratch'
   | 'users'
+  | 'groups'
+  | 'roles'
+  | 'policies'
+  | 'connections'
+  | 'security'
   | 'approvals'
   | 'audit'
   | 'status'
@@ -40,6 +50,11 @@ const NAV: { view: View; label: string; permission?: Permission }[] = [
   { view: 'saved', label: 'Consultas salvas' },
   { view: 'scratch', label: 'Scratch', permission: 'QUERY.SELECT' },
   { view: 'users', label: 'Usuários', permission: 'ADMIN.USERS' },
+  { view: 'groups', label: 'Grupos', permission: 'ADMIN.GROUPS' },
+  { view: 'roles', label: 'Papéis', permission: 'ADMIN.ROLES' },
+  { view: 'policies', label: 'Políticas', permission: 'ADMIN.POLICIES' },
+  { view: 'connections', label: 'Conexões', permission: 'ADMIN.CONNECTIONS' },
+  { view: 'security', label: 'Segurança', permission: 'ADMIN.SECURITY' },
   { view: 'approvals', label: 'Aprovações', permission: 'APPROVAL.DECIDE' },
   { view: 'audit', label: 'Auditoria', permission: 'AUDIT.READ' },
   { view: 'status', label: 'Status' },
@@ -163,6 +178,11 @@ export function Layout({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: 
               <ScratchPage connectionId={connection?.id} connectionName={connection?.name} />
             )}
             {view === 'users' && allowed('users') && <UsersPage />}
+            {view === 'groups' && allowed('groups') && <GroupsPage />}
+            {view === 'roles' && allowed('roles') && <RolesPage />}
+            {view === 'policies' && allowed('policies') && <PoliciesPage />}
+            {view === 'connections' && allowed('connections') && <ConnectionsPage />}
+            {view === 'security' && allowed('security') && <SecurityPage />}
             {view === 'approvals' && allowed('approvals') && <ApprovalsPage />}
             {view === 'audit' && allowed('audit') && <AuditPage />}
             {view === 'status' && <StatusPage />}

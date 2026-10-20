@@ -14,6 +14,11 @@ vi.mock('../pages/ChangePasswordPage', () => ({ ChangePasswordPage: () => null }
 vi.mock('../admin/UsersPage', () => ({ UsersPage: () => null }));
 vi.mock('../admin/AuditPage', () => ({ AuditPage: () => null }));
 vi.mock('../admin/ApprovalsPage', () => ({ ApprovalsPage: () => null }));
+vi.mock('../admin/GroupsPage', () => ({ GroupsPage: () => null }));
+vi.mock('../admin/RolesPage', () => ({ RolesPage: () => null }));
+vi.mock('../admin/PoliciesPage', () => ({ PoliciesPage: () => null }));
+vi.mock('../admin/ConnectionsPage', () => ({ ConnectionsPage: () => null }));
+vi.mock('../admin/SecurityPage', () => ({ SecurityPage: () => null }));
 vi.mock('../admin/StatusPage', () => ({ StatusPage: () => null }));
 vi.mock('../scratch/ScratchPage', () => ({ ScratchPage: () => null }));
 
@@ -157,5 +162,23 @@ describe('Layout navigation gating', () => {
     cleanup();
     renderLayout(META, { ...USER, roles: ['ADMIN'], permissions: ['ADMIN.USERS', 'AUDIT.READ'] });
     expect(navLabels()).toEqual(expect.arrayContaining(['Usuários', 'Auditoria']));
+  });
+
+  it('maps every admin page to its ADMIN.* permission', () => {
+    const pairs: [string, string][] = [
+      ['Grupos', 'ADMIN.GROUPS'],
+      ['Papéis', 'ADMIN.ROLES'],
+      ['Políticas', 'ADMIN.POLICIES'],
+      ['Conexões', 'ADMIN.CONNECTIONS'],
+      ['Segurança', 'ADMIN.SECURITY'],
+    ];
+    renderLayout(META);
+    for (const [label] of pairs) expect(navLabels()).not.toContain(label);
+    for (const [label, permission] of pairs) {
+      cleanup();
+      renderLayout(META, { ...USER, permissions: [permission as never] });
+      expect(navLabels()).toContain(label);
+      for (const [other] of pairs) if (other !== label) expect(navLabels()).not.toContain(other);
+    }
   });
 });
