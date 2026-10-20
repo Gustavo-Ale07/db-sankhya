@@ -48,6 +48,10 @@ interface Harness {
   approvals: ApprovalsService;
   /** A user holding exactly `permissions`, its AuthState, session cookie and role id. */
   userWith(permissions: Permission[]): Promise<{ auth: AuthState; cookie: string; roleId: string }>;
+  /** A user holding exactly the seeded `roles` (system role keys), its AuthState and cookie. */
+  userWithRoles(roleKeys: string[]): Promise<{ auth: AuthState; cookie: string }>;
+  /** Deletes every policy rule, the bench-wide `writes allowed` ALLOW included. */
+  clearPolicies(): Promise<void>;
   call(
     cookie: string | null,
     opts: InjectOptions,
@@ -162,6 +166,22 @@ async function setup(
       roleId: role!.id,
     };
   };
+  const userWithRoles = async (roleKeys: string[]) => {
+    const email = `user${++n}@example.com`;
+    const user = await s.users.create({ email, name: 'User', password: PASSWORD, roles: roleKeys });
+    const login = await call(null, {
+      method: 'POST',
+      url: '/api/auth/login',
+      payload: { email, password: PASSWORD },
+    });
+    expect(login.statusCode, login.body).toBe(200);
+    const cookie = login.cookies.find((x) => x.name === config.session.cookieName)!.value;
+    const resolved = (await s.sessions.resolve(cookie))!;
+    return { auth: { ...resolved, grants: await s.authz.grants(user.id) }, cookie };
+  };
+  const clearPolicies = async () => {
+    for (const rule of await s.policies.list()) await s.policies.delete(rule.id);
+  };
   const policy = async (input: Partial<PolicyInput>) => {
     await s.policies.create({
       name: 'test rule',
@@ -195,6 +215,8 @@ async function setup(
     service,
     approvals,
     userWith,
+    userWithRoles,
+    clearPolicies,
     call,
     policy,
     audit,
@@ -1700,5 +1722,219 @@ describe('POST /api/query/execute', () => {
     expect(JSON.stringify(rows.items)).not.toContain(signature);
     expect(logs.length).toBeGreaterThan(0);
     expect(logs.join('\n')).not.toContain(signature);
+  });
+});
+
+// -------------------------------------------------------------------------------- DATA.PREVIEW
+
+describe('DATA.PREVIEW: preview without execution', () => {
+  const SQL = "UPDATE TGFPAR SET NOMEPARC = 'Prévia' WHERE CODPARC = 3";
+  const previewHttp = (h: Harness, cookie: string, sql: string) =>
+    h.call(cookie, { method: 'POST', url: '/api/query/preview', payload: { sql } });
+  const executeHttp = (h: Harness, cookie: string, plan: { planId: string; token: string }) =>
+    h.call(cookie, {
+      method: 'POST',
+      url: '/api/query/execute',
+      payload: { planId: plan.planId, token: plan.token, idempotencyKey: randomUUID() },
+    });
+  /** Only an explicit ALLOW of `action` on TGFPAR, instead of the bench-wide DATA.* rule. */
+  const allowOnPartners = async (h: Harness, action: Permission) => {
+    await h.clearPolicies();
+    await h.policy({
+      name: `allow ${action} TGFPAR`,
+      effect: 'ALLOW',
+      actions: [action],
+      entities: ['TGFPAR'],
+    });
+  };
+
+  it('an ADMIN-only user previews an allowed UPDATE but can never execute it', async () => {
+    const h = await setup();
+    await allowOnPartners(h, 'DATA.UPDATE');
+    const { cookie, auth } = await h.userWithRoles(['ADMIN']);
+    expect(auth.grants.permissions.has('DATA.PREVIEW')).toBe(true);
+    expect(auth.grants.permissions.has('DATA.UPDATE')).toBe(false);
+    const before = await partner(h.mock, 3);
+
+    const res = await previewHttp(h, cookie, SQL);
+    expect(res.statusCode, res.body).toBe(200);
+    const body = res.json();
+    expect(body).toMatchObject({
+      type: 'preview',
+      operation: 'UPDATE',
+      preview: { affected: 1 },
+      execution: {
+        available: false,
+        permitted: false,
+        safeMode: true,
+        globalWriteEnabled: false,
+        writeToSankhya: false,
+      },
+    });
+    expect(body.preview.targets[0].after).toMatchObject({ NOMEPARC: 'Prévia' });
+    expect(body.permitted).toBeUndefined();
+    expect(saves(h.mock)).toEqual([]);
+    expect(writeCalls(h.mock)).toEqual([]);
+    expect(await h.audit('PLAN_CREATED')).toHaveLength(1);
+
+    const exec = await executeHttp(h, cookie, body);
+    expect(exec.statusCode, exec.body).toBe(403);
+    expect(exec.json().error).toMatchObject({
+      code: 'FORBIDDEN',
+      details: { permission: 'DATA.UPDATE' },
+    });
+    expect(saves(h.mock)).toEqual([]);
+    expect(await partner(h.mock, 3)).toBe(before);
+    const [denied] = await h.audit('PLAN_DENIED');
+    expect(denied).toMatchObject({ status: 'denied', errorCode: 'FORBIDDEN', planId: body.planId });
+  });
+
+  it('even with every write switch on, a preview-only plan is FORBIDDEN at execute', async () => {
+    const h = await setup(WRITES);
+    await allowOnPartners(h, 'DATA.UPDATE');
+    const { auth } = await h.userWithRoles(['ADMIN']);
+    const p = await prepare(h, auth, SQL);
+    expect(p.operation).toBe('UPDATE');
+    expect(p.permitted).toBe(false);
+    await expect(execute(h, auth, p)).rejects.toMatchObject({
+      code: 'FORBIDDEN',
+      details: { permission: 'DATA.UPDATE' },
+    });
+    expect(saves(h.mock)).toEqual([]);
+  });
+
+  it('a user with neither DATA.PREVIEW nor DATA.UPDATE cannot preview', async () => {
+    const h = await setup();
+    const { cookie, auth } = await h.userWithRoles(['VIEWER']);
+    expect(auth.grants.permissions.has('DATA.PREVIEW')).toBe(false);
+    const res = await previewHttp(h, cookie, SQL);
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error).toMatchObject({
+      code: 'FORBIDDEN',
+      details: { permission: 'DATA.UPDATE' },
+    });
+    expect(h.mock.calls).toEqual([]);
+    expect(await h.audit('write.denied')).toHaveLength(1);
+    expect(await h.audit('PLAN_CREATED')).toHaveLength(0);
+  });
+
+  it('DATA.PREVIEW without a policy ALLOW for the write is denied by policy and audited', async () => {
+    const h = await setup();
+    await h.clearPolicies();
+    const { cookie } = await h.userWithRoles(['ADMIN']);
+    const res = await previewHttp(h, cookie, SQL);
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error).toMatchObject({
+      code: 'FORBIDDEN',
+      message: 'The change was denied by policy',
+    });
+    // An ALLOW for UPDATE does not cover an INSERT preview either: the statement action decides.
+    await allowOnPartners(h, 'DATA.UPDATE');
+    const insert = await previewHttp(
+      h,
+      cookie,
+      "INSERT INTO TGFPAR (CODPARC, NOMEPARC, ATIVO) VALUES (9998, 'Novo', 'S')",
+    );
+    expect(insert.statusCode).toBe(403);
+    expect(insert.json().error.code).toBe('FORBIDDEN');
+    expect(writeCalls(h.mock)).toEqual([]);
+    const denied = await h.audit('write.denied');
+    expect(denied).toHaveLength(2);
+    for (const d of denied) {
+      expect(d).toMatchObject({ status: 'denied', errorCode: 'FORBIDDEN', resource: 'TGFPAR' });
+      expect((d.details as Record<string, unknown>).reasons).toBeDefined();
+    }
+    expect(await h.audit('PLAN_CREATED')).toHaveLength(0);
+  });
+
+  it('a policy DENY on a referenced column refuses the whole preview', async () => {
+    const h = await setup();
+    await allowOnPartners(h, 'DATA.UPDATE');
+    await h.policy({ name: 'no name changes', columns: ['TGFPAR.NOMEPARC'] });
+    const { cookie } = await h.userWithRoles(['ADMIN']);
+    const res = await previewHttp(
+      h,
+      cookie,
+      "UPDATE TGFPAR SET NOMEPARC = 'X', ATIVO = 'N' WHERE CODPARC = 3",
+    );
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error.code).toBe('FORBIDDEN');
+    expect(res.body).not.toContain('"preview"');
+    expect(writeCalls(h.mock)).toEqual([]);
+    expect(await h.audit('PLAN_CREATED')).toHaveLength(0);
+  });
+
+  it('an OPERATOR with the switches off previews (permitted) and gets READ_ONLY_MODE', async () => {
+    const h = await setup();
+    const { cookie } = await h.userWithRoles(['OPERATOR']);
+    const res = await previewHttp(h, cookie, SQL);
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json()).toMatchObject({
+      operation: 'UPDATE',
+      execution: { available: false, permitted: true },
+    });
+    const exec = await executeHttp(h, cookie, res.json());
+    expect(exec.json().error.code).toBe('READ_ONLY_MODE');
+    expect(saves(h.mock)).toEqual([]);
+  });
+
+  it('an INSERT preview reports operation INSERT', async () => {
+    const h = await setup();
+    await allowOnPartners(h, 'DATA.INSERT');
+    const { cookie } = await h.userWithRoles(['ADMIN']);
+    const res = await previewHttp(
+      h,
+      cookie,
+      "INSERT INTO TGFPAR (CODPARC, NOMEPARC, ATIVO) VALUES (9997, 'Novo', 'S')",
+    );
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json()).toMatchObject({
+      operation: 'INSERT',
+      previewKind: 'SIMULATED_PREVIEW',
+      execution: { permitted: false },
+    });
+    expect(writeCalls(h.mock)).toEqual([]);
+  });
+
+  it('a scratch preview reports its operation and TEMP.WRITE as the execute permission', async () => {
+    const h = await setup();
+    const { cookie, auth } = await h.userWithRoles(['VIEWER']);
+    const ws = await h.app.services.scratch.workspace(auth.user.id);
+    await ws.exec('CREATE TABLE tmp_p (id int, v text)');
+    await ws.exec("INSERT INTO tmp_p VALUES (1, 'x')");
+    const res = await previewHttp(h, cookie, 'DELETE FROM tmp_p WHERE id = 1');
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json()).toMatchObject({
+      operation: 'DELETE',
+      previewKind: 'TRANSACTIONAL_DRY_RUN',
+      execution: { permitted: true },
+    });
+  });
+
+  it('a preview-only user cannot submit a plan for approval', async () => {
+    const h = await setup();
+    await h.clearPolicies();
+    await h.policy({
+      name: 'updates need approval',
+      effect: 'ALLOW',
+      actions: ['DATA.UPDATE'],
+      entities: ['TGFPAR'],
+      limits: { requireApproval: true },
+    });
+    const { cookie } = await h.userWithRoles(['ADMIN']);
+    const res = await previewHttp(h, cookie, SQL);
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json()).toMatchObject({
+      requires: { approval: true },
+      execution: { permitted: false },
+    });
+    const requested = await h.call(cookie, {
+      method: 'POST',
+      url: '/api/approvals',
+      payload: { planId: res.json().planId },
+    });
+    expect(requested.statusCode, requested.body).toBe(403);
+    expect(requested.json().error.code).toBe('FORBIDDEN');
+    expect(await h.audit('approval.request')).toHaveLength(0);
   });
 });

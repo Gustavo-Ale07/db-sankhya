@@ -182,6 +182,7 @@ describe('POST /api/audit/:id/rollback-plan', () => {
     expect(res.statusCode, res.body).toBe(200);
     expect(res.headers['cache-control']).toContain('no-store');
     const body = res.json();
+    expect(body.plan.permitted).toBeUndefined();
     expect(body).toMatchObject({
       type: 'rollback-plan',
       label: ROLLBACK_LABEL,
@@ -189,6 +190,7 @@ describe('POST /api/audit/:id/rollback-plan', () => {
       statements: 1,
       conflict: { detected: false, columns: [] },
       plan: {
+        operation: 'UPDATE',
         previewKind: 'IMPACT_ANALYSIS',
         preview: {
           affected: 1,

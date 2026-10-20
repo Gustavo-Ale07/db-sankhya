@@ -94,6 +94,13 @@ export interface PreparedMutation {
   preview: { targets: PreviewTarget[]; affected: number };
   impact: { entities: string[]; rows: number; environment: Environment };
   requires: { strongConfirmation: string | null; approval: boolean };
+  /** The kind of the planned SQL statement (from the parsed statement); absent for actions. */
+  operation?: WriteClassified['kind'];
+  /**
+   * Whether the caller holds the permission `execute` checks first (the statement's DATA.*, or
+   * TEMP.WRITE on scratch). False for a preview made only through DATA.PREVIEW.
+   */
+  permitted: boolean;
 }
 
 export interface PrepareContext {
@@ -242,6 +249,7 @@ export class MutationService {
         const s = await this.resolveScratch(auth, write, sql);
         return await this.finishPlan(ctx, {
           operation: write.kind,
+          kind: write.kind,
           permission: 'TEMP.WRITE',
           environment: SCRATCH_ENVIRONMENT,
           connectionId: SCRATCH_CONNECTION_ID,
@@ -259,6 +267,7 @@ export class MutationService {
       });
       return await this.finishPlan(ctx, {
         operation: write.kind,
+        kind: write.kind,
         permission: r.permission,
         environment: r.environment,
         connectionId: ctx.connectionId,
@@ -284,6 +293,10 @@ export class MutationService {
    * (one ALLOW rule with `overrideWhereRequired` covering the entity), which forces the strong
    * phrase and four-eyes approval; anything else is WHERE_REQUIRED. That check runs before the
    * catalog is read, so a refused statement makes no gateway call.
+   *
+   * RBAC: `execute` needs the statement's own permission. `prepare` also accepts DATA.PREVIEW,
+   * which only shows the plan: the policy is still evaluated on the statement's write action
+   * (an explicit ALLOW is needed, exactly as for a writer), and `execute` refuses the plan.
    */
   private async resolveSankhya(
     auth: AuthState,
@@ -295,7 +308,9 @@ export class MutationService {
     const permission = PERMISSION[write.kind];
     // DELETE without WHERE never gets here (VALIDATE); INSERT has no WHERE at all.
     const noWhere = write.kind === 'UPDATE' && !write.hasWhere;
-    if (!auth.grants.permissions.has(permission)) {
+    const holds = auth.grants.permissions.has(permission);
+    const previewOnly = !holds && mode === 'prepare' && auth.grants.permissions.has('DATA.PREVIEW');
+    if (!holds && !previewOnly) {
       throw refuse(
         'AUTHORIZE',
         noWhere && mode === 'prepare'
@@ -303,6 +318,18 @@ export class MutationService {
           : new AppError('FORBIDDEN', 'You do not have permission for this action', { permission }),
       );
     }
+    // The policy engine denies an action the caller does not hold. A preview-only caller is
+    // evaluated as if it held the statement permission, so the rules decide exactly what they
+    // would for a writer; this set is used only for the write-action decisions below.
+    const writeAuth: AuthState = previewOnly
+      ? {
+          ...auth,
+          grants: {
+            ...auth.grants,
+            permissions: new Set<Permission>([...auth.grants.permissions, permission]),
+          },
+        }
+      : auth;
     const { policies, connections, metadata } = this.deps;
     const defaults = { maxReadRows: this.deps.maxReadRows };
     const groupIds = await this.deps.authz.activeGroupIds(auth.user.id);
@@ -324,7 +351,7 @@ export class MutationService {
     if (noWhere) {
       const override = await evaluateFor({
         policies,
-        auth,
+        auth: writeAuth,
         groupIds,
         action: permission,
         environment,
@@ -368,7 +395,7 @@ export class MutationService {
 
     const decision = await evaluateFor({
       policies,
-      auth,
+      auth: writeAuth,
       groupIds,
       action: permission,
       environment,
@@ -451,6 +478,8 @@ export class MutationService {
     o: {
       /** INSERT / UPDATE / DELETE, or the word of a business action (summary and phrase). */
       operation: string;
+      /** The parsed statement kind of a SQL plan (none for a business action). */
+      kind?: WriteClassified['kind'];
       permission: Permission;
       environment: Environment;
       connectionId: string;
@@ -497,6 +526,8 @@ export class MutationService {
           : null,
         approval: decision.limits.requireApproval,
       },
+      ...(o.kind ? { operation: o.kind } : {}),
+      permitted: auth.grants.permissions.has(permission),
     };
     await this.deps.audit.recordPlanCreated(
       {

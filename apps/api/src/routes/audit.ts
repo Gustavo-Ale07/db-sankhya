@@ -154,7 +154,8 @@ export async function auditRoutes(app: FastifyInstance): Promise<void> {
       );
     }
     // The plan token is the caller's own confirmation credential: returned outside the redactor.
-    const { token, ...shown } = prepared;
+    // `permitted` belongs to the write-switch summary of /api/query/preview, which this answer omits.
+    const { token, permitted: _permitted, ...shown } = prepared;
     const body = redact({
       type: 'rollback-plan',
       label: ROLLBACK_LABEL,

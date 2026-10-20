@@ -108,13 +108,15 @@ export async function actionRoutes(app: FastifyInstance): Promise<void> {
       config.writeToSankhya &&
       !(config.safeMode && prepared.impact.environment === 'PRODUCTION');
     // The plan token is the caller's own confirmation credential: returned outside the redactor.
-    const { token, ...shown } = prepared;
+    const { token, permitted, ...shown } = prepared;
     return {
       ...(redact({
         type: 'preview',
         ...shown,
         execution: {
           available,
+          // Whether the caller holds the permission execute checks (false for DATA.PREVIEW only).
+          permitted,
           safeMode: config.safeMode,
           globalWriteEnabled: globalWrite,
           writeToSankhya: config.writeToSankhya,
