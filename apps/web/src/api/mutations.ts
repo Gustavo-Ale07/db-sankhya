@@ -95,6 +95,8 @@ export interface ExecutionReport {
   status: 'success' | 'partial' | 'failed';
   verification: VerificationLabel;
   steps: ExecutionStep[];
+  /** Replays only: some row values were clipped or left out of the stored report. */
+  valuesTruncated?: boolean;
 }
 
 export interface ExecuteInput {
