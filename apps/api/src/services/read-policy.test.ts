@@ -129,29 +129,44 @@ describe('visibleCatalog', () => {
     user: { id: 'u1' },
     grants: { permissions: PERMS },
   } as unknown as AuthState;
-  /** A policy service over `rules`, counting the checks it answers. */
-  const fake = (rules: PolicyRule[]) => {
-    const stats = { checks: 0 };
+  /**
+   * A policy service over `rules`, counting the table and column decisions it answers. With a
+   * `version`, its checkers carry it (as `PolicyService.denyChecker` does) and results are memoized.
+   */
+  const fake = (rules: PolicyRule[], version?: string) => {
+    const stats = { tables: 0, columns: 0 };
+    const state = { rules, version };
     const policies = {
       denyChecker: (ctx: Parameters<typeof compileDenyChecker>[0], perms: Set<Permission>) => {
-        const inner = compileDenyChecker(ctx, rules, perms);
+        const inner = compileDenyChecker(ctx, state.rules, perms);
         if (!inner) return Promise.resolve(null);
         const counted: DenyChecker = {
           denyRules: inner.denyRules,
-          denied: (e, c) => {
-            stats.checks++;
-            return inner.denied(e, c);
+          ...(state.version === undefined ? {} : { policyVersion: state.version }),
+          denied: (e, c) => inner.denied(e, c),
+          forTable: (t) => {
+            stats.tables++;
+            const verdict = inner.forTable(t);
+            return (
+              verdict && {
+                patterns: verdict.patterns,
+                columnDenied: (c) => {
+                  stats.columns++;
+                  return verdict.columnDenied(c);
+                },
+              }
+            );
           },
         };
         return Promise.resolve(counted);
       },
     } as unknown as PolicyService;
-    return { policies, stats };
+    return { policies, stats, state };
   };
   const run = (rules: PolicyRule[], catalog: Catalog) =>
     visibleCatalog({ policies: fake(rules).policies, auth, ...CONTEXT }, catalog);
 
-  /** The pre-compilation algorithm: one full `evaluatePolicy` per table and per column. */
+  /** The original algorithm: one full `evaluatePolicy` per table and per column. */
   const reference = (rules: PolicyRule[], catalog: Catalog) => {
     const allowed = (entity: string, columns: Array<{ table: string; name: string }>) =>
       evaluatePolicy(
@@ -165,6 +180,7 @@ describe('visibleCatalog', () => {
         },
         rules,
         PERMS,
+        { policyVersion: 'v' },
       ).effect === 'ALLOW';
     const out: Record<string, string[]> = {};
     for (const t of catalog.tables) {
@@ -203,7 +219,7 @@ describe('visibleCatalog', () => {
     ]);
     const out = await visibleCatalog({ policies, auth, ...CONTEXT }, withFks);
     expect(out).toBe(withFks);
-    expect(stats.checks).toBe(0);
+    expect(stats.tables + stats.columns).toBe(0);
   });
 
   it('drops denied columns and the foreign keys that would name them', async () => {
@@ -241,6 +257,9 @@ describe('visibleCatalog', () => {
       [base],
       [{ ...base, columns: ['EMAIL'] }],
       [{ ...base, columns: ['*'] }],
+      [{ ...base, columns: ['COL*'] }],
+      [{ ...base, columns: ['*'], entities: ['TGF*'] }],
+      [{ ...base, columns: ['CPF', 'CNPJ', 'EMAIL', 'TELEFONE', 'NOMEPARC'] }],
       [{ ...base, columns: [], entities: ['TGF*'] }],
       [{ ...base, columns: [], entities: ['X.TSICID'] }],
       [{ ...base, columns: ['T*.NOME*', 'CODCID'] }],
@@ -254,46 +273,76 @@ describe('visibleCatalog', () => {
       return seed / 0x7fffffff;
     };
     const some = <T>(xs: readonly T[]) => xs.filter(() => rnd() < 0.3);
+    const one = <T>(xs: readonly T[]) => [xs[Math.floor(rnd() * xs.length)]!];
+    const COLUMN_PATTERNS = [
+      'TGFPAR.EMAIL',
+      'EMAIL',
+      'CPF',
+      'CODCID',
+      'NOME*',
+      'COL*',
+      '*COL*',
+      'AD_*.COL1',
+      '*',
+    ];
     const random = (): PolicyRule[] =>
-      Array.from({ length: 1 + Math.floor(rnd() * 5) }, (_, i) => ({
-        ...base,
-        id: `r${i}`,
-        effect: rnd() < 0.75 ? 'DENY' : 'ALLOW',
-        subjectType: rnd() < 0.6 ? 'everyone' : 'group',
-        subjectId: rnd() < 0.5 ? 'g1' : 'g2',
-        environments: some(['PRODUCTION', 'HOMOLOGATION', 'SANDBOX'] as const),
-        connectionIds: some(['c1', 'c2']),
-        entities: rnd() < 0.5 ? [] : some(['TGFPAR', 'TGF*', 'TSICID', 'SYS.*']),
-        columns: rnd() < 0.4 ? [] : some(['TGFPAR.EMAIL', 'EMAIL', 'CODCID', 'NOME*', '*']),
-      }));
+      Array.from({ length: 1 + Math.floor(rnd() * 5) }, (_, i) => {
+        const kind = rnd();
+        return {
+          ...base,
+          id: `r${i}`,
+          effect: rnd() < 0.75 ? 'DENY' : 'ALLOW',
+          subjectType: rnd() < 0.6 ? 'everyone' : 'group',
+          subjectId: rnd() < 0.5 ? 'g1' : 'g2',
+          environments: some(['PRODUCTION', 'HOMOLOGATION', 'SANDBOX'] as const),
+          connectionIds: some(['c1', 'c2']),
+          // Bare column denies, count-only (`*`) rules and broad wildcards are frequent.
+          entities: kind < 0.5 ? [] : some(['TGFPAR', 'TGF*', 'TSICID', 'SYS.*', 'AD_*']),
+          columns:
+            kind < 0.2
+              ? []
+              : kind < 0.5
+                ? one(COLUMN_PATTERNS)
+                : kind < 0.65
+                  ? ['*']
+                  : some(COLUMN_PATTERNS),
+        };
+      });
     const catalog: Catalog = {
       ...CATALOG,
       tables: [
-        table('TGFPAR', ['CODPARC', 'NOMEPARC', 'EMAIL', 'CODCID']),
+        table('TGFPAR', ['CODPARC', 'NOMEPARC', 'EMAIL', 'CODCID', 'CPF']),
         table('TSICID', ['CODCID', 'NOMECID']),
-        table('TGFPRO', ['CODPROD', 'DESCRPROD']),
+        table('TGFPRO', ['CODPROD', 'DESCRPROD', 'COL1']),
         table('TGFEMPTY', []),
-        table('AD_X', ['NOMEX', 'EMAIL']),
+        table('AD_X', ['NOMEX', 'EMAIL', 'COL1', 'XCOLY', 'COL2']),
       ],
     };
-    const sets = [...fixed, ...Array.from({ length: 200 }, random)];
-    let hidden = 0;
+    const total = (shaped: Record<string, string[]>) =>
+      Object.values(shaped).reduce((n, cols) => n + cols.length, 0);
+    const sets = [...fixed, ...Array.from({ length: 300 }, random)];
+    let tablesHidden = 0;
+    let columnsHidden = 0;
     for (const rules of sets) {
       const out = await run(rules, catalog);
       const expected = reference(rules, catalog);
       expect(shape(out), JSON.stringify(rules)).toEqual(expected);
-      if (Object.keys(expected).length < catalog.tables.length) hidden++;
+      if (Object.keys(expected).length < catalog.tables.length) tablesHidden++;
+      else if (total(expected) < total(shape(catalog))) columnsHidden++;
     }
-    // The sets exercise both outcomes.
-    expect(hidden).toBeGreaterThan(20);
-    expect(hidden).toBeLessThan(sets.length - 20);
+    // The sets exercise every outcome: tables hidden, only columns hidden, nothing hidden.
+    expect(tablesHidden).toBeGreaterThan(30);
+    expect(columnsHidden).toBeGreaterThan(30);
+    expect(tablesHidden + columnsHidden).toBeLessThan(sets.length - 30);
   });
 
-  it('filters 5,000 tables quickly: no check with 50 non-matching rules, few with a column DENY', async () => {
+  describe('on 5,000 tables of 31 columns', () => {
     const columns = Array.from({ length: 30 }, (_, i) => `COL${i}`);
     const big: Catalog = {
       ...CATALOG,
-      tables: Array.from({ length: 5000 }, (_, i) => table(`T${i}`, [...columns, 'CODUSU'])),
+      tables: Array.from({ length: 5000 }, (_, i) =>
+        table(i % 2 ? `TGF${i}` : `AD_T${i}`, [...columns, 'CODUSU']),
+      ),
     };
     const nonMatching: PolicyRule[] = Array.from({ length: 50 }, (_, i) => ({
       ...DENY_EMAIL,
@@ -302,20 +351,118 @@ describe('visibleCatalog', () => {
       subjectType: 'user',
       subjectId: `other-${i}`,
     }));
-    const quiet = fake(nonMatching);
-    let started = performance.now();
-    expect(await visibleCatalog({ policies: quiet.policies, auth, ...CONTEXT }, big)).toBe(big);
-    expect(quiet.stats.checks).toBe(0);
-    expect(performance.now() - started).toBeLessThan(2000);
+    const timed = async (rules: PolicyRule[]) => {
+      const { policies, stats } = fake(rules);
+      const started = performance.now();
+      const out = await visibleCatalog({ policies, auth, ...CONTEXT }, big);
+      return { out, stats, ms: performance.now() - started };
+    };
 
-    const loud = fake([...nonMatching, { ...DENY_EMAIL, columns: ['CODUSU'] }]);
-    started = performance.now();
-    const out = await visibleCatalog({ policies: loud.policies, auth, ...CONTEXT }, big);
-    expect(performance.now() - started).toBeLessThan(10_000);
-    expect(out.tables).toHaveLength(5000);
-    expect(out.tables.every((t: CatalogTable) => t.columns.length === 30)).toBe(true);
-    // Bisection: about 2 log2(31) checks per table, not one per column.
-    expect(loud.stats.checks).toBeLessThan(5000 * 15);
+    it('serves the same catalog with no check when 50 rules do not apply', async () => {
+      const { out, stats, ms } = await timed(nonMatching);
+      expect(out).toBe(big);
+      expect(stats.tables + stats.columns).toBe(0);
+      expect(ms).toBeLessThan(1500);
+    });
+
+    it('applies 30 bare column denies (all but one column hidden) in linear time', async () => {
+      const pii = columns.map((name, i) => ({ ...DENY_EMAIL, id: `pii${i}`, columns: [name] }));
+      const { out, stats, ms } = await timed([...nonMatching, ...pii]);
+      expect(ms).toBeLessThan(1500);
+      expect(out.tables).toHaveLength(5000);
+      expect(out.tables.every((t: CatalogTable) => t.columns.length === 1)).toBe(true);
+      // One decision per table and one per column, never more.
+      expect(stats.tables).toBe(5000);
+      expect(stats.columns).toBe(5000 * 31);
+    });
+
+    it('applies a broad COL* deny and a count-only rule in linear time', async () => {
+      const { out, stats, ms } = await timed([
+        ...nonMatching,
+        { ...DENY_EMAIL, id: 'broad', columns: ['COL*'] },
+        { ...DENY_EMAIL, id: 'count-only', entities: ['AD_*'], columns: ['*'] },
+      ]);
+      expect(ms).toBeLessThan(1500);
+      expect(out.tables).toHaveLength(5000);
+      for (const t of out.tables) {
+        expect(t.columns.map((c) => c.name)).toEqual(t.name.startsWith('AD_') ? [] : ['CODUSU']);
+      }
+      expect(stats.columns).toBe(5000 * 31);
+    });
+
+    it('yields to the event loop while it works', async () => {
+      const { policies } = fake([{ ...DENY_EMAIL, columns: ['COL*'] }]);
+      let ticks = 0;
+      let done = false;
+      const tick = () => {
+        ticks++;
+        if (!done) setImmediate(tick);
+      };
+      setImmediate(tick);
+      const started = performance.now();
+      await visibleCatalog({ policies, auth, ...CONTEXT }, big);
+      const ms = performance.now() - started;
+      done = true;
+      // About 10 ms of work between two turns of the loop; checked with a generous margin.
+      if (ms > 50) expect(ticks).toBeGreaterThanOrEqual(Math.floor(ms / 50));
+    });
+
+    it('answers a repeated call from the memo, near instantly', async () => {
+      const { policies, stats } = fake(
+        [...nonMatching, { ...DENY_EMAIL, columns: ['COL*'] }],
+        'v1',
+      );
+      const first = await visibleCatalog({ policies, auth, ...CONTEXT }, big);
+      const decided = stats.tables + stats.columns;
+      expect(decided).toBeGreaterThan(0);
+      const started = performance.now();
+      const second = await visibleCatalog({ policies, auth, ...CONTEXT }, big);
+      expect(performance.now() - started).toBeLessThan(50);
+      expect(second).toBe(first);
+      expect(stats.tables + stats.columns).toBe(decided);
+    });
+  });
+
+  describe('memo', () => {
+    it('is invalidated by a policy change and keyed by caller, groups, connection, environment and catalog', async () => {
+      const { policies, stats, state } = fake([DENY_EMAIL], 'v1');
+      const call = (over: Partial<typeof CONTEXT> = {}, catalog = withFks, user = auth) =>
+        visibleCatalog({ policies, auth: user, ...CONTEXT, ...over }, catalog);
+      const first = await call();
+      expect(shape(first).TGFPAR).not.toContain('EMAIL');
+      expect(await call()).toBe(first);
+      const base = stats.tables;
+
+      // A policy change gives another version: the memo misses and the new rules apply.
+      state.rules = [{ ...DENY_EMAIL, columns: ['NOMEPARC'] }];
+      state.version = 'v2';
+      const changed = await call();
+      expect(shape(changed).TGFPAR).toEqual(['CODPARC', 'EMAIL', 'CODCID']);
+      expect(stats.tables).toBe(base + withFks.tables.length);
+
+      // Every other part of the key misses too.
+      const before = stats.tables;
+      await call({ groupIds: ['g2'] });
+      await call({ connectionId: 'c2' });
+      await call({ environment: 'PRODUCTION' });
+      await call({}, { ...withFks });
+      await call({}, withFks, { ...auth, user: { id: 'u2' } } as unknown as AuthState);
+      expect(stats.tables).toBe(before + 5 * withFks.tables.length);
+
+      // The group order does not matter.
+      const at = stats.tables;
+      await call({ groupIds: ['g2', 'g1'] });
+      await call({ groupIds: ['g1', 'g2'] });
+      expect(stats.tables).toBe(at + withFks.tables.length);
+    });
+
+    it('never remembers a failure', async () => {
+      const { policies, state } = fake([{ ...DENY_EMAIL, actions: [] }], 'v1');
+      const call = () => visibleCatalog({ policies, auth, ...CONTEXT }, withFks);
+      expect((await call()).degraded).toEqual([POLICY_FILTER_FAILED]);
+      state.rules = [DENY_EMAIL];
+      expect((await call()).degraded).toBeUndefined();
+    });
   });
 
   it('serves no table, marked degraded, when the rules cannot be compiled or a check throws', async () => {

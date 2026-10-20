@@ -316,7 +316,8 @@ export class PolicyService {
     try {
       const snapshot = await this.current();
       if (snapshot.invalid.length > 0) return null;
-      return compileDenyChecker(context, snapshot.rules, permissions);
+      const checker = compileDenyChecker(context, snapshot.rules, permissions);
+      return checker && { ...checker, policyVersion: snapshot.version };
     } catch (err) {
       this.logSafe('error', { err }, 'Policies unavailable: denying every policy-evaluated action');
       return null;

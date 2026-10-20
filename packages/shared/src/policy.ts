@@ -302,10 +302,29 @@ export interface DenyChecker {
   /** How many enabled DENY rules match the context; 0 means only a malformed name is denied. */
   readonly denyRules: number;
   /**
+   * Version of the rule set this was compiled from, when the caller knows it (`PolicyService`
+   * sets it): two checkers of one context and version decide everything alike.
+   */
+  readonly policyVersion?: string;
+  /**
    * Whether `evaluatePolicy` would DENY `{ ...context, entities, columns, hasWhere: false }`.
    * Never throws (an error counts as denied).
    */
   denied(entities: string[], columns: PolicyColumn[]): boolean;
+  /**
+   * One table at a time: null when `denied([table], [])`, else the verdict for single-column
+   * reads of it, decided against only the rules that can reach this table. Never throws (an error
+   * counts as denied).
+   */
+  forTable(table: string): TableDenies | null;
+}
+
+/** Single-column decisions for one table that `DenyChecker.forTable` let through. */
+export interface TableDenies {
+  /** Column patterns that can reach this table; 0 means only a malformed column is denied. */
+  readonly patterns: number;
+  /** Whether `denied([table], [{ table, name: column }])`. Never throws. */
+  columnDenied(column: string): boolean;
 }
 
 /**
@@ -346,6 +365,9 @@ export function compileDenyChecker(
       if (!rule) return null;
       if (rule.effect === 'DENY' && matchesContext(rule, ctx)) denies.push(rule);
     }
+    const entityRules = denies.filter((r) => r.columns.length === 0).map(compileTableRule);
+    const columnRules = denies.filter((r) => r.columns.length > 0).map(compileTableRule);
+    const matchers = new Map<string, (name: string) => boolean>();
     return {
       denyRules: denies.length,
       denied(entities, columns) {
@@ -357,10 +379,142 @@ export function compileDenyChecker(
           return true;
         }
       },
+      forTable(table) {
+        try {
+          return tableDenies(table, entityRules, columnRules, matchers);
+        } catch {
+          return null;
+        }
+      },
     };
   } catch {
     return null;
   }
+}
+
+/**
+ * `forTable` of a `DenyChecker`, the same decisions as `normalizeRequest` + `overlaps`, specialised
+ * to `{ entities: [T], columns: [] }` and `{ entities: [T], columns: [{ table: T, name: C }] }`:
+ * - T must parse to one or two plain identifier parts (else malformed: denied). It is the only
+ *   entity, and a column naming T by the same string is attributed to it alone.
+ * - The table request has no columns, so only rules without columns can overlap it: an
+ *   entity-free one, or one whose entities hit T (`denyHit`).
+ * - Once the table passed, those rules cannot overlap a column request either (same entity). A
+ *   column rule overlaps `T.C` when its entities are empty or hit T, and one of its patterns has
+ *   no table part or a table part that hits T, and its name globs C (a `*` column, any pattern).
+ *   Those name patterns are collected once per table, and C must parse to one part (else
+ *   malformed: denied).
+ */
+function tableDenies(
+  table: string,
+  entityRules: TableRule[],
+  columnRules: TableRule[],
+  matchers: Map<string, (name: string) => boolean>,
+): TableDenies | null {
+  if (!isNonEmptyString(table)) return null;
+  const parts = parseName(table);
+  if (!parts || parts.length > 2 || !parts.every((p) => IDENTIFIER.test(p))) return null;
+  const entity = toEntity(parts);
+  if (entityRules.some((r) => r.entity(entity))) return null;
+  const names: string[] = [];
+  for (const r of columnRules) {
+    if (!r.entity(entity)) continue;
+    for (const p of r.columns) if (p.table === null || p.table(entity)) names.push(p.name);
+  }
+  const key = names.join('\u0000');
+  let matches = matchers.get(key);
+  if (!matches) {
+    matches = nameMatcher(names);
+    matchers.set(key, matches);
+  }
+  const hit = matches;
+  return {
+    patterns: names.length,
+    columnDenied(column) {
+      try {
+        if (!isNonEmptyString(column)) return true;
+        let name: string;
+        // A plain identifier parses to itself, upper-cased.
+        if (IDENTIFIER.test(column)) name = column.toUpperCase();
+        else {
+          const n = parseName(column);
+          if (!n || n.length !== 1) return true;
+          name = n[0]!;
+        }
+        return hit(name);
+      } catch {
+        return true;
+      }
+    },
+  };
+}
+
+/** A DENY rule with its entity patterns compiled, for `tableDenies`. */
+interface TableRule {
+  /** `entityMatches(rule, e, denyHit)`. */
+  entity: (e: Entity) => boolean;
+  /** Column patterns, the table part as `denyHit(table, e)` (null: no table part). */
+  columns: Array<{ table: ((e: Entity) => boolean) | null; name: string }>;
+}
+
+function compileTableRule(r: CompiledRule): TableRule {
+  const entities = r.entities.map(compileDenyHit);
+  return {
+    entity: entities.length === 0 ? () => true : (e) => entities.some((hit) => hit(e)),
+    columns: r.columns.map((p) => ({
+      table: p.table === null ? null : compileDenyHit(p.table),
+      name: p.name,
+    })),
+  };
+}
+
+/** `denyHit(p, e)` with its globs compiled once (entity parts are already upper-cased). */
+function compileDenyHit(p: string[]): (e: Entity) => boolean {
+  const parts = p.map(compileGlob);
+  const full = compileGlob(p.join('.'));
+  const last = parts[parts.length - 1]!;
+  return (e) =>
+    (p.length === 1
+      ? parts[0]!(e.last)
+      : e.parts.length === 2 && parts[0]!(e.parts[0]!) && parts[1]!(e.last)) ||
+    full(e.full) ||
+    full(e.last) ||
+    (e.parts.length === 1 && last(e.last));
+}
+
+/** `glob` over several column name patterns: exact names in a set, wildcards one by one. */
+function nameMatcher(patterns: string[]): (name: string) => boolean {
+  if (patterns.length === 0) return () => false;
+  const exact = new Set<string>();
+  const wild: Array<(name: string) => boolean> = [];
+  for (const p of patterns) {
+    if (p.includes('*')) wild.push(compileGlob(p));
+    else exact.add(p.toUpperCase());
+  }
+  // A `*` request column (the catalog had none) is hit by any column pattern of the table.
+  return (name) => name === '*' || exact.has(name) || wild.some((hit) => hit(name));
+}
+
+/** `glob(pattern, value)` with the pattern split once, for values already upper-cased. */
+function compileGlob(pattern: string): (value: string) => boolean {
+  const parts = pattern.toUpperCase().split('*');
+  if (parts.length === 1) return (v) => v === parts[0];
+  const first = parts[0]!;
+  const last = parts[parts.length - 1]!;
+  const middle = parts.slice(1, -1);
+  return (v) => {
+    if (v.length < first.length + last.length || !v.startsWith(first) || !v.endsWith(last)) {
+      return false;
+    }
+    let at = first.length;
+    const end = v.length - last.length;
+    for (const part of middle) {
+      const found = v.indexOf(part, at);
+      if (found < 0 || found + part.length > end) return false;
+      at = found + part.length;
+    }
+    return true;
+  };
 }
 
 /**

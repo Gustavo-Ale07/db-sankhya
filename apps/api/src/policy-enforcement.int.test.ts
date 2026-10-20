@@ -369,6 +369,29 @@ describe('catalog filtering by read policy', () => {
     expect(names).toHaveLength(fullPar.columns.length - 1);
   });
 
+  it('reflects a policy change at once, despite the memoized catalog', async () => {
+    const h = await setup();
+    const { cookie } = await h.viewer();
+    const columnsOf = async () =>
+      tableOf((await catalogOf(h, cookie)).tables, 'TGFPAR')!.columns.map((c) => c.name);
+    // An unrelated deny makes the filter run (and memoize) instead of short-circuiting.
+    await h.policy({ entities: ['TSICID'] });
+    expect(await columnsOf()).toContain('EMAIL');
+    expect(await columnsOf()).toContain('EMAIL');
+
+    await h.policy({ columns: ['TGFPAR.EMAIL'] });
+    expect(await columnsOf()).not.toContain('EMAIL');
+
+    const { policies } = h.app.services;
+    const rule = (await policies.list()).find((r) => r.columns.includes('TGFPAR.EMAIL'))!;
+    await policies.update(rule.id, { enabled: false });
+    expect(await columnsOf()).toContain('EMAIL');
+    await policies.update(rule.id, { enabled: true });
+    expect(await columnsOf()).not.toContain('EMAIL');
+    await policies.delete(rule.id);
+    expect(await columnsOf()).toContain('EMAIL');
+  });
+
   it('applies rules to an administrator too (no bypass)', async () => {
     const h = await setup();
     await h.policy({ entities: ['TSICID'] });

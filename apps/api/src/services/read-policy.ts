@@ -13,7 +13,7 @@ import type {
 import type { ReadAnalysis } from '@dbx/sql-engine';
 import type { AuthState } from '../context';
 import type { ConnectionsService } from './connections';
-import type { Catalog, CatalogTable } from './metadata';
+import type { Catalog, CatalogColumn, CatalogTable } from './metadata';
 import type { PolicyService } from './policy';
 
 /**
@@ -156,10 +156,33 @@ export async function authorizeConnection(
 /** Catalog marker of a filter that failed closed (`degraded` is free-form `SOURCE:state`). */
 export const POLICY_FILTER_FAILED = 'POLICY:failed';
 
-/** Tables filtered between two yields to the event loop. */
-const TABLES_PER_SLICE = 200;
+/** Longest run of filtering, in milliseconds, before yielding to the event loop. */
+const SLICE_MS = 10;
+
+/** Filtered catalogs remembered per policy service (most recently used last). */
+const MEMO_SIZE = 64;
 
 const yieldToLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+interface Memo {
+  source: Catalog;
+  result: Catalog;
+}
+
+/**
+ * Bounded LRU of filtered catalogs, one per `PolicyService` (so separate apps never share one).
+ * An entry is only reused for the very same catalog object, so a refreshed catalog misses.
+ */
+const memos = new WeakMap<PolicyService, Map<string, Memo>>();
+
+function memoOf(policies: PolicyService): Map<string, Memo> {
+  let memo = memos.get(policies);
+  if (!memo) {
+    memo = new Map();
+    memos.set(policies, memo);
+  }
+  return memo;
+}
 
 /**
  * The part of `catalog` the user may read with QUERY.SELECT, so the schema browser and
@@ -169,15 +192,20 @@ const yieldToLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
  * foreign key that names an omitted table or column at either end is omitted too. The shape of
  * the catalog is unchanged.
  *
- * Cost: the rule set is read and compiled once per call (`PolicyService.denyChecker`), keeping
- * only the DENY rules that match this user, groups, connection and environment. With none, and
- * only plain names, the catalog is returned as is, with no per-table check. Otherwise each table
- * is checked once without and once with all its columns; when the latter is denied, the columns
- * are bisected (a set is denied exactly when one of its columns is), so a few denied columns cost
- * a few checks. The loop yields to the event loop every `TABLES_PER_SLICE` tables.
+ * Cost:
+ * - The rule set is read and compiled once per call (`PolicyService.denyChecker`), keeping only
+ *   the DENY rules that match this user, groups, connection and environment. With none, and only
+ *   plain names, the catalog is returned as is.
+ * - Otherwise each table is decided once against those rules (`DenyChecker.forTable`), which
+ *   also collects the column patterns that can reach it; each column is then a set lookup or a
+ *   few globs against only those patterns. Linear in tables and columns, whatever is denied.
+ * - The loop yields to the event loop after every `SLICE_MS` of work.
+ * - The result is memoized per user, groups, connection, environment, policy version and catalog
+ *   object, so repeated calls cost a lookup; any policy change alters the version and misses.
  *
  * Fails closed: if the rules cannot be compiled, or anything throws, no table is returned and
  * `degraded` gains `POLICY:failed`. `onError` is only told; it cannot turn this into a throw.
+ * A failed result is never memoized.
  */
 export async function visibleCatalog(
   check: Omit<PolicyCheck, 'action' | 'entities' | 'columns' | 'hasWhere' | 'defaults'>,
@@ -209,7 +237,28 @@ export async function visibleCatalog(
     );
     if (!checker) return failed(new Error('policy rules unavailable for this context'));
     if (checker.denyRules === 0 && allPlain(catalog)) return catalog;
-    return await filterCatalog(checker, catalog);
+    // Without a known version two calls cannot be told apart, so nothing is remembered.
+    if (typeof checker.policyVersion !== 'string') return await filterCatalog(checker, catalog);
+    const key = JSON.stringify([
+      checker.policyVersion,
+      check.auth.user.id,
+      [...check.groupIds].sort(),
+      check.connectionId,
+      check.environment,
+      catalog.fetchedAt,
+    ]);
+    const memo = memoOf(check.policies);
+    const hit = memo.get(key);
+    if (hit && hit.source === catalog) {
+      memo.delete(key);
+      memo.set(key, hit);
+      return hit.result;
+    }
+    const result = await filterCatalog(checker, catalog);
+    memo.delete(key);
+    memo.set(key, { source: catalog, result });
+    while (memo.size > MEMO_SIZE) memo.delete(memo.keys().next().value as string);
+    return result;
   } catch (err) {
     return failed(err);
   }
@@ -224,67 +273,58 @@ function allPlain(catalog: Catalog): boolean {
 async function filterCatalog(checker: DenyChecker, catalog: Catalog): Promise<Catalog> {
   const kept: CatalogTable[] = [];
   const hiddenTables = new Set<string>();
-  /** `TABLE\0COLUMN`, upper-cased. */
-  const hiddenColumns = new Set<string>();
-  const key = (table: string, column: string) =>
-    `${table.toUpperCase()}\u0000${column.toUpperCase()}`;
-  let n = 0;
+  /** Denied columns per upper-cased table; made into name sets only if a foreign key asks. */
+  const deniedByTable = new Map<string, CatalogColumn[]>();
+  let sliceStart = performance.now();
   for (const table of catalog.tables) {
-    if (++n % TABLES_PER_SLICE === 0) await yieldToLoop();
+    if (performance.now() - sliceStart >= SLICE_MS) {
+      await yieldToLoop();
+      sliceStart = performance.now();
+    }
     const entity = table.name.toUpperCase();
-    if (checker.denied([entity], [])) {
+    const verdict = checker.forTable(entity);
+    if (!verdict) {
       hiddenTables.add(entity);
       continue;
     }
-    const denied = deniedColumns(
-      checker,
-      entity,
-      table.columns.map((c) => c.name),
-    );
-    if (denied.size === 0) {
+    // Copied only from the first denied column on, so an untouched table is kept as is.
+    let visible: CatalogColumn[] | null = null;
+    const denied: CatalogColumn[] = [];
+    table.columns.forEach((c, i) => {
+      if (verdict.columnDenied(c.name)) {
+        visible ??= table.columns.slice(0, i);
+        denied.push(c);
+      } else visible?.push(c);
+    });
+    if (!visible) {
       kept.push(table);
       continue;
     }
-    for (const name of denied) hiddenColumns.add(key(entity, name));
-    kept.push({ ...table, columns: table.columns.filter((c) => !denied.has(c.name)) });
+    deniedByTable.set(entity, [...(deniedByTable.get(entity) ?? []), ...denied]);
+    kept.push({ ...table, columns: visible });
   }
-  if (hiddenTables.size === 0 && hiddenColumns.size === 0) return catalog;
+  if (hiddenTables.size === 0 && deniedByTable.size === 0) return catalog;
+  const names = new Map<string, Set<string>>();
+  const columnHidden = (table: string, column: string) => {
+    const t = table.toUpperCase();
+    const cols = deniedByTable.get(t);
+    if (!cols) return false;
+    let set = names.get(t);
+    if (!set) {
+      set = new Set(cols.map((c) => c.name.toUpperCase()));
+      names.set(t, set);
+    }
+    return set.has(column.toUpperCase());
+  };
   const tables = kept.map((t) => {
+    if (t.foreignKeys.length === 0) return t;
     const foreignKeys = t.foreignKeys.filter(
       (fk) =>
-        !hiddenColumns.has(key(t.name, fk.column)) &&
+        !columnHidden(t.name, fk.column) &&
         !hiddenTables.has(fk.refTable.toUpperCase()) &&
-        !hiddenColumns.has(key(fk.refTable, fk.refColumn)),
+        !columnHidden(fk.refTable, fk.refColumn),
     );
     return foreignKeys.length === t.foreignKeys.length ? t : { ...t, foreignKeys };
   });
   return { ...catalog, tables };
-}
-
-/**
- * The columns of `entity` whose single-column read is denied. Sound because, once the table
- * itself passed, a column set is denied exactly when one of its columns is (DENY overlap is
- * per column, and a malformed column is denied on its own as well).
- */
-function deniedColumns(checker: DenyChecker, entity: string, names: string[]): Set<string> {
-  const out = new Set<string>();
-  const visit = (part: string[]) => {
-    if (part.length === 0) return;
-    if (
-      !checker.denied(
-        [entity],
-        part.map((name) => ({ table: entity, name })),
-      )
-    )
-      return;
-    if (part.length === 1) {
-      out.add(part[0]!);
-      return;
-    }
-    const mid = part.length >> 1;
-    visit(part.slice(0, mid));
-    visit(part.slice(mid));
-  };
-  visit(names);
-  return out;
 }

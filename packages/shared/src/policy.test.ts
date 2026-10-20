@@ -1439,6 +1439,139 @@ describe('compileDenyChecker', () => {
     expect(deniedCount).toBeLessThan(compared * 0.9);
   });
 
+  it('forTable decides each table and single column like evaluatePolicy (randomized)', () => {
+    let seed = 0xc01;
+    const rnd = () => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed / 0x7fffffff;
+    };
+    const pick = <T>(xs: readonly T[]): T => xs[Math.floor(rnd() * xs.length)]!;
+    const some = <T>(xs: readonly T[]): T[] => xs.filter(() => rnd() < 0.3);
+    const ENTITY_PATTERNS = [
+      'TGFPAR',
+      'TGF*',
+      'tsicid',
+      'SANKHYA.TGF*',
+      'DBO.TGFPAR',
+      'X.TGFPAR',
+      '*',
+      'SYS.*',
+      'AD_*',
+    ];
+    const COLUMN_PATTERNS = [
+      'EMAIL',
+      'CPF',
+      'codcid',
+      'COL*',
+      '*COL*',
+      'NOME*',
+      '*',
+      'TGFPAR.EMAIL',
+      'TGF*.COD*',
+      '*.NOMECID',
+      'DBO.TGFPAR.EMAIL',
+      'TSICID.*',
+    ];
+    const randomRule = (i: number): PolicyRule => {
+      const shape = rnd();
+      return rule({
+        id: `r${i}`,
+        effect: rnd() < 0.8 ? 'DENY' : 'ALLOW',
+        subjectType: pick(['everyone', 'everyone', 'user', 'group'] as const),
+        subjectId: pick(['u1', 'u2', 'g1', 'g2']),
+        environments: rnd() < 0.7 ? [] : some(['PRODUCTION', 'HOMOLOGATION', 'SANDBOX'] as const),
+        connectionIds: rnd() < 0.7 ? [] : some(['c1', 'c2']),
+        actions: [pick(['QUERY.SELECT', 'QUERY.*', '*', 'DATA.*'])],
+        // Bare column denies, count-only (`columns: ['*']`) and broad wildcards are common.
+        entities: shape < 0.4 ? [] : shape < 0.6 ? [pick(ENTITY_PATTERNS)] : some(ENTITY_PATTERNS),
+        columns:
+          shape < 0.2
+            ? []
+            : shape < 0.5
+              ? [pick(COLUMN_PATTERNS)]
+              : shape < 0.6
+                ? ['*']
+                : some(COLUMN_PATTERNS),
+        enabled: rnd() < 0.95,
+        ...(rnd() < 0.02 ? { columns: ['A.B.C.D'] } : {}),
+      });
+    };
+    const TABLES = [
+      'TGFPAR',
+      'tgfpar',
+      'TSICID',
+      'AD_X',
+      'COLTAB',
+      'SANKHYA.TGFPAR',
+      'dbo.TGFPAR',
+      '"TGFPAR"',
+      '[TSICID]',
+      'BAD NAME',
+      'A.B.C',
+      '',
+      ' ',
+    ];
+    const COLUMNS = [
+      'EMAIL',
+      'email',
+      'CPF',
+      'CODCID',
+      'NOMECID',
+      'COL1',
+      'XCOLY',
+      '"EMAIL"',
+      '[Cpf]',
+      '*',
+      'A.B',
+      'X"Y',
+      'BAD NAME',
+      '',
+    ];
+    let compared = 0;
+    let tablesHidden = 0;
+    let columnsHidden = 0;
+    for (let round = 0; round < 400; round++) {
+      const rules = Array.from({ length: 1 + Math.floor(rnd() * 6) }, (_, i) => randomRule(i));
+      const context: PolicyContext = {
+        ...ctx,
+        userId: pick(['u1', 'u2']),
+        groupIds: some(['g1', 'g2']),
+        environment: pick(['PRODUCTION', 'HOMOLOGATION', 'SANDBOX'] as const),
+        connectionId: pick(['c1', 'c2']),
+      };
+      const checker = compileDenyChecker(context, rules, ALL);
+      const deny = (entities: string[], columns: PolicyColumn[]) =>
+        evaluatePolicy({ ...context, entities, columns, hasWhere: false }, rules, ALL, {
+          policyVersion: 'v',
+        }).effect === 'DENY';
+      const same = (actual: boolean, expected: boolean, what: string) => {
+        if (actual !== expected)
+          expect.fail(`${what}: ${expected} expected, rules ${JSON.stringify(rules)}`);
+      };
+      for (const table of TABLES) {
+        const verdict = checker ? checker.forTable(table) : null;
+        const tableDenied = deny([table], []);
+        same(verdict === null, tableDenied, table);
+        compared++;
+        if (tableDenied) {
+          tablesHidden++;
+          continue;
+        }
+        for (const name of COLUMNS) {
+          const expected = deny([table], [{ table, name }]);
+          same(verdict!.columnDenied(name), expected, `${table}.${name}`);
+          compared++;
+          if (expected) columnsHidden++;
+        }
+      }
+    }
+    expect(compared).toBeGreaterThan(20_000);
+    // Hidden and visible tables and columns are all well represented.
+    expect(tablesHidden).toBeGreaterThan(400);
+    expect(columnsHidden).toBeGreaterThan(compared * 0.2);
+    expect(columnsHidden).toBeLessThan(compared * 0.8);
+  });
+
   it('isPlainPolicyName accepts plain identifiers only', () => {
     expect(isPlainPolicyName('TGFPAR')).toBe(true);
     expect(isPlainPolicyName('AD_X$1')).toBe(true);
