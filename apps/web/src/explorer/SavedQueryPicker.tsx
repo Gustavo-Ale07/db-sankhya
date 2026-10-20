@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '../api/client';
 import type { SavedQuery } from '../api/types';
@@ -23,6 +23,13 @@ export function SavedQueryPicker({ open, onClose, onPick }: Props) {
 
 function PickerBody({ onPick }: { onPick: (query: SavedQuery) => void }) {
   const [filter, setFilter] = useState('');
+  const input = useRef<HTMLInputElement>(null);
+  // The dialog's showModal() runs after this mounts and moves focus to its first button, so the
+  // filter takes focus on the next frame instead of through autoFocus.
+  useEffect(() => {
+    const frame = requestAnimationFrame(() => input.current?.focus());
+    return () => cancelAnimationFrame(frame);
+  }, []);
   const saved = useQuery({
     queryKey: ['saved'],
     queryFn: () => api.get<{ items: SavedQuery[] }>('/api/saved-queries'),
@@ -53,7 +60,7 @@ function PickerBody({ onPick }: { onPick: (query: SavedQuery) => void }) {
           className="input input-search w-full"
           placeholder="Filtrar por nome, descrição ou SQL…"
           value={filter}
-          autoFocus
+          ref={input}
           onChange={(e) => setFilter(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && items[0]) {

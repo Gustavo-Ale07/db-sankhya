@@ -62,8 +62,14 @@ export const SCHEMA_WIDTH_MAX = 480;
 const SCHEMA_WIDTH_DEFAULT = 256;
 const SCHEMA_WIDTH_STEP = 16;
 
+/** Widest the schema panel may be: 480px, or half the window on narrow screens (never below the minimum). */
+export function schemaWidthMax(): number {
+  const half = typeof window !== 'undefined' ? window.innerWidth * 0.5 : SCHEMA_WIDTH_MAX;
+  return Math.max(SCHEMA_WIDTH_MIN, Math.floor(Math.min(SCHEMA_WIDTH_MAX, half)));
+}
+
 const clampSchemaWidth = (n: number) =>
-  Math.round(Math.max(SCHEMA_WIDTH_MIN, Math.min(SCHEMA_WIDTH_MAX, n)));
+  Math.round(Math.max(SCHEMA_WIDTH_MIN, Math.min(schemaWidthMax(), n)));
 
 /** Width of the schema panel: a per-browser layout preference, never anything sensitive. */
 function loadSchemaWidth(): number {
@@ -131,7 +137,6 @@ export function ExplorerPage({
   const run: RunState = runs[tab.id] ?? { status: 'idle' };
 
   useEffect(() => saveTabs(user.id, tabs, tab.id), [user.id, tabs, tab.id]);
-  useEffect(() => saveSchemaWidth(schemaWidth), [schemaWidth]);
 
   const flash = useCallback((msg: string) => {
     setNotice(msg);
@@ -373,14 +378,21 @@ export function ExplorerPage({
     e.preventDefault();
     const startX = e.clientX;
     const startWidth = schemaWidth;
-    const move = (ev: PointerEvent) =>
-      setSchemaWidth(clampSchemaWidth(startWidth + ev.clientX - startX));
-    const up = () => {
+    let width = startWidth;
+    const move = (ev: PointerEvent) => {
+      width = clampSchemaWidth(startWidth + ev.clientX - startX);
+      setSchemaWidth(width);
+    };
+    const end = () => {
       window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', up);
+      window.removeEventListener('pointerup', end);
+      window.removeEventListener('pointercancel', end);
+      // Persisted once per drag, not on every move.
+      if (width !== startWidth) saveSchemaWidth(width);
     };
     window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', up);
+    window.addEventListener('pointerup', end);
+    window.addEventListener('pointercancel', end);
   }
 
   function schemaResizeKey(e: React.KeyboardEvent) {
@@ -388,12 +400,14 @@ export function ExplorerPage({
       ArrowLeft: schemaWidth - SCHEMA_WIDTH_STEP,
       ArrowRight: schemaWidth + SCHEMA_WIDTH_STEP,
       Home: SCHEMA_WIDTH_MIN,
-      End: SCHEMA_WIDTH_MAX,
+      End: schemaWidthMax(),
     };
     const next = steps[e.key];
     if (next === undefined) return;
     e.preventDefault();
-    setSchemaWidth(clampSchemaWidth(next));
+    const width = clampSchemaWidth(next);
+    setSchemaWidth(width);
+    saveSchemaWidth(width);
   }
 
   function startSplitDrag(e: React.PointerEvent) {
@@ -404,12 +418,14 @@ export function ExplorerPage({
       const pct = ((ev.clientY - box.top) / box.height) * 100;
       setEditorHeight(Math.max(15, Math.min(85, pct)));
     };
-    const up = () => {
+    const end = () => {
       window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', up);
+      window.removeEventListener('pointerup', end);
+      window.removeEventListener('pointercancel', end);
     };
     window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', up);
+    window.addEventListener('pointerup', end);
+    window.addEventListener('pointercancel', end);
   }
 
   const labelCls = 'max-lg:sr-only';
@@ -473,6 +489,7 @@ export function ExplorerPage({
           className="tbtn"
           onClick={() => setPickerOpen(true)}
           aria-haspopup="dialog"
+          aria-label="Abrir consulta salva"
           title="Abrir uma consulta salva em nova aba"
         >
           <Icon name="folder" />
@@ -498,7 +515,7 @@ export function ExplorerPage({
         {showSchema && (
           <>
             <aside
-              className="max-w-[50vw] shrink-0 overflow-hidden bg-panel"
+              className="shrink-0 overflow-hidden bg-panel"
               style={{ width: schemaWidth }}
               aria-label="Schema"
               data-testid="schema-panel"
@@ -523,7 +540,7 @@ export function ExplorerPage({
               aria-orientation="vertical"
               aria-label="Redimensionar painel de tabelas"
               aria-valuemin={SCHEMA_WIDTH_MIN}
-              aria-valuemax={SCHEMA_WIDTH_MAX}
+              aria-valuemax={schemaWidthMax()}
               aria-valuenow={schemaWidth}
               tabIndex={0}
               data-testid="schema-resizer"

@@ -119,9 +119,15 @@ describe('ExplorerPage toolbar', () => {
 
   it('"Consultas salvas" opens a picker; the filter narrows it and a choice opens a new tab', async () => {
     renderPage();
-    fireEvent.click(screen.getByRole('button', { name: 'Consultas salvas' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Abrir consulta salva' }));
     const dialog = await screen.findByRole('dialog', { name: 'Consultas salvas' });
     await within(dialog).findByText('Parceiros ativos');
+    // Focus lands on the filter, not on the dialog's close button.
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        within(dialog).getByLabelText('Filtrar consultas salvas'),
+      ),
+    );
     expect(within(dialog).getAllByTestId('saved-picker-item')).toHaveLength(2);
     fireEvent.change(within(dialog).getByLabelText('Filtrar consultas salvas'), {
       target: { value: 'produtos' },
@@ -147,7 +153,7 @@ describe('ExplorerPage toolbar', () => {
 
   it('closes the picker with Escape without opening a tab', async () => {
     renderPage();
-    fireEvent.click(screen.getByRole('button', { name: 'Consultas salvas' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Abrir consulta salva' }));
     const dialog = await screen.findByRole('dialog', { name: 'Consultas salvas' });
     // The browser fires "cancel" on the dialog for Escape.
     fireEvent(dialog, new Event('cancel', { cancelable: true }));
@@ -182,6 +188,36 @@ describe('ExplorerPage schema panel', () => {
     cleanup();
     renderPage();
     expect(panel().style.width).toBe(`${SCHEMA_WIDTH_MAX}px`);
+  });
+
+  it('saves the width once at the end of a drag, and stops on pointercancel', () => {
+    renderPage();
+    const setItem = vi.spyOn(Storage.prototype, 'setItem');
+    const widthWrites = () => setItem.mock.calls.filter(([k]) => k === 'dbx.schemaWidth');
+    fireEvent.pointerDown(handle(), { clientX: 256 });
+    fireEvent.pointerMove(window, { clientX: 266 });
+    fireEvent.pointerMove(window, { clientX: 276 });
+    fireEvent.pointerMove(window, { clientX: 286 });
+    expect(widthWrites()).toHaveLength(0);
+    fireEvent.pointerCancel(window);
+    expect(widthWrites()).toEqual([['dbx.schemaWidth', '286']]);
+    // The cancelled drag left no listener behind.
+    fireEvent.pointerMove(window, { clientX: 400 });
+    expect(panel().style.width).toBe('286px');
+  });
+
+  it('caps the width at half a narrow window and reports that cap', () => {
+    const original = window.innerWidth;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 600 });
+    try {
+      renderPage();
+      expect(handle().getAttribute('aria-valuemax')).toBe('300');
+      fireEvent.keyDown(handle(), { key: 'End' });
+      expect(panel().style.width).toBe('300px');
+      expect(handle().getAttribute('aria-valuenow')).toBe('300');
+    } finally {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: original });
+    }
   });
 
   it('resizes with the arrow keys and clamps at the minimum', () => {
