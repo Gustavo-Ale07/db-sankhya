@@ -73,7 +73,7 @@ describe('MutationDialog', () => {
       'PRÉVIA SIMULADA',
     ]);
     expect(screen.getByTestId('impact-environment').textContent).toBe('PRODUCTION');
-    expect(screen.getByTestId('impact-rows').textContent).toBe('1');
+    expect(screen.getByTestId('impact-rows').textContent).toBe('1 registro será alterado');
     expect(screen.getByTestId('mutation-impact').textContent).toContain('TGFPAR');
     expect(screen.getByTestId('plan-countdown').textContent).toBe('5:00');
     const diff = screen.getByTestId('mutation-diff').textContent;
@@ -213,7 +213,7 @@ describe('MutationDialog', () => {
     await screen.findByTestId('execution-report');
     expect(screen.getByTestId('verification-status').textContent).toBe('PARTIALLY_VERIFIED');
     const steps = screen.getAllByTestId('execution-step').map((r) => r.textContent);
-    expect(steps[0]).toContain('CODPARC=1');
+    expect(steps[0]).toContain('CODPARC = 1');
     expect(steps[0]).toContain('gravado');
     expect(steps[0]).toContain('sim');
     expect(steps[1]).toContain('SANKHYA_API_ERROR');
@@ -235,7 +235,11 @@ describe('MutationDialog', () => {
       />,
     );
     fireEvent.click(execButton());
-    expect((await screen.findByTestId('outcome-unknown')).textContent).toContain('NÃO repita');
+    const warning = await screen.findByTestId('outcome-unknown');
+    expect(warning.textContent).toContain('RESULTADO DESCONHECIDO');
+    expect(warning.textContent).toContain(
+      'A alteração pode ter sido executada. Não repita a operação antes de conferir o registro.',
+    );
     expect(execButton().disabled).toBe(true);
     expect(onOutcome).toHaveBeenCalledWith({
       sent: true,
@@ -329,8 +333,9 @@ describe('MutationDialog', () => {
     );
     const diff = screen.getByTestId('mutation-diff').textContent ?? '';
     expect(diff).toContain('Antigo');
-    expect(diff).toContain('(registro removido)');
+    expect(diff).toContain('REGISTRO SERÁ REMOVIDO');
     expect(diff).not.toContain('∅');
+    expect(diff).not.toContain('NULL');
   });
 
   it('shows an unknown preview label as its raw code', () => {
@@ -348,8 +353,11 @@ describe('MutationDialog', () => {
   it.each([
     ['READ_ONLY_MODE', 'somente leitura'],
     ['FORBIDDEN', 'permissão'],
-    ['TARGETS_CHANGED', 'mudaram'],
-    ['CONFIRMATION_EXPIRED', 'expirou'],
+    [
+      'TARGETS_CHANGED',
+      'Os dados mudaram desde a prévia. Gere uma nova prévia antes de continuar.',
+    ],
+    ['CONFIRMATION_EXPIRED', 'Execute novamente para gerar uma nova prévia'],
   ])('shows the %s refusal in pt-BR with its code', async (code, text) => {
     vi.mocked(executePlan).mockRejectedValue(new ApiError(400, { code, message: 'x' }));
     render(
@@ -450,7 +458,7 @@ describe('MutationDialog', () => {
       unknown: true,
       errorCode: 'NETWORK_ERROR',
     });
-    expect(screen.getByTestId('outcome-unknown').textContent).toContain('NÃO repita');
+    expect(screen.getByTestId('outcome-unknown').textContent).toContain('Não repita');
   });
 
   it('clears the unknown outcome when a 5xx is followed by a replayed report', async () => {
@@ -527,7 +535,7 @@ describe('MutationDialog', () => {
         initialOutcome={{ sent: true, unknown: true, errorCode: 'NETWORK_ERROR' }}
       />,
     );
-    expect(screen.getByTestId('outcome-unknown').textContent).toContain('NÃO repita');
+    expect(screen.getByTestId('outcome-unknown').textContent).toContain('Não repita');
     expect(execButton().textContent).toBe('Consultar resultado');
     expect(execButton().disabled).toBe(false);
   });
@@ -685,7 +693,7 @@ describe('MutationDialog', () => {
       expect(screen.getByTestId('mutation-error').textContent).toContain('[CONFIRMATION_EXPIRED]'),
     );
     expect(screen.getByTestId('outcome-unknown')).toBeTruthy();
-    expect(screen.getByRole('dialog').textContent).not.toMatch(/gere um novo preview/i);
+    expect(screen.getByRole('dialog').textContent).not.toMatch(/gere um novo preview|nova prévia/i);
   });
 
   it('shows the verification the server recorded with WRITE_OUTCOME_UNKNOWN', async () => {
@@ -756,5 +764,434 @@ describe('MutationDialog', () => {
     render(<MutationDialog preview={prepared} sql="x" onClose={() => {}} />);
     expect(screen.getByRole('dialog', { name: 'Prévia da alteração' })).toBeTruthy();
     expect(screen.queryByRole('note')).toBeNull();
+  });
+});
+
+const noPhrase = { strongConfirmation: null, approval: false };
+
+function rows(n: number) {
+  return Array.from({ length: n }, (_, i) => ({
+    key: { CODPARC: i + 1 },
+    before: { CODPARC: i + 1, NOMEPARC: `Antigo ${i + 1}`, CODCID: 10 },
+    after: { CODPARC: i + 1, NOMEPARC: `Novo ${i + 1}`, CODCID: 10 },
+  }));
+}
+
+describe('MutationDialog preview redesign', () => {
+  it('shows the operation and the entities, a count sentence and only the changed fields', () => {
+    render(
+      <MutationDialog
+        preview={preview({
+          operation: 'UPDATE',
+          preview: {
+            affected: 1,
+            targets: [
+              {
+                key: { CODPARC: 123 },
+                before: { CODPARC: 123, NOMEPARC: 'Antigo', CODCID: 7 },
+                after: { CODPARC: 123, NOMEPARC: 'Novo', CODCID: 7 },
+              },
+            ],
+          },
+        })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.getByTestId('mutation-operation').textContent).toBe('UPDATE • TGFPAR');
+    expect(screen.getByTestId('impact-rows').textContent).toBe('1 registro será alterado');
+    const diff = screen.getByTestId('mutation-diff');
+    expect(diff.textContent).toContain('Registro CODPARC = 123');
+    expect(diff.textContent).toContain('ANTES');
+    expect(diff.textContent).toContain('DEPOIS');
+    expect(screen.getAllByTestId('diff-field').map((f) => f.getAttribute('data-field'))).toEqual([
+      'NOMEPARC',
+    ]);
+    fireEvent.click(screen.getByRole('button', { name: 'Mostrar todos os campos' }));
+    expect(screen.getAllByTestId('diff-field').map((f) => f.getAttribute('data-field'))).toEqual([
+      'CODPARC',
+      'NOMEPARC',
+      'CODCID',
+    ]);
+  });
+
+  it('pluralises the UPDATE count from the server numbers', () => {
+    render(
+      <MutationDialog
+        preview={preview({
+          operation: 'UPDATE',
+          preview: { affected: 3, targets: rows(3) },
+          impact: { entities: ['TGFPAR'], rows: 3, environment: 'SANDBOX' },
+        })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.getByTestId('impact-rows').textContent).toBe('3 registros serão alterados');
+  });
+
+  it.each([
+    [1, '1 novo registro será criado'],
+    [2, '2 novos registros serão criados'],
+  ])('shows an INSERT of %i as new records', (n, sentence) => {
+    const targets = Array.from({ length: n }, (_, i) => ({
+      key: { ID: i + 1 },
+      before: null,
+      after: { ID: i + 1, NOME: `Novo ${i + 1}` },
+    }));
+    render(
+      <MutationDialog
+        preview={preview({
+          operation: 'INSERT',
+          preview: { affected: n, targets },
+          impact: { entities: ['TMP_X'], rows: n, environment: 'SCRATCH' },
+        })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.getByTestId('mutation-operation').textContent).toBe('INSERT • TMP_X');
+    expect(screen.getByTestId('impact-rows').textContent).toBe(sentence);
+    const diff = screen.getByTestId('mutation-diff').textContent ?? '';
+    expect(diff).toContain('(novo registro)');
+    expect(diff).toContain('Novo 1');
+  });
+
+  it('derives the operation of an older plan without `operation`', () => {
+    render(
+      <MutationDialog
+        preview={preview({
+          preview: { affected: 1, targets: [{ key: { ID: 1 }, before: null, after: { ID: 1 } }] },
+        })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.getByTestId('mutation-operation').textContent).toBe('INSERT • TGFPAR');
+  });
+
+  it('shows a DELETE as the full existing row and "REGISTRO SERÁ REMOVIDO", never NULLs', () => {
+    render(
+      <MutationDialog
+        preview={preview({
+          operation: 'DELETE',
+          preview: {
+            affected: 2,
+            targets: [
+              { key: { ID: 1 }, before: { ID: 1, NOME: 'Linha um', VALOR: 10 }, after: {} },
+              { key: { ID: 2 }, before: { ID: 2, NOME: 'Linha dois', VALOR: 20 }, after: {} },
+            ],
+          },
+          impact: { entities: ['TMP_X'], rows: 2, environment: 'SCRATCH' },
+        })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.getByTestId('mutation-operation').textContent).toBe('DELETE • TMP_X');
+    expect(screen.getByTestId('impact-rows').textContent).toBe('2 registros serão removidos');
+    const diff = screen.getByTestId('mutation-diff').textContent ?? '';
+    expect(diff).toContain('Linha um');
+    expect(diff).toContain('VALOR');
+    expect(diff).toContain('REGISTRO SERÁ REMOVIDO');
+    expect(diff).not.toContain('NULL');
+    expect(diff).not.toContain('∅');
+  });
+
+  it('shows the PRODUÇÃO band only for production', () => {
+    render(<MutationDialog preview={preview()} sql="x" onClose={() => {}} />);
+    expect(screen.getByTestId('production-band').textContent).toContain(
+      'PRODUÇÃO — Você está prestes a alterar dados do ambiente de produção.',
+    );
+    cleanup();
+    render(
+      <MutationDialog
+        preview={preview({ impact: { entities: ['TGFPAR'], rows: 1, environment: 'SANDBOX' } })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.queryByTestId('production-band')).toBeNull();
+  });
+
+  it('collapses the cards when there are more than 5 targets, except the first', () => {
+    render(
+      <MutationDialog
+        preview={preview({ preview: { affected: 6, targets: rows(6) } })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    const toggles = screen.getAllByTestId('diff-card-toggle');
+    expect(toggles.map((t) => t.getAttribute('aria-expanded'))).toEqual([
+      'true',
+      'false',
+      'false',
+      'false',
+      'false',
+      'false',
+    ]);
+    fireEvent.click(toggles[1]!);
+    expect(toggles[1]!.getAttribute('aria-expanded')).toBe('true');
+    fireEvent.click(toggles[0]!);
+    expect(toggles[0]!.getAttribute('aria-expanded')).toBe('false');
+  });
+
+  it('paginates 1000 targets: never more than 20 cards, with the total and page controls', () => {
+    render(
+      <MutationDialog
+        preview={preview({
+          operation: 'UPDATE',
+          preview: { affected: 1000, targets: rows(1000) },
+          impact: { entities: ['TGFPAR'], rows: 1000, environment: 'SANDBOX' },
+        })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.getAllByTestId('diff-card')).toHaveLength(20);
+    expect(screen.getByTestId('impact-rows').textContent).toBe('1000 registros serão alterados');
+    expect(screen.getByTestId('mutation-diff').textContent).toContain('1000 registros no total');
+    expect(screen.getByTestId('diff-page').textContent).toBe('Página 1 de 50');
+    const prev = screen.getByRole('button', { name: 'Anterior' }) as HTMLButtonElement;
+    expect(prev.disabled).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: 'Próxima' }));
+    expect(screen.getByTestId('diff-page').textContent).toBe('Página 2 de 50');
+    expect(screen.getAllByTestId('diff-card')).toHaveLength(20);
+    const headers = screen.getAllByTestId('diff-card-toggle').map((t) => t.textContent);
+    expect(headers[0]).toContain('Registro CODPARC = 21');
+    expect(headers.some((h) => h?.includes('Registro CODPARC = 1 '))).toBe(false);
+  });
+
+  it('labels the buttons "Confirmar alteração" and "Cancelar"', () => {
+    render(<MutationDialog preview={preview()} sql="x" onClose={() => {}} />);
+    expect(execButton().textContent).toBe('Confirmar alteração');
+    expect(screen.getByRole('button', { name: 'Cancelar' })).toBeTruthy();
+  });
+
+  it('disables the confirmation for a preview-only caller, with a note', () => {
+    render(
+      <MutationDialog
+        preview={preview({
+          requires: noPhrase,
+          execution: {
+            available: true,
+            permitted: false,
+            safeMode: false,
+            globalWriteEnabled: true,
+            writeToSankhya: true,
+          },
+        })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    expect(execButton().disabled).toBe(true);
+    expect(screen.getByTestId('preview-only-note').textContent).toBe(
+      'Você pode ver a prévia, mas não tem permissão para executar esta alteração.',
+    );
+    fireEvent.click(execButton());
+    expect(executePlan).not.toHaveBeenCalled();
+  });
+
+  it('disables the confirmation while the write switches are unavailable', () => {
+    render(
+      <MutationDialog
+        preview={preview({
+          requires: noPhrase,
+          execution: {
+            available: false,
+            safeMode: true,
+            globalWriteEnabled: true,
+            writeToSankhya: true,
+          },
+        })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.getByRole('note').textContent).toContain('SAFE_MODE');
+    expect(execButton().disabled).toBe(true);
+  });
+
+  it('never executes on Enter, neither in the confirmation input nor anywhere in the dialog', () => {
+    vi.mocked(executePlan).mockResolvedValue(report());
+    render(<MutationDialog preview={preview()} sql="x" onClose={() => {}} />);
+    type(PHRASE);
+    const input = screen.getByTestId('confirmation-input');
+    fireEvent.keyDown(input, { key: 'Enter' });
+    fireEvent.keyPress(input, { key: 'Enter', charCode: 13 });
+    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Enter' });
+    // Default prevented on the button: the browser does not turn the Enter into a click.
+    expect(fireEvent.keyDown(execButton(), { key: 'Enter' })).toBe(false);
+    expect(executePlan).not.toHaveBeenCalled();
+    expect(screen.getByRole('dialog')).toBeTruthy();
+  });
+
+  it('sends exactly one execute on a double click', async () => {
+    vi.mocked(executePlan).mockResolvedValue(report());
+    render(<MutationDialog preview={preview({ requires: noPhrase })} sql="x" onClose={() => {}} />);
+    fireEvent.click(execButton());
+    fireEvent.click(execButton());
+    await screen.findByTestId('execution-report');
+    expect(executePlan).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not execute an expired plan and says to run again for a new preview', () => {
+    render(
+      <MutationDialog
+        preview={preview({ expiresAt: new Date(NOW - 1_000).toISOString(), requires: noPhrase })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    expect(execButton().disabled).toBe(true);
+    fireEvent.click(execButton());
+    expect(executePlan).not.toHaveBeenCalled();
+    expect(screen.getByTestId('plan-countdown').textContent).toContain(
+      'execute novamente para gerar uma nova prévia',
+    );
+  });
+});
+
+describe('MutationDialog execution report', () => {
+  async function run(r: ExecutionReport) {
+    vi.mocked(executePlan).mockResolvedValue(r);
+    render(<MutationDialog preview={preview({ requires: noPhrase })} sql="x" onClose={() => {}} />);
+    fireEvent.click(execButton());
+    return screen.findByTestId('execution-report');
+  }
+
+  it('shows "Alteração concluída" and ANTES × AGORA from the read-back when VERIFIED', async () => {
+    const el = await run(
+      report({
+        steps: [
+          {
+            key: { CODPARC: 1 },
+            outcome: 'ok',
+            verified: true,
+            before: { NOMEPARC: 'Antigo' },
+            expected: { NOMEPARC: 'Novo' },
+            observed: { NOMEPARC: 'Lido de volta' },
+          },
+        ],
+      }),
+    );
+    expect(screen.getByTestId('report-title').textContent).toBe('Alteração concluída');
+    expect(el.textContent).toContain('Os valores foram lidos novamente no Sankhya e conferem.');
+    const step = screen.getByTestId('execution-step');
+    expect(step.textContent).toContain('ANTES');
+    expect(step.textContent).toContain('AGORA');
+    expect(step.textContent).toContain('Antigo');
+    expect(screen.getByTestId('step-now').textContent).toContain('Lido de volta');
+    expect(step.textContent).not.toContain('ESPERADO');
+  });
+
+  it('shows ESPERADO × OBSERVADO in danger and never "Alteração concluída" when FAILED', async () => {
+    await run(
+      report({
+        status: 'success',
+        verification: 'FAILED',
+        steps: [
+          {
+            key: { CODPARC: 1 },
+            outcome: 'ok',
+            verified: false,
+            before: { NOMEPARC: 'Antigo' },
+            expected: { NOMEPARC: 'Novo' },
+            observed: { NOMEPARC: 'Outro' },
+          },
+        ],
+      }),
+    );
+    expect(screen.getByTestId('report-title').textContent).toBe('Alteração com divergência');
+    expect(screen.getByTestId('execution-report').textContent).not.toContain('Alteração concluída');
+    const mismatch = screen.getByTestId('step-mismatch');
+    expect(mismatch.textContent).toContain('ESPERADO');
+    expect(mismatch.textContent).toContain('OBSERVADO');
+    expect(mismatch.textContent).toContain('Novo');
+    expect(mismatch.textContent).toContain('Outro');
+    expect(mismatch.className).toContain('danger');
+  });
+
+  it.each([
+    ['PARTIALLY_VERIFIED', 'success', 'Alteração executada — verificação parcial'],
+    ['UNVERIFIED', 'success', 'Não foi possível verificar'],
+    ['VERIFIED', 'partial', 'Alteração parcial'],
+    ['VERIFIED', 'failed', 'A alteração falhou'],
+  ] as const)('titles %s/%s without "concluída"', async (verification, status, title) => {
+    await run(report({ verification, status }));
+    expect(screen.getByTestId('report-title').textContent).toBe(title);
+  });
+
+  it('says "não foi possível reler" without observed, and never shows expected as AGORA', async () => {
+    await run(
+      report({
+        verification: 'UNVERIFIED',
+        steps: [
+          {
+            key: { CODPARC: 1 },
+            outcome: 'ok',
+            before: { NOMEPARC: 'Antigo' },
+            expected: { NOMEPARC: 'Esperado-XYZ' },
+          },
+        ],
+      }),
+    );
+    const now = screen.getByTestId('step-now');
+    expect(now.textContent).toContain('não foi possível reler');
+    expect(screen.getByTestId('execution-step').textContent).not.toContain('Esperado-XYZ');
+  });
+
+  it('says the values are not available in a replay that omits them', async () => {
+    await run({ ...report(), valuesTruncated: true });
+    expect(screen.getByTestId('values-unavailable').textContent).toContain('não estão disponíveis');
+  });
+
+  it('paginates the steps of a large report', async () => {
+    await run(
+      report({
+        steps: Array.from({ length: 45 }, (_, i) => ({
+          key: { CODPARC: i + 1 },
+          outcome: 'ok' as const,
+          verified: true,
+        })),
+      }),
+    );
+    expect(screen.getAllByTestId('execution-step')).toHaveLength(20);
+    expect(screen.getByTestId('execution-report').textContent).toContain('Página 1 de 3');
+  });
+});
+
+describe('MutationDialog unknown outcome', () => {
+  it('shows RESULTADO DESCONHECIDO and never retries on its own', async () => {
+    vi.mocked(executePlan).mockRejectedValue(
+      new ApiError(0, { code: 'NETWORK_ERROR', message: 'x' }),
+    );
+    render(
+      <MutationDialog
+        preview={preview({ requires: noPhrase })}
+        sql="x"
+        onClose={() => {}}
+        newKey={() => 'same-key'}
+      />,
+    );
+    fireEvent.click(execButton());
+    const warning = await screen.findByTestId('outcome-unknown');
+    expect(warning.textContent).toContain('RESULTADO DESCONHECIDO');
+    expect(warning.textContent).toContain(
+      'A alteração pode ter sido executada. Não repita a operação antes de conferir o registro.',
+    );
+    act(() => {
+      vi.advanceTimersByTime(10_000);
+    });
+    expect(executePlan).toHaveBeenCalledTimes(1);
+    expect(execButton().textContent).toBe('Consultar resultado');
+    fireEvent.click(execButton());
+    await waitFor(() => expect(executePlan).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(executePlan).mock.calls.map((c) => c[0].idempotencyKey)).toEqual([
+      'same-key',
+      'same-key',
+    ]);
   });
 });
