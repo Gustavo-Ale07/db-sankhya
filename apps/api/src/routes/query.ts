@@ -7,6 +7,7 @@ import type { Classified, ReadAnalysis } from '@dbx/sql-engine';
 import type { AuthState } from '../context';
 import type { Catalog } from '../services/metadata';
 import { ENV_CONNECTION_ID } from '../services/connections';
+import { ApprovalsService } from '../services/approvals';
 import { MutationService } from '../services/mutations';
 import { PlansService } from '../services/plans';
 import { executeRead } from '../services/read-executor';
@@ -60,6 +61,15 @@ const previewBody = z
   })
   .strict();
 
+const executeBody = z
+  .object({
+    planId: z.uuid(),
+    token: z.string().min(1).max(200),
+    strongConfirmation: z.string().max(300).optional(),
+    idempotencyKey: z.string().min(1).max(200),
+  })
+  .strict();
+
 const cancelBody = z.object({ executionId: z.string().regex(EXECUTION_ID) }).strict();
 
 /** Statement kinds that would change data or schema. */
@@ -74,6 +84,16 @@ function mutationTable(c: Classified): string | null {
 export async function queryRoutes(app: FastifyInstance): Promise<void> {
   const { history, audit, executions, connections, metadata, config, redact, policies, authz } =
     app.services;
+  const { security } = app.services;
+  const plans = new PlansService(app.services.database.db, {
+    secret: config.session.secret,
+    ttlSeconds: config.planTtlSeconds,
+    approvalTtlSeconds: config.approvalTtlMinutes * 60,
+  });
+  const ceilings = {
+    sankhyaMaxReadRows: config.sankhya.maxRows,
+    scratchMaxReadRows: config.scratch.maxRows,
+  };
   const mutations = new MutationService({
     policies,
     authz,
@@ -81,12 +101,20 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
     metadata,
     audit,
     scratch: app.services.scratch,
-    plans: new PlansService(app.services.database.db, {
-      secret: config.session.secret,
-      ttlSeconds: config.planTtlSeconds,
-      approvalTtlSeconds: config.approvalTtlMinutes * 60,
+    plans,
+    // Plans that require approval are consumed only through the approvals service.
+    approvals: new ApprovalsService(app.services.database.db, {
+      plans,
+      policies,
+      authz,
+      redact,
+      logger: app.log,
+      ceilings,
     }),
-    maxReadRows: config.sankhya.maxRows,
+    security,
+    switches: { safeMode: config.safeMode, writeToSankhya: config.writeToSankhya },
+    maxReadRows: ceilings.sankhyaMaxReadRows,
+    scratchMaxReadRows: ceilings.scratchMaxReadRows,
   });
 
   const safeHistory = async (
@@ -399,9 +427,10 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
   }
 
   // ------------------------------------------------------------ POST /api/query/preview
-  // Plans an INSERT / UPDATE / DELETE and returns its preview. Never writes: execution does not
-  // exist yet and the write switches (SAFE_MODE, GLOBAL_WRITE_ENABLED, WRITE_TO_SANKHYA) are only
-  // reported. MutationService audits every preview, allowed or denied.
+  // Plans an INSERT / UPDATE / DELETE and returns its preview. Never writes: the plan runs only
+  // through /api/query/execute. `execution.available` reports whether the write switches
+  // (SAFE_MODE, GLOBAL_WRITE_ENABLED, WRITE_TO_SANKHYA) would let it run now. MutationService
+  // audits every preview, allowed or denied.
   app.post('/api/query/preview', async (request, reply) => {
     noStore(reply);
     const auth = requireAuth(request);
@@ -412,16 +441,49 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
       connectionId: body.connectionId ?? defaultConnection(),
       meta: { ip: clientIp(request), requestId: request.id },
     });
-    return redact({
-      type: 'preview',
-      ...prepared,
-      execution: {
-        available: false,
-        safeMode: config.safeMode,
-        globalWriteEnabled: config.globalWriteEnabled,
-        writeToSankhya: config.writeToSankhya,
-      },
+    // Whether execute would pass the write switches right now (it checks them again itself).
+    const globalWrite = (await security.globalWriteState()).effective;
+    const available =
+      globalWrite &&
+      (prepared.capability.route === 'SCRATCH' ||
+        (config.writeToSankhya &&
+          !(config.safeMode && prepared.impact.environment === 'PRODUCTION')));
+    // The plan token is the caller's own confirmation credential (bound to this session by an
+    // HMAC): it is returned as is, outside the redactor, which would mask any `token` key.
+    const { token, ...shown } = prepared;
+    return {
+      ...(redact({
+        type: 'preview',
+        ...shown,
+        execution: {
+          available,
+          safeMode: config.safeMode,
+          globalWriteEnabled: globalWrite,
+          writeToSankhya: config.writeToSankhya,
+        },
+      }) as Record<string, unknown>),
+      token,
+    };
+  });
+
+  // ------------------------------------------------------------ POST /api/query/execute
+  // Executes a previewed plan: re-authorizes, writes, verifies and audits (MutationService).
+  // Nothing runs without the plan token of this session; the idempotency key makes retries safe.
+  app.post('/api/query/execute', async (request, reply) => {
+    noStore(reply);
+    const auth = requireAuth(request);
+    const body = parseBody(executeBody, request.body);
+    const report = await mutations.execute({
+      auth,
+      planId: body.planId,
+      token: body.token,
+      idempotencyKey: body.idempotencyKey,
+      ...(body.strongConfirmation !== undefined
+        ? { strongConfirmation: body.strongConfirmation }
+        : {}),
+      meta: { ip: clientIp(request), requestId: request.id },
     });
+    return redact({ type: 'execution', planId: body.planId, ...report });
   });
 
   // ------------------------------------------------------------ POST /api/query/confirm

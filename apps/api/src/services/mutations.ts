@@ -1,11 +1,28 @@
 /**
- * Mutation orchestrator, preview half (Task 11.2a). `prepare` runs
- * PARSE → VALIDATE → AUTHORIZE → PLAN → PREVIEW → IMPACT and persists an immutable plan. It never
- * writes: the only gateway call it can make is the before-snapshot read (`executeQuery` through
- * `executeRead`). Execution (Task 11.2b) does not exist yet, so nothing can consume the plan.
+ * Mutation orchestrator.
+ *
+ * `prepare` (Task 11.2a) runs PARSE → VALIDATE → AUTHORIZE → PLAN → PREVIEW → IMPACT and persists
+ * an immutable plan. It never writes: the only gateway call it can make is the before-snapshot
+ * read (`executeQuery` through `executeRead`).
+ *
+ * `execute` (Task 11.2b) runs CONFIRM → RE-AUTHORIZE → EXECUTE → VERIFY → AUDIT on a plan:
+ * - CONFIRM consumes the plan (token, session, exact strong phrase, idempotency key). A plan that
+ *   requires approval is consumed only through `ApprovalsService.consumeForPlan`. A replay with
+ *   the same idempotency key returns the stored report and never writes again.
+ * - RE-AUTHORIZE reloads the grants and the policy rules: the policy version must be the frozen
+ *   one, the decision must still ALLOW with gates no stricter than the frozen ones, the capability
+ *   must be unchanged, and the targets are read again (TARGETS_CHANGED when they moved). Then the
+ *   write switches: GLOBAL_WRITE_ENABLED (env AND runtime kill switch), WRITE_TO_SANKHYA (Sankhya
+ *   plans) and SAFE_MODE (PRODUCTION plans), each failing closed with READ_ONLY_MODE.
+ * - EXECUTE sends one save per target, in order, never retried. A definite failure stops the run
+ *   (the rest is `not_attempted`); a timeout is `unknown` (WRITE_OUTCOME_UNKNOWN).
+ * - VERIFY reads every target back by key and labels the run VERIFIED, PARTIALLY_VERIFIED,
+ *   UNVERIFIED or FAILED (see `verification.ts`).
+ * - AUDIT records PLAN_EXECUTED (with the report, for replays) and VERIFICATION; every refusal
+ *   after the consume is a PLAN_DENIED, every refusal of the consume a `write.denied`.
  */
 import { AppError, isAppError } from '@dbx/shared';
-import type { Environment, Permission, PolicyColumn, PolicyDecision } from '@dbx/shared';
+import type { Environment, ErrorCode, Permission, PolicyColumn, PolicyDecision } from '@dbx/shared';
 import { classifyStatement, resolveCapability } from '@dbx/sql-engine';
 import type {
   Capability,
@@ -16,12 +33,14 @@ import type {
   Value,
 } from '@dbx/sql-engine';
 import type { AuthState } from '../context';
+import type { ApprovalsService } from './approvals';
+import { gatesHold } from './approvals';
 import type { AuthzService } from './authz';
 import type { ConnectionsService } from './connections';
 import type { Catalog, CatalogTable } from './metadata';
 import type { MetadataService } from './metadata';
-import type { PlansService } from './plans';
-import { strongConfirmationPhrase } from './plans';
+import type { ConsumedPlan, PlanRow, PlansService } from './plans';
+import { strongConfirmationPhrase, targetsHashOf } from './plans';
 import type { PolicyService } from './policy';
 import { executeRead } from './read-executor';
 import {
@@ -32,9 +51,15 @@ import {
   evaluateFor,
   readTargets,
 } from './read-policy';
-import type { ScratchManager } from './scratch';
+import type { DryRunResult, ScratchManager, ScratchWorkspace } from './scratch';
 import { analyzeScratchSql } from './scratch-guard';
-import type { AuditService } from './records';
+import type { ScratchStatement } from './scratch-guard';
+import type { AuditLifecycleContext, AuditService } from './records';
+import type { SecuritySettingsService } from './security-settings';
+import { labelOf, statusOf, verifyByKey } from './verification';
+import type { ExecutionReport, ExecutionStep } from './verification';
+
+export type { ExecutionReport, ExecutionStep } from './verification';
 
 export type PreviewKind = 'SIMULATED_PREVIEW' | 'IMPACT_ANALYSIS' | 'TRANSACTIONAL_DRY_RUN';
 
@@ -68,16 +93,32 @@ export interface PrepareContext {
   meta?: { ip?: string | null; requestId?: string | null };
 }
 
+export interface ExecuteContext {
+  auth: AuthState;
+  planId: string;
+  token: string;
+  strongConfirmation?: string;
+  idempotencyKey?: string;
+  meta?: { ip?: string | null; requestId?: string | null };
+}
+
 export interface MutationDeps {
   policies: PolicyService;
-  authz: Pick<AuthzService, 'activeGroupIds'>;
+  authz: Pick<AuthzService, 'activeGroupIds' | 'grants'>;
   connections: ConnectionsService;
   metadata: Pick<MetadataService, 'get'>;
-  plans: Pick<PlansService, 'create'>;
+  plans: Pick<PlansService, 'create' | 'consume' | 'peek'>;
+  /** The only consume path of plans that require approval. */
+  approvals: Pick<ApprovalsService, 'consumeForPlan'>;
   scratch: Pick<ScratchManager, 'workspace'>;
   audit: AuditService;
-  /** SANKHYA_MAX_ROWS: ceiling of the before-snapshot read. */
+  /** GLOBAL_WRITE_ENABLED: env AND the runtime kill switch. */
+  security: Pick<SecuritySettingsService, 'globalWriteState'>;
+  switches: { safeMode: boolean; writeToSankhya: boolean };
+  /** SANKHYA_MAX_ROWS: read ceiling of the policy decisions and of the before-snapshot read. */
   maxReadRows: number;
+  /** SCRATCH_MAX_ROWS: read ceiling of the scratch policy decisions. */
+  scratchMaxReadRows?: number;
 }
 
 type WriteClassified = Extract<Classified, { kind: 'INSERT' | 'UPDATE' | 'DELETE' }>;
@@ -90,6 +131,7 @@ const PERMISSION: Record<WriteClassified['kind'], Permission> = {
 
 const SCRATCH_TABLE = /^tmp_/i;
 const IDENT = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** A refusal with the stage that produced it and audit-only details (never sent to the user). */
 class Refusal extends AppError {
@@ -105,6 +147,32 @@ class Refusal extends AppError {
 const refuse = (stage: string, err: AppError, internal?: Record<string, unknown>) =>
   new Refusal(stage, err, internal);
 
+/** Everything the Sankhya AUTHORIZE → PREVIEW stages produce, at prepare and again at execute. */
+interface SankhyaResolution {
+  permission: Permission;
+  environment: Environment;
+  capability: Capability;
+  decision: PolicyDecision;
+  table: CatalogTable;
+  targets: PreviewTarget[];
+  /** UPDATE: the SET columns, in statement order. */
+  setColumns: string[];
+  previewKind: PreviewKind;
+  previewLabels: PreviewKind[];
+}
+
+interface ScratchResolution {
+  workspace: ScratchWorkspace;
+  stmt: ScratchStatement;
+  capability: Capability;
+  decision: PolicyDecision;
+  dry: DryRunResult;
+  targets: PreviewTarget[];
+  entity: string;
+}
+
+const invalidPlan = (message: string) => new AppError('CONFIRMATION_INVALID', message);
+
 export class MutationService {
   constructor(private readonly deps: MutationDeps) {}
 
@@ -113,168 +181,207 @@ export class MutationService {
     let classified: Classified | undefined;
     let environment: Environment | null = null;
     try {
-      // ---------------------------------------------------------------- PARSE
-      // AST classification only: anything the parser cannot positively identify is refused.
       classified = classifyStatement(sql);
-      if (classified.kind === 'UNKNOWN') {
-        throw refuse(
-          'PARSE',
-          new AppError('SQL_PARSE_ERROR', 'The statement could not be recognised.'),
-          { reason: classified.reason },
-        );
-      }
-      if (
-        classified.kind !== 'INSERT' &&
-        classified.kind !== 'UPDATE' &&
-        classified.kind !== 'DELETE'
-      ) {
-        throw refuse(
-          'PARSE',
-          new AppError('SQL_UNSUPPORTED', 'Only INSERT, UPDATE and DELETE can be previewed.'),
-        );
-      }
-      const write = classified;
+      const write = parseWrite(classified);
 
       // ---------------------------------------------------------------- VALIDATE
-      if (write.kind !== 'INSERT' && !write.hasWhere) {
-        throw refuse(
-          'VALIDATE',
-          new AppError(
-            'WHERE_REQUIRED',
-            `${write.kind} without WHERE affects every row and is blocked.`,
-          ),
-        );
-      }
-
-      if (write.kind !== 'INSERT' && write.stmt && 'where' in write.stmt && write.stmt.where) {
-        if (isTrivialWhere(write.stmt.where)) {
-          throw refuse(
-            'VALIDATE',
-            new AppError(
-              'WHERE_REQUIRED',
-              `${write.kind} with a condition that does not restrict rows is blocked.`,
-            ),
-          );
-        }
-      }
+      validateWrite(write);
 
       // A write to a scratch table never touches Sankhya: it gets a transactional dry run.
       if (SCRATCH_TABLE.test(write.table)) {
         environment = SCRATCH_ENVIRONMENT;
-        return await this.prepareScratch(ctx, write);
-      }
-
-      // ---------------------------------------------------------------- AUTHORIZE
-      const permission = PERMISSION[write.kind];
-      if (!auth.grants.permissions.has(permission)) {
-        throw refuse(
-          'AUTHORIZE',
-          new AppError('FORBIDDEN', 'You do not have permission for this action', { permission }),
-        );
-      }
-      const { policies, connections, metadata } = this.deps;
-      const groupIds = await this.deps.authz.activeGroupIds(auth.user.id);
-      // The connection is authorized for reading first: the preview reads the targets, and a
-      // write request without entities is always denied by the engine. The write itself is
-      // authorized per entity below.
-      const access = await authorizeConnection({
-        policies,
-        auth,
-        groupIds,
-        action: 'QUERY.SELECT',
-        connectionId: ctx.connectionId,
-        connections,
-      });
-      if (!access.ok) throw refuse('AUTHORIZE', connectionDenied(), { reasons: access.reasons });
-      environment = access.environment;
-
-      const catalog = await metadata.get(ctx.connectionId);
-      const capability = resolveCapability(write, { catalog, scratchTables: [] });
-      if (capability.class === 'UNSUPPORTED' || capability.route !== 'SANKHYA_SAVE') {
-        throw refuse(
-          'AUTHORIZE',
-          new AppError('OPERATION_NOT_SUPPORTED', capability.reason, {
-            capability: capability.class,
-          }),
-        );
-      }
-      if (capability.blocked) {
-        throw refuse('VALIDATE', new AppError('WHERE_REQUIRED', capability.blocked.reason));
-      }
-      const stmt = write.stmt;
-      if (!stmt || stmt.type === 'delete') {
-        throw refuse(
-          'VALIDATE',
-          new AppError('OPERATION_NOT_SUPPORTED', 'This statement shape cannot be previewed.'),
-        );
-      }
-      const table = catalogTable(catalog, write.table);
-
-      const decision = await evaluateFor({
-        policies,
-        auth,
-        groupIds,
-        action: permission,
-        environment,
-        connectionId: ctx.connectionId,
-        entities: [table.name.toUpperCase()],
-        columns: writeColumns(stmt, table),
-        hasWhere: write.hasWhere,
-      });
-      if (decision.effect !== 'ALLOW') {
-        throw refuse('AUTHORIZE', new AppError('FORBIDDEN', 'The change was denied by policy'), {
-          reasons: decision.reasons,
-          matchedRuleIds: decision.matchedRuleIds,
-          policyVersion: decision.policyVersion,
+        const s = await this.resolveScratch(auth, write, sql);
+        return await this.finishPlan(ctx, {
+          write,
+          permission: 'TEMP.WRITE',
+          environment: SCRATCH_ENVIRONMENT,
+          connectionId: SCRATCH_CONNECTION_ID,
+          capability: s.capability,
+          decision: s.decision,
+          targets: s.targets,
+          entity: s.entity,
+          previewKind: 'TRANSACTIONAL_DRY_RUN',
+          previewLabels: ['TRANSACTIONAL_DRY_RUN'],
         });
       }
 
-      // ---------------------------------------------------------------- PLAN + PREVIEW
-      const maxWriteRows = decision.limits.maxWriteRows;
-      let targets: PreviewTarget[];
-      let previewKind: PreviewKind;
-      let previewLabels: PreviewKind[];
-      if (stmt.type === 'insert') {
-        targets = [insertTarget(stmt, table)];
-        previewKind = 'SIMULATED_PREVIEW';
-        previewLabels = ['SIMULATED_PREVIEW'];
-      } else {
-        targets = await this.updateTargets(ctx, stmt, table, catalog, {
-          groupIds,
-          environment,
-          maxWriteRows,
-        });
-        previewKind = 'IMPACT_ANALYSIS';
-        previewLabels = ['IMPACT_ANALYSIS', 'SIMULATED_PREVIEW'];
-      }
-      if (targets.length > maxWriteRows) {
-        throw refuse(
-          'PREVIEW',
-          new AppError(
-            'WRITE_ROW_LIMIT_EXCEEDED',
-            `The change affects more than ${maxWriteRows} rows.`,
-            { maxWriteRows },
-          ),
-        );
-      }
-
+      const r = await this.resolveSankhya(auth, ctx.connectionId, write, 'prepare', (e) => {
+        environment = e;
+      });
       return await this.finishPlan(ctx, {
         write,
-        permission,
-        environment,
+        permission: r.permission,
+        environment: r.environment,
         connectionId: ctx.connectionId,
-        capability,
-        decision,
-        targets,
-        entity: table.name.toUpperCase(),
-        previewKind,
-        previewLabels,
+        capability: r.capability,
+        decision: r.decision,
+        targets: r.targets,
+        entity: r.table.name.toUpperCase(),
+        previewKind: r.previewKind,
+        previewLabels: r.previewLabels,
       });
     } catch (err) {
       await this.auditRefusal(ctx, classified, environment, err);
       if (err instanceof Refusal) throw new AppError(err.code, err.message, err.details);
       throw err;
     }
+  }
+
+  /**
+   * AUTHORIZE → PLAN → PREVIEW of a Sankhya write. Used by `prepare`, and again by `execute`
+   * with fresh grants and rules, so both see exactly the same checks.
+   *
+   * UPDATE without WHERE is allowed only when the policy engine applies a WHERE override
+   * (one ALLOW rule with `overrideWhereRequired` covering the entity), which forces the strong
+   * phrase and four-eyes approval; anything else is WHERE_REQUIRED. That check runs before the
+   * catalog is read, so a refused statement makes no gateway call.
+   */
+  private async resolveSankhya(
+    auth: AuthState,
+    connectionId: string,
+    write: WriteClassified,
+    mode: 'prepare' | 'execute',
+    onEnvironment?: (environment: Environment) => void,
+  ): Promise<SankhyaResolution> {
+    const permission = PERMISSION[write.kind];
+    // DELETE without WHERE never gets here (VALIDATE); INSERT has no WHERE at all.
+    const noWhere = write.kind === 'UPDATE' && !write.hasWhere;
+    if (!auth.grants.permissions.has(permission)) {
+      throw refuse(
+        'AUTHORIZE',
+        noWhere && mode === 'prepare'
+          ? whereRequired(write.kind)
+          : new AppError('FORBIDDEN', 'You do not have permission for this action', { permission }),
+      );
+    }
+    const { policies, connections, metadata } = this.deps;
+    const defaults = { maxReadRows: this.deps.maxReadRows };
+    const groupIds = await this.deps.authz.activeGroupIds(auth.user.id);
+    // The connection is authorized for reading first: the preview reads the targets, and a
+    // write request without entities is always denied by the engine. The write itself is
+    // authorized per entity below.
+    const access = await authorizeConnection({
+      policies,
+      auth,
+      groupIds,
+      action: 'QUERY.SELECT',
+      connectionId,
+      connections,
+    });
+    if (!access.ok) throw refuse('AUTHORIZE', connectionDenied(), { reasons: access.reasons });
+    const environment = access.environment;
+    onEnvironment?.(environment);
+
+    if (noWhere) {
+      const override = await evaluateFor({
+        policies,
+        auth,
+        groupIds,
+        action: permission,
+        environment,
+        connectionId,
+        entities: [write.table.toUpperCase()],
+        hasWhere: false,
+        defaults,
+      });
+      if (!overrideApplies(override)) {
+        throw refuse('VALIDATE', whereRequired(write.kind), { reasons: override.reasons });
+      }
+    }
+
+    const catalog = await metadata.get(connectionId);
+    let capability = resolveCapability(write, { catalog, scratchTables: [] });
+    if (capability.class === 'UNSUPPORTED' || capability.route !== 'SANKHYA_SAVE') {
+      throw refuse(
+        'AUTHORIZE',
+        new AppError('OPERATION_NOT_SUPPORTED', capability.reason, {
+          capability: capability.class,
+        }),
+      );
+    }
+    if (capability.blocked) {
+      // Only a missing WHERE blocks a capability, and the override was checked above; the
+      // decision below must confirm it again.
+      if (!noWhere) {
+        throw refuse('VALIDATE', new AppError('WHERE_REQUIRED', capability.blocked.reason));
+      }
+      const { blocked: _blocked, ...rest } = capability;
+      capability = rest;
+    }
+    const stmt = write.stmt;
+    if (!stmt || stmt.type === 'delete') {
+      throw refuse(
+        'VALIDATE',
+        new AppError('OPERATION_NOT_SUPPORTED', 'This statement shape cannot be previewed.'),
+      );
+    }
+    const table = catalogTable(catalog, write.table);
+
+    const decision = await evaluateFor({
+      policies,
+      auth,
+      groupIds,
+      action: permission,
+      environment,
+      connectionId,
+      entities: [table.name.toUpperCase()],
+      columns: writeColumns(stmt, table),
+      hasWhere: write.hasWhere,
+      defaults,
+    });
+    if (decision.effect !== 'ALLOW') {
+      throw refuse('AUTHORIZE', new AppError('FORBIDDEN', 'The change was denied by policy'), {
+        reasons: decision.reasons,
+        matchedRuleIds: decision.matchedRuleIds,
+        policyVersion: decision.policyVersion,
+      });
+    }
+    if (noWhere && !overrideApplies(decision)) {
+      throw refuse('VALIDATE', whereRequired(write.kind), { reasons: decision.reasons });
+    }
+
+    // ---------------------------------------------------------------- PLAN + PREVIEW
+    const maxWriteRows = decision.limits.maxWriteRows;
+    let targets: PreviewTarget[];
+    let setColumns: string[] = [];
+    let previewKind: PreviewKind;
+    let previewLabels: PreviewKind[];
+    if (stmt.type === 'insert') {
+      targets = [insertTarget(stmt, table)];
+      previewKind = 'SIMULATED_PREVIEW';
+      previewLabels = ['SIMULATED_PREVIEW'];
+    } else {
+      const u = await this.updateTargets(auth, connectionId, stmt, table, catalog, {
+        groupIds,
+        environment,
+        maxWriteRows,
+      });
+      targets = u.targets;
+      setColumns = u.setColumns;
+      previewKind = 'IMPACT_ANALYSIS';
+      previewLabels = ['IMPACT_ANALYSIS', 'SIMULATED_PREVIEW'];
+    }
+    if (targets.length > maxWriteRows) {
+      throw refuse(
+        'PREVIEW',
+        new AppError(
+          'WRITE_ROW_LIMIT_EXCEEDED',
+          `The change affects more than ${maxWriteRows} rows.`,
+          { maxWriteRows },
+        ),
+      );
+    }
+    return {
+      permission,
+      environment,
+      capability,
+      decision,
+      table,
+      targets,
+      setColumns,
+      previewKind,
+      previewLabels,
+    };
   }
 
   /** IMPACT: persists the immutable plan, audits it and shapes the response. */
@@ -353,14 +460,15 @@ export class MutationService {
   }
 
   /**
-   * Scratch preview: the statement runs inside a transaction of the caller's own workspace and is
-   * rolled back (TRANSACTIONAL_DRY_RUN). Policy is evaluated first, exactly as for a real write.
+   * Scratch AUTHORIZE → PREVIEW: the statement runs inside a transaction of the caller's own
+   * workspace and is rolled back (TRANSACTIONAL_DRY_RUN). Policy is evaluated first, exactly as
+   * for a real write. Used by `prepare` and again by `execute`.
    */
-  private async prepareScratch(
-    ctx: PrepareContext,
+  private async resolveScratch(
+    auth: AuthState,
     write: WriteClassified,
-  ): Promise<PreparedMutation> {
-    const { auth, sql } = ctx;
+    sql: string,
+  ): Promise<ScratchResolution> {
     const permission: Permission = 'TEMP.WRITE';
     if (!auth.grants.permissions.has(permission)) {
       throw refuse(
@@ -382,7 +490,7 @@ export class MutationService {
     if (capability.blocked) {
       throw refuse('VALIDATE', new AppError('WHERE_REQUIRED', capability.blocked.reason));
     }
-    let stmt;
+    let stmt: ScratchStatement;
     try {
       stmt = analyzeScratchSql(sql);
     } catch (err) {
@@ -408,6 +516,9 @@ export class MutationService {
       connectionId: SCRATCH_CONNECTION_ID,
       entities: [...new Set([...stmt.tables, stmt.target])],
       hasWhere: write.hasWhere,
+      ...(this.deps.scratchMaxReadRows !== undefined
+        ? { defaults: { maxReadRows: this.deps.scratchMaxReadRows } }
+        : {}),
     });
     if (decision.effect !== 'ALLOW') {
       throw refuse('AUTHORIZE', new AppError('FORBIDDEN', 'The change was denied by policy'), {
@@ -450,28 +561,18 @@ export class MutationService {
         ),
       );
     }
-    return this.finishPlan(ctx, {
-      write,
-      permission,
-      environment: SCRATCH_ENVIRONMENT,
-      connectionId: SCRATCH_CONNECTION_ID,
-      capability,
-      decision,
-      targets,
-      entity,
-      previewKind: 'TRANSACTIONAL_DRY_RUN',
-      previewLabels: ['TRANSACTIONAL_DRY_RUN'],
-    });
+    return { workspace, stmt, capability, decision, dry, targets, entity };
   }
 
   /** Before snapshot of the UPDATE targets through the read path, capped at maxWriteRows + 1. */
   private async updateTargets(
-    ctx: PrepareContext,
+    auth: AuthState,
+    connectionId: string,
     stmt: UpdateStatement,
     table: CatalogTable,
     catalog: Catalog,
     opts: { groupIds: string[]; environment: Environment; maxWriteRows: number },
-  ): Promise<PreviewTarget[]> {
+  ): Promise<{ targets: PreviewTarget[]; setColumns: string[] }> {
     const pk = table.columns.filter((c) => c.pk).map((c) => c.name.toUpperCase());
     if (pk.length === 0) {
       throw refuse(
@@ -499,12 +600,13 @@ export class MutationService {
     const referenced = new Set<string>();
     for (const s of stmt.set) collectColumns(s.value, qualifiers, known, referenced);
     const selected = [...new Set([...pk, ...setColumns, ...referenced])];
-    if (!stmt.where) throw refuse('VALIDATE', new AppError('WHERE_REQUIRED', 'WHERE is required.'));
-    const where = renderExpr(stmt.where, qualifiers, known);
-    const snapshotSql = `SELECT ${selected.join(', ')} FROM ${table.name.toUpperCase()} WHERE ${where}`;
+    // No WHERE only reaches here under a policy WHERE override (checked by the caller); the
+    // snapshot then reads the whole table, still capped below.
+    const where = stmt.where ? ` WHERE ${renderExpr(stmt.where, qualifiers, known)}` : '';
+    const snapshotSql = `SELECT ${selected.join(', ')} FROM ${table.name.toUpperCase()}${where}`;
 
     const { policies, connections } = this.deps;
-    const runtime = await connections.getRuntime(ctx.connectionId);
+    const runtime = await connections.getRuntime(connectionId);
     const maxRows = Math.max(1, Math.min(this.deps.maxReadRows, opts.maxWriteRows));
     const out = await executeRead({
       runtime,
@@ -516,11 +618,11 @@ export class MutationService {
         const t = readTargets(analysis, catalog);
         const read = await evaluateFor({
           policies,
-          auth: ctx.auth,
+          auth,
           groupIds: opts.groupIds,
           action: 'QUERY.SELECT',
           environment: opts.environment,
-          connectionId: ctx.connectionId,
+          connectionId,
           entities: t.entities,
           columns: t.columns,
           defaults: { maxReadRows: maxRows },
@@ -541,7 +643,7 @@ export class MutationService {
       );
     }
     const index = out.columns.map((c) => c.toUpperCase());
-    return out.rows.map((raw) => {
+    const targets = out.rows.map((raw) => {
       const before: RecordValues = {};
       selected.forEach((name) => {
         const i = index.indexOf(name);
@@ -554,6 +656,369 @@ export class MutationService {
         after[setColumns[i]!] = simulate(s.value, before, qualifiers);
       });
       return { key, before, after };
+    });
+    return { targets, setColumns };
+  }
+
+  // ======================================================================== execute
+
+  async execute(ctx: ExecuteContext): Promise<ExecutionReport> {
+    const { auth } = ctx;
+
+    // ---------------------------------------------------------------- CONFIRM
+    let consumed: ConsumedPlan & { approvalId?: string };
+    try {
+      const input = {
+        id: ctx.planId,
+        token: ctx.token,
+        userId: auth.user.id,
+        sessionId: auth.session.id,
+        ...(ctx.strongConfirmation !== undefined
+          ? { strongConfirmation: ctx.strongConfirmation }
+          : {}),
+        ...(ctx.idempotencyKey !== undefined ? { idempotencyKey: ctx.idempotencyKey } : {}),
+      };
+      const peek = await this.deps.plans.peek(ctx.planId, auth.user.id);
+      consumed = peek?.requiresApproval
+        ? await this.deps.approvals.consumeForPlan(input)
+        : await this.deps.plans.consume(input);
+    } catch (err) {
+      await this.auditConfirmRefusal(ctx, err);
+      throw err;
+    }
+    const plan = consumed.plan;
+
+    // A replay never runs anything: it answers with what the original call produced.
+    if (consumed.replayed) return this.replay(plan);
+
+    const started = Date.now();
+    const lctx: AuditLifecycleContext = {
+      userId: auth.user.id,
+      userEmail: auth.user.email,
+      ip: ctx.meta?.ip ?? null,
+      requestId: ctx.meta?.requestId ?? null,
+      connectionId: plan.connectionId,
+      environment: plan.environment,
+      planId: plan.id,
+      planHash: plan.planHash,
+      capability: null,
+      approvalId: consumed.approvalId ?? null,
+    };
+    const scratch = plan.connectionId === SCRATCH_CONNECTION_ID;
+
+    // ---------------------------------------------------------------- RE-AUTHORIZE
+    let write: WriteClassified;
+    let resolved: { sankhya: SankhyaResolution } | { scratch: ScratchResolution };
+    let decision: PolicyDecision;
+    let targets: PreviewTarget[];
+    let entity: string;
+    try {
+      write = parseWrite(classifyStatement(plan.sql));
+      lctx.capability = scratch ? 'TEMP.WRITE' : PERMISSION[write.kind];
+      validateWrite(write);
+      const fresh: AuthState = { ...auth, grants: await this.deps.authz.grants(auth.user.id) };
+      await this.assertPolicyVersion(plan);
+
+      if (scratch) {
+        if (!SCRATCH_TABLE.test(write.table))
+          throw refuse('RE-AUTHORIZE', invalidPlan('The plan no longer matches its statement.'));
+        const s = await this.resolveScratch(fresh, write, plan.sql);
+        resolved = { scratch: s };
+        decision = s.decision;
+        targets = s.targets;
+        entity = s.entity;
+      } else {
+        const r = await this.resolveSankhya(fresh, plan.connectionId, write, 'execute');
+        if (r.environment !== plan.environment) {
+          throw refuse('RE-AUTHORIZE', invalidPlan('The connection changed after the preview.'));
+        }
+        resolved = { sankhya: r };
+        decision = r.decision;
+        targets = r.targets;
+        entity = r.table.name.toUpperCase();
+      }
+      const capability =
+        'sankhya' in resolved ? resolved.sankhya.capability : resolved.scratch.capability;
+      if (canonical(capability) !== canonical(plan.capability)) {
+        throw refuse('RE-AUTHORIZE', invalidPlan('The capability changed after the preview.'));
+      }
+      if (!gatesHold(decision.limits, plan)) {
+        throw refuse(
+          'RE-AUTHORIZE',
+          invalidPlan('The policy now requires more than the preview did; preview it again.'),
+        );
+      }
+      if (targetsHashOf(targets) !== plan.targetsHash) {
+        throw refuse(
+          'IMPACT',
+          new AppError(
+            'TARGETS_CHANGED',
+            'The rows changed after the preview; preview the change again.',
+          ),
+        );
+      }
+      if ('sankhya' in resolved && !resolved.sankhya.table.entityName) {
+        throw refuse(
+          'EXECUTE',
+          new AppError(
+            'OPERATION_NOT_SUPPORTED',
+            `${entity} has no entity name in the data dictionary: it cannot be saved.`,
+          ),
+        );
+      }
+      await this.assertSwitches(plan, scratch);
+      // The rules may have changed while the targets were read: check the version once more,
+      // right before the first write.
+      await this.assertPolicyVersion(plan);
+    } catch (err) {
+      await this.auditExecuteRefusal(lctx, plan, err);
+      if (err instanceof Refusal) throw new AppError(err.code, err.message, err.details);
+      throw err;
+    }
+
+    // ---------------------------------------------------------------- EXECUTE + VERIFY
+    let steps: ExecutionStep[];
+    try {
+      steps =
+        'sankhya' in resolved
+          ? await this.runSankhya(plan, write, resolved.sankhya)
+          : await this.runScratch(resolved.scratch);
+    } catch (err) {
+      // Nothing was sent (the runtime could not be built, for example): a failed execution.
+      await this.deps.audit.recordPlanExecuted(lctx, {
+        outcome: 'failed',
+        affectedRows: 0,
+        durationMs: Date.now() - started,
+        errorCode: isAppError(err) ? err.code : 'INTERNAL_ERROR',
+        errorMessage: err instanceof Error ? err.message : String(err),
+        statement: plan.sql,
+        policyDecision: policySummary(decision),
+        details: { operation: write.kind, resource: entity },
+      });
+      throw err;
+    }
+
+    // ---------------------------------------------------------------- AUDIT
+    const report: ExecutionReport = {
+      status: statusOf(steps),
+      verification: labelOf(steps),
+      steps,
+    };
+    const firstError = steps.find((s) => s.errorCode !== undefined);
+    const attempted = targets.filter((_, i) => {
+      const o = steps[i]?.outcome;
+      return o === 'ok' || o === 'unknown';
+    });
+    await this.deps.audit.recordPlanExecuted(lctx, {
+      outcome: report.status,
+      affectedRows: steps.filter((s) => s.outcome === 'ok').length,
+      durationMs: Date.now() - started,
+      errorCode: firstError?.errorCode ?? null,
+      errorMessage: firstError ? `Step ${steps.indexOf(firstError) + 1} failed.` : null,
+      statement: plan.sql,
+      policyDecision: policySummary(decision),
+      details: { operation: write.kind, resource: entity, report },
+      before: attempted.flatMap((t) => (t.before ? [t.before] : [])),
+      after: attempted.map((t) => t.after),
+      auditSnapshots:
+        (decision.limits as unknown as Record<string, unknown>).auditSnapshots !== false,
+    });
+    await this.deps.audit.recordVerification(lctx, {
+      passed: report.verification === 'VERIFIED',
+      verification: {
+        label: report.verification,
+        verified: steps.filter((s) => s.verified === true).length,
+        mismatched: steps.filter((s) => s.verified === false).length,
+        unverified: steps.filter((s) => s.verified === undefined).length,
+      },
+    });
+    return report;
+  }
+
+  /** One save per target, in order, never retried; then the read-back. */
+  private async runSankhya(
+    plan: PlanRow,
+    write: WriteClassified,
+    r: SankhyaResolution,
+  ): Promise<ExecutionStep[]> {
+    const runtime = await this.deps.connections.getRuntime(plan.connectionId);
+    const entityName = r.table.entityName!;
+    const update = write.kind === 'UPDATE';
+    const steps: ExecutionStep[] = r.targets.map((t) => ({
+      key: t.key,
+      outcome: 'not_attempted',
+    }));
+    const expected = r.targets.map((t) => {
+      const fields = update ? r.setColumns : Object.keys(t.after);
+      return Object.fromEntries(fields.map((f) => [f, t.after[f] ?? null]));
+    });
+    for (let i = 0; i < r.targets.length; i++) {
+      const t = r.targets[i]!;
+      const values = Object.fromEntries(Object.entries(expected[i]!).map(([f, v]) => [f, wire(v)]));
+      const record = update
+        ? {
+            pk: Object.fromEntries(Object.entries(t.key).map(([k, v]) => [k, wire(v)])),
+            values,
+          }
+        : { values };
+      try {
+        await runtime.client.save({ entityName, fields: Object.keys(values), records: [record] });
+        steps[i] = { key: t.key, outcome: 'ok' };
+      } catch (err) {
+        // Anything but a definite gateway answer may have been applied: unknown, never retried.
+        const code = isAppError(err) ? err.code : 'WRITE_OUTCOME_UNKNOWN';
+        steps[i] = {
+          key: t.key,
+          outcome: code === 'WRITE_OUTCOME_UNKNOWN' ? 'unknown' : 'error',
+          errorCode: code,
+        };
+        break;
+      }
+    }
+
+    // VERIFY: the steps that ran (or may have run) are read back by key.
+    const pk = r.table.columns.filter((c) => c.pk).map((c) => c.name.toUpperCase());
+    const check = steps
+      .map((s, i) => ({ s, i }))
+      .filter(({ s }) => s.outcome === 'ok' || s.outcome === 'unknown');
+    const results = await verifyByKey(runtime.client, {
+      entityName,
+      pk,
+      targets: check.map(({ i }) => ({ key: r.targets[i]!.key, expected: expected[i]! })),
+    });
+    check.forEach(({ i }, n) => {
+      const verified = results[n];
+      if (verified !== undefined) steps[i] = { ...steps[i]!, verified };
+    });
+    return steps;
+  }
+
+  /**
+   * Runs the statement for real in the caller's workspace (one transaction, so it either applies
+   * entirely or not at all), then reads the table back and compares it with the dry-run result
+   * taken at execute time.
+   */
+  private async runScratch(s: ScratchResolution): Promise<ExecutionStep[]> {
+    const steps: ExecutionStep[] = s.targets.map((t) => ({ key: t.key, outcome: 'ok' }));
+    try {
+      await s.workspace.execStatement(s.stmt, undefined, { maxWriteRows: s.dry.rowCount });
+    } catch (err) {
+      const errorCode = isAppError(err) ? err.code : 'INTERNAL_ERROR';
+      return s.targets.map((t) => ({ key: t.key, outcome: 'error', errorCode }));
+    }
+    let verified: boolean | undefined;
+    try {
+      const read = await s.workspace.execStatement(
+        analyzeScratchSql(`SELECT * FROM ${s.dry.table}`),
+        undefined,
+        { maxResultRows: s.dry.after.rows.length + 1 },
+      );
+      verified = read.truncated ? undefined : sameRows(read, s.dry.after);
+    } catch {
+      verified = undefined;
+    }
+    return verified === undefined ? steps : steps.map((st) => ({ ...st, verified }));
+  }
+
+  /** The stored report of the original execution; never executes. */
+  private async replay(plan: PlanRow): Promise<ExecutionReport> {
+    const { audit } = this.deps;
+    const [executed] = (
+      await audit.list({ action: 'PLAN_EXECUTED', planId: plan.id, limit: 1, offset: 0 })
+    ).items;
+    const report = (executed?.details as Record<string, unknown> | null | undefined)?.report;
+    if (isReport(report)) return report;
+    const [denied] = (
+      await audit.list({ action: 'PLAN_DENIED', planId: plan.id, limit: 1, offset: 0 })
+    ).items;
+    const code = executed?.errorCode ?? denied?.errorCode;
+    if (code) {
+      throw new AppError(
+        code as ErrorCode,
+        executed?.errorMessage ?? denied?.errorMessage ?? 'The execution was refused.',
+      );
+    }
+    throw new AppError(
+      'CONFLICT',
+      'This plan is being executed, or its result is not available; check the audit log.',
+    );
+  }
+
+  /** CONFIRMATION_INVALID unless the current rule set is the one the plan was built with. */
+  private async assertPolicyVersion(plan: PlanRow): Promise<void> {
+    let version: string;
+    try {
+      version = (await this.deps.policies.load()).version;
+    } catch {
+      throw refuse(
+        'RE-AUTHORIZE',
+        new AppError('FORBIDDEN', 'The policy rules could not be loaded; nothing was executed.'),
+      );
+    }
+    if (version !== plan.policyVersion) {
+      throw refuse(
+        'RE-AUTHORIZE',
+        invalidPlan('The policy rules changed after the preview; preview the change again.'),
+        { planPolicyVersion: plan.policyVersion, policyVersion: version },
+      );
+    }
+  }
+
+  /** GLOBAL_WRITE_ENABLED, then WRITE_TO_SANKHYA (Sankhya), then SAFE_MODE (PRODUCTION). */
+  private async assertSwitches(plan: PlanRow, scratch: boolean): Promise<void> {
+    const off = (name: string) =>
+      refuse(
+        'EXECUTE',
+        new AppError('READ_ONLY_MODE', `Writes are disabled (${name}).`, { switch: name }),
+      );
+    if (!(await this.deps.security.globalWriteState()).effective) throw off('GLOBAL_WRITE_ENABLED');
+    if (scratch) return;
+    if (!this.deps.switches.writeToSankhya) throw off('WRITE_TO_SANKHYA');
+    if (plan.environment === 'PRODUCTION' && this.deps.switches.safeMode) throw off('SAFE_MODE');
+  }
+
+  /** The consume refused the request: `write.denied` with stage CONFIRM. */
+  private async auditConfirmRefusal(ctx: ExecuteContext, err: unknown): Promise<void> {
+    const code = isAppError(err) ? err.code : 'INTERNAL_ERROR';
+    await this.deps.audit.record({
+      userId: ctx.auth.user.id,
+      userEmail: ctx.auth.user.email,
+      ip: ctx.meta?.ip ?? null,
+      requestId: ctx.meta?.requestId ?? null,
+      action: isAppError(err) ? 'write.denied' : 'write.execute_failed',
+      status: isAppError(err) ? 'denied' : 'failed',
+      planId: typeof ctx.planId === 'string' && UUID_RE.test(ctx.planId) ? ctx.planId : null,
+      errorCode: code,
+      errorMessage: err instanceof Error ? err.message : String(err),
+      details: { stage: 'CONFIRM' },
+    });
+  }
+
+  /** A refusal after the consume: PLAN_DENIED (the plan is used up). */
+  private async auditExecuteRefusal(
+    lctx: AuditLifecycleContext,
+    plan: PlanRow,
+    err: unknown,
+  ): Promise<void> {
+    if (!isAppError(err)) {
+      await this.deps.audit.recordPlanExecuted(lctx, {
+        outcome: 'failed',
+        affectedRows: 0,
+        errorCode: 'INTERNAL_ERROR',
+        errorMessage: err instanceof Error ? err.message : String(err),
+        statement: plan.sql,
+      });
+      return;
+    }
+    await this.deps.audit.recordPlanDenied(lctx, {
+      errorCode: err.code,
+      errorMessage: err.message,
+      statement: plan.sql,
+      details: {
+        stage: err instanceof Refusal ? err.stage : 'RE-AUTHORIZE',
+        ...(err.details ?? {}),
+        ...(err instanceof Refusal ? err.internal : {}),
+      },
     });
   }
 
@@ -593,6 +1058,113 @@ export class MutationService {
       },
     });
   }
+}
+
+/** PARSE: AST classification only; anything the parser cannot positively identify is refused. */
+function parseWrite(classified: Classified): WriteClassified {
+  if (classified.kind === 'UNKNOWN') {
+    throw refuse(
+      'PARSE',
+      new AppError('SQL_PARSE_ERROR', 'The statement could not be recognised.'),
+      { reason: classified.reason },
+    );
+  }
+  if (
+    classified.kind !== 'INSERT' &&
+    classified.kind !== 'UPDATE' &&
+    classified.kind !== 'DELETE'
+  ) {
+    throw refuse(
+      'PARSE',
+      new AppError('SQL_UNSUPPORTED', 'Only INSERT, UPDATE and DELETE can be previewed.'),
+    );
+  }
+  return classified;
+}
+
+const whereRequired = (kind: string) =>
+  new AppError('WHERE_REQUIRED', `${kind} without WHERE affects every row and is blocked.`);
+
+/**
+ * VALIDATE: DELETE and scratch writes always need a WHERE; a Sankhya UPDATE without one goes on
+ * to the policy override check. A WHERE that does not restrict rows is always refused.
+ */
+function validateWrite(write: WriteClassified): void {
+  if (
+    write.kind !== 'INSERT' &&
+    !write.hasWhere &&
+    (write.kind === 'DELETE' || SCRATCH_TABLE.test(write.table))
+  ) {
+    throw refuse('VALIDATE', whereRequired(write.kind));
+  }
+  if (write.kind !== 'INSERT' && write.stmt && 'where' in write.stmt && write.stmt.where) {
+    if (isTrivialWhere(write.stmt.where)) {
+      throw refuse(
+        'VALIDATE',
+        new AppError(
+          'WHERE_REQUIRED',
+          `${write.kind} with a condition that does not restrict rows is blocked.`,
+        ),
+      );
+    }
+  }
+}
+
+/** The engine applied a WHERE override: ALLOW with the forced phrase and four-eyes approval. */
+function overrideApplies(d: PolicyDecision): boolean {
+  return (
+    d.effect === 'ALLOW' &&
+    d.limits.requireWhere === false &&
+    d.limits.requireStrongConfirmation === true &&
+    d.limits.requireApproval === true
+  );
+}
+
+/** Values as the gateway expects them: text, null stays null. */
+function wire(v: Value | undefined): string | null {
+  if (v === null || v === undefined) return null;
+  if (typeof v === 'boolean') return v ? 'S' : 'N';
+  return String(v);
+}
+
+/** Key-order independent JSON, for comparing values that went through jsonb. */
+function canonical(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(canonical).join(',')}]`;
+  if (v !== null && typeof v === 'object') {
+    const o = v as Record<string, unknown>;
+    return `{${Object.keys(o)
+      .filter((k) => o[k] !== undefined)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${canonical(o[k])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(v) ?? 'null';
+}
+
+/** Whether two table reads hold the same rows (as a multiset, column order ignored). */
+function sameRows(
+  a: { columns: string[]; rows: unknown[][] },
+  b: { columns: string[]; rows: unknown[][] },
+): boolean {
+  const sigs = (t: { columns: string[]; rows: unknown[][] }) =>
+    t.rows
+      .map((row) => {
+        const r: Record<string, unknown> = {};
+        t.columns.forEach((c, i) => (r[c] = SCALAR(row[i])));
+        return canonical(r);
+      })
+      .sort();
+  const x = sigs(a);
+  const y = sigs(b);
+  return x.length === y.length && x.every((s, i) => s === y[i]);
+}
+
+function isReport(v: unknown): v is ExecutionReport {
+  if (typeof v !== 'object' || v === null) return false;
+  const r = v as Record<string, unknown>;
+  return (
+    typeof r.status === 'string' && typeof r.verification === 'string' && Array.isArray(r.steps)
+  );
 }
 
 function policySummary(d: PolicyDecision): Record<string, unknown> {

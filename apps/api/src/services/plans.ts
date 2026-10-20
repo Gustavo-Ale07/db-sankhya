@@ -104,6 +104,14 @@ function plain(value: unknown, field: string): unknown {
 
 const hashOf = (value: unknown) => sha256Hex(canonicalJSON(value));
 
+/**
+ * The `targets_hash` the plan would store for `targets`. The executor re-resolves the targets and
+ * compares this with the frozen hash: any difference means the rows changed (TARGETS_CHANGED).
+ */
+export function targetsHashOf(targets: unknown): string {
+  return hashOf(plain(targets, 'targets'));
+}
+
 /** The `params_hash` of a plan, so the executor can re-verify the bound parameters. */
 export function paramsHashOf(params: unknown): string {
   return hashOf(plain(params, 'params'));
@@ -367,6 +375,23 @@ export class PlansService {
     }
     if (consumed) return { plan: consumed, replayed: false };
     return { plan: await this.refusal(row.id, key), replayed: true };
+  }
+
+  /**
+   * Whether the plan `id` of `userId` needs an approval, so the executor knows which consume path
+   * applies. Undefined for a malformed id, an unknown plan or a plan of someone else: the caller
+   * then goes through `consume`, which answers CONFIRMATION_INVALID without leaking anything.
+   */
+  async peek(id: string, userId: string): Promise<{ requiresApproval: boolean } | undefined> {
+    if (typeof id !== 'string' || !UUID.test(id)) return undefined;
+    if (typeof userId !== 'string' || !UUID.test(userId)) return undefined;
+    const [row] = await this.db
+      .select({ userId: plans.userId, requiresApproval: plans.requiresApproval })
+      .from(plans)
+      .where(eq(plans.id, id))
+      .limit(1);
+    if (!row || row.userId !== userId) return undefined;
+    return { requiresApproval: row.requiresApproval };
   }
 
   /**

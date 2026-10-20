@@ -46,6 +46,10 @@ export async function approvalRoutes(app: FastifyInstance): Promise<void> {
     authz,
     redact,
     logger: app.log,
+    ceilings: {
+      sankhyaMaxReadRows: config.sankhya.maxRows,
+      scratchMaxReadRows: config.scratch.maxRows,
+    },
   });
 
   const context = (request: FastifyRequest, email: string): ApprovalAuditContext => ({

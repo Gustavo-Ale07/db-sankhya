@@ -18,6 +18,7 @@ import type {
 import { classifyStatement } from '@dbx/sql-engine';
 import type { AuthzService } from './authz';
 import type { ConsumePlanInput, ConsumedPlan, PlansService } from './plans';
+import { SCRATCH_CONNECTION_ID } from './read-policy';
 import { SCRATCH_TABLE_NAME } from './scratch-guard';
 import type { PolicyService, PolicySnapshot } from './policy';
 import { AuditService } from './records';
@@ -60,6 +61,12 @@ export interface ApprovalsDeps {
   redact: (value: unknown) => unknown;
   /** Receives failures of the denied-audit writes (redacted); the refusal is still thrown. */
   logger?: { error(obj: object, msg: string): void };
+  /**
+   * The row ceilings the mutation orchestrator passes to the policy engine (SANKHYA_MAX_ROWS for
+   * Sankhya plans, SCRATCH_MAX_ROWS for scratch plans). The approval checks must evaluate with
+   * the same ceilings, or a frozen limit computed under them would look laxer than a fresh one.
+   */
+  ceilings?: { sankhyaMaxReadRows?: number; scratchMaxReadRows?: number };
 }
 
 type Tx = Parameters<Parameters<Database['transaction']>[0]>[0];
@@ -86,6 +93,8 @@ interface Subject {
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_REASON = 1000;
 const PENDING_LIMIT = 200;
+/** Rows `listPending` reads at most; the filter then keeps up to PENDING_LIMIT of them. */
+const PENDING_SCAN_LIMIT = 1000;
 const BOOLEAN_GATES = [
   'requireWhere',
   'requirePreview',
@@ -157,11 +166,13 @@ function allowedBy(
   snapshot: PolicySnapshot | undefined,
   req: PolicyRequest,
   permissions: ReadonlySet<Permission>,
+  defaults?: { maxReadRows?: number },
 ): PolicyDecision | undefined {
   if (!snapshot || snapshot.invalid.length > 0) return undefined;
   try {
     const decision = evaluatePolicy(req, snapshot.rules, new Set(permissions), {
       policyVersion: snapshot.version,
+      ...(defaults ? { defaults } : {}),
     });
     return decision.effect === 'ALLOW' ? decision : undefined;
   } catch {
@@ -173,7 +184,7 @@ function allowedBy(
  * True when the frozen gates are at least as strict as the current ones: every gate the current
  * policy turns on is on in the plan, and no frozen row ceiling exceeds the current one.
  */
-function gatesHold(fresh: EffectiveLimits, plan: PlanRow): boolean {
+export function gatesHold(fresh: EffectiveLimits, plan: PlanRow): boolean {
   const frozen = (plan.decision as { limits?: Record<string, unknown> } | null)?.limits;
   if (typeof frozen !== 'object' || frozen === null) return false;
   for (const gate of BOOLEAN_GATES) {
@@ -202,8 +213,8 @@ function gatesHold(fresh: EffectiveLimits, plan: PlanRow): boolean {
  *   hash equal, not expired), so of two racing deciders exactly one wins; the other gets
  *   CONFLICT. APPROVE moves the plan to APPROVED (which `PlansService` also ties to this row);
  *   REJECT moves it to INVALIDATED, so it can never be consumed. Every outcome is audited.
- * - `consumeApproved` is the execution boundary for plans that require approval. Until the
- *   execution orchestrator (Task 11.2) exists, "execute" means a successful `PlansService.consume`.
+ * - `consumeApproved` is the execution boundary for plans that require approval: the mutation
+ *   executor reaches it through `consumeForPlan` and never calls `PlansService.consume` for them.
  *   A rejected or still pending approval gives FORBIDDEN; so does a requester who is no longer
  *   active, lost a capability permission, or whose current policy denies the plan or demands
  *   stricter gates than the frozen ones (audited). An approval of another plan, or whose hash no
@@ -378,7 +389,8 @@ export class ApprovalsService {
           gt(plans.expiresAt, sql`now()`),
         ),
       )
-      .orderBy(asc(approvals.createdAt), asc(approvals.id));
+      .orderBy(asc(approvals.createdAt), asc(approvals.id))
+      .limit(PENDING_SCAN_LIMIT);
     // Filter first, then limit: approvals the user cannot decide never take a slot.
     const out: PendingApproval[] = [];
     for (const { approval, plan, requesterName } of rows) {
@@ -456,6 +468,31 @@ export class ApprovalsService {
   }
 
   /**
+   * The approval path of the mutation executor: finds the approval of `input.id` and runs
+   * `consumeApproved` with it. A plan nobody has asked approval for yet is refused (FORBIDDEN,
+   * audited) without touching the plan, exactly like a pending approval.
+   */
+  async consumeForPlan(input: ConsumePlanInput): Promise<ConsumedPlan & { approvalId: string }> {
+    if (typeof input.id !== 'string' || !UUID.test(input.id)) throw invalid();
+    const [row] = await this.db
+      .select({ id: approvals.id })
+      .from(approvals)
+      .where(eq(approvals.planId, input.id))
+      .limit(1);
+    if (!row) {
+      const err = forbidden('The plan has not been approved yet.', 'approval_pending');
+      await this.auditDenied(err, {
+        ...this.auditBase(UUID.test(String(input.userId)) ? input.userId : null, {}),
+        action: 'approval.execute',
+        details: { planId: input.id, reason: 'approval_pending' },
+      });
+      throw err;
+    }
+    const result = await this.consumeApproved({ ...input, approvalId: row.id });
+    return { ...result, approvalId: row.id };
+  }
+
+  /**
    * Throws FORBIDDEN unless the subject may decide this approval; returns the plan scope. The
    * decider needs APPROVAL.DECIDE and every capability action in their own grants (so a role
    * without DATA.* never approves ERP writes, whatever an `everyone` rule says), plus a policy
@@ -483,6 +520,7 @@ export class ApprovalsService {
             snapshot,
             this.policyRequest(subject, plan, scope, action, [entity]),
             subject.permissions,
+            this.defaultsFor(plan),
           )
         )
           throw forbidden('No policy allows you to approve this plan.', 'policy_denied');
@@ -505,6 +543,7 @@ export class ApprovalsService {
           snapshot,
           this.policyRequest(subject, plan, scope, 'QUERY.SELECT', [entity]),
           subject.permissions,
+          this.defaultsFor(plan),
         ) !== undefined,
     );
   }
@@ -527,6 +566,7 @@ export class ApprovalsService {
         snapshot,
         this.policyRequest(subject, plan, scope, action, scope.entities),
         subject.permissions,
+        this.defaultsFor(plan),
       );
       if (!decision)
         throw forbidden(
@@ -557,6 +597,16 @@ export class ApprovalsService {
       entities,
       hasWhere: scope.hasWhere,
     };
+  }
+
+  /** The row ceiling the orchestrator evaluated this plan with (see `ApprovalsDeps.ceilings`). */
+  private defaultsFor(plan: PlanRow): { maxReadRows: number } | undefined {
+    const ceilings = this.deps.ceilings;
+    const maxReadRows =
+      plan.connectionId === SCRATCH_CONNECTION_ID
+        ? ceilings?.scratchMaxReadRows
+        : ceilings?.sankhyaMaxReadRows;
+    return maxReadRows === undefined ? undefined : { maxReadRows };
   }
 
   /** The rule set re-read from the database; undefined (deny everything) when it cannot be. */

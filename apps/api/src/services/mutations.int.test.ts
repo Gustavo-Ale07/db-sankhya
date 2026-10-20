@@ -1,5 +1,7 @@
+import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance, InjectOptions } from 'fastify';
+import { and, eq } from 'drizzle-orm';
 import { createDatabase, rolePermissions, roles } from '@dbx/database';
 import type { DatabaseHandle } from '@dbx/database';
 import { MOCK_CREDENTIALS, createMockSankhya } from '@dbx/sankhya-client/mock';
@@ -8,8 +10,10 @@ import type { Permission } from '@dbx/shared';
 import { buildApp } from '../app';
 import { loadConfig } from '../config';
 import type { AuthState } from '../context';
+import { ApprovalsService } from './approvals';
 import { ENV_CONNECTION_ID } from './connections';
 import { MutationService, renderExpr } from './mutations';
+import type { PreparedMutation } from './mutations';
 import { PlansService } from './plans';
 import type { PolicyInput } from './policy';
 
@@ -39,8 +43,9 @@ interface Harness {
   database: DatabaseHandle;
   mock: MockSankhya;
   service: MutationService;
-  /** A user holding exactly `permissions`, its AuthState and session cookie. */
-  userWith(permissions: Permission[]): Promise<{ auth: AuthState; cookie: string }>;
+  approvals: ApprovalsService;
+  /** A user holding exactly `permissions`, its AuthState, session cookie and role id. */
+  userWith(permissions: Permission[]): Promise<{ auth: AuthState; cookie: string; roleId: string }>;
   call(
     cookie: string | null,
     opts: InjectOptions,
@@ -69,6 +74,18 @@ async function setup(env: Record<string, string> = {}): Promise<Harness> {
     roles: config.bootstrapAdmin.roles,
   });
   const s = app.services;
+  const plans = new PlansService(database.db, { secret: config.session.secret, ttlSeconds: 300 });
+  const ceilings = {
+    sankhyaMaxReadRows: config.sankhya.maxRows,
+    scratchMaxReadRows: config.scratch.maxRows,
+  };
+  const approvals = new ApprovalsService(database.db, {
+    plans,
+    policies: s.policies,
+    authz: s.authz,
+    redact: s.redact,
+    ceilings,
+  });
   const service = new MutationService({
     policies: s.policies,
     authz: s.authz,
@@ -76,8 +93,12 @@ async function setup(env: Record<string, string> = {}): Promise<Harness> {
     metadata: s.metadata,
     audit: s.audit,
     scratch: s.scratch,
-    plans: new PlansService(database.db, { secret: config.session.secret, ttlSeconds: 300 }),
-    maxReadRows: config.sankhya.maxRows,
+    plans,
+    approvals,
+    security: s.security,
+    switches: { safeMode: config.safeMode, writeToSankhya: config.writeToSankhya },
+    maxReadRows: ceilings.sankhyaMaxReadRows,
+    scratchMaxReadRows: ceilings.scratchMaxReadRows,
   });
   const call: Harness['call'] = (cookie, opts) =>
     app.inject({
@@ -110,7 +131,11 @@ async function setup(env: Record<string, string> = {}): Promise<Harness> {
     const cookie = login.cookies.find((x) => x.name === config.session.cookieName)!.value;
     const resolved = (await s.sessions.resolve(cookie))!;
     expect(resolved.user.id).toBe(user.id);
-    return { auth: { ...resolved, grants: await s.authz.grants(user.id) }, cookie };
+    return {
+      auth: { ...resolved, grants: await s.authz.grants(user.id) },
+      cookie,
+      roleId: role!.id,
+    };
   };
   const policy = async (input: Partial<PolicyInput>) => {
     await s.policies.create({
@@ -135,7 +160,7 @@ async function setup(env: Record<string, string> = {}): Promise<Harness> {
     >;
   // Writes are default-deny: grant DATA.* everywhere, as an operator would for a test bench.
   await policy({ name: 'writes allowed', effect: 'ALLOW', actions: ['DATA.*'] });
-  const h: Harness = { app, database, mock, service, userWith, call, policy, audit };
+  const h: Harness = { app, database, mock, service, approvals, userWith, call, policy, audit };
   open.push(h);
   return h;
 }
@@ -643,5 +668,417 @@ describe('read audit', () => {
     });
     const stored = JSON.stringify(events[0]);
     for (const row of rows) expect(stored).not.toContain(String(row[1]));
+  });
+});
+
+// ------------------------------------------------------------------------------------ execute
+
+/** Every write switch on: SAFE_MODE off, GLOBAL_WRITE_ENABLED and WRITE_TO_SANKHYA on. */
+const WRITES = { SAFE_MODE: 'false', GLOBAL_WRITE_ENABLED: 'true', WRITE_TO_SANKHYA: 'true' };
+
+const saves = (mock: MockSankhya) => mock.calls.filter((c) => c.serviceName === 'DatasetSP.save');
+
+const execute = (
+  h: Harness,
+  auth: AuthState,
+  p: PreparedMutation,
+  extra: { strongConfirmation?: string; idempotencyKey?: string; token?: string } = {},
+) =>
+  h.service.execute({
+    auth,
+    planId: p.planId,
+    token: extra.token ?? p.token,
+    idempotencyKey: extra.idempotencyKey ?? randomUUID(),
+    ...(extra.strongConfirmation !== undefined
+      ? { strongConfirmation: extra.strongConfirmation }
+      : {}),
+  });
+
+describe('MutationService.execute', () => {
+  const SQL = "UPDATE TGFPAR SET NOMEPARC = 'Novo nome' WHERE CODPARC = 1";
+
+  it('the first submit never writes; execute writes, verifies (VERIFIED) and audits', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    const before = await partner(h.mock, 1);
+    const p = await prepare(h, auth, SQL);
+    expect(saves(h.mock)).toEqual([]);
+    expect(await partner(h.mock, 1)).toBe(before);
+
+    const report = await execute(h, auth, p);
+    expect(report).toMatchObject({
+      status: 'success',
+      verification: 'VERIFIED',
+      steps: [{ key: { CODPARC: 1 }, outcome: 'ok', verified: true }],
+    });
+    expect(saves(h.mock)).toHaveLength(1);
+    expect(await partner(h.mock, 1)).toBe('Novo nome');
+
+    const [executed] = await h.audit('PLAN_EXECUTED');
+    expect(executed).toMatchObject({
+      status: 'success',
+      planId: p.planId,
+      capability: 'DATA.UPDATE',
+      errorCode: null,
+    });
+    const [verification] = await h.audit('VERIFICATION');
+    expect(verification).toMatchObject({ status: 'success', planId: p.planId });
+  });
+
+  it('a row changed between prepare and execute: TARGETS_CHANGED, nothing saved', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    const p = await prepare(h, auth, SQL);
+    await h.mock.db.query("UPDATE tgfpar SET nomeparc = 'Mudou' WHERE codparc = 1");
+    await expect(execute(h, auth, p)).rejects.toMatchObject({ code: 'TARGETS_CHANGED' });
+    expect(saves(h.mock)).toEqual([]);
+    expect(await partner(h.mock, 1)).toBe('Mudou');
+    const [denied] = await h.audit('PLAN_DENIED');
+    expect(denied).toMatchObject({ errorCode: 'TARGETS_CHANGED', planId: p.planId });
+  });
+
+  it('DATA.UPDATE removed after the preview: FORBIDDEN, nothing saved, audited as denied', async () => {
+    const h = await setup(WRITES);
+    const { auth, roleId } = await h.userWith(WRITER);
+    const p = await prepare(h, auth, SQL);
+    await h.database.db
+      .delete(rolePermissions)
+      .where(
+        and(eq(rolePermissions.roleId, roleId), eq(rolePermissions.permission, 'DATA.UPDATE')),
+      );
+    await expect(execute(h, auth, p)).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(saves(h.mock)).toEqual([]);
+    const [denied] = await h.audit('PLAN_DENIED');
+    expect(denied).toMatchObject({ status: 'denied', errorCode: 'FORBIDDEN', planId: p.planId });
+  });
+
+  it('a policy change after the preview: CONFIRMATION_INVALID, nothing saved', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    const p = await prepare(h, auth, SQL);
+    await h.policy({ name: 'unrelated', actions: ['DATA.DELETE'], entities: ['TGFPRO'] });
+    await expect(execute(h, auth, p)).rejects.toMatchObject({ code: 'CONFIRMATION_INVALID' });
+    expect(saves(h.mock)).toEqual([]);
+    expect(await h.audit('PLAN_DENIED')).toHaveLength(1);
+  });
+
+  it('GLOBAL_WRITE_ENABLED=false: READ_ONLY_MODE, nothing saved', async () => {
+    const h = await setup({ SAFE_MODE: 'false', WRITE_TO_SANKHYA: 'true' });
+    const { auth } = await h.userWith(WRITER);
+    const p = await prepare(h, auth, SQL);
+    await expect(execute(h, auth, p)).rejects.toMatchObject({
+      code: 'READ_ONLY_MODE',
+      details: { switch: 'GLOBAL_WRITE_ENABLED' },
+    });
+    expect(saves(h.mock)).toEqual([]);
+    expect(await h.audit('PLAN_DENIED')).toHaveLength(1);
+  });
+
+  it('the runtime kill switch turned off: READ_ONLY_MODE, nothing saved', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    const p = await prepare(h, auth, SQL);
+    await h.app.services.security.setGlobalWrite(false, null);
+    await expect(execute(h, auth, p)).rejects.toMatchObject({ code: 'READ_ONLY_MODE' });
+    expect(saves(h.mock)).toEqual([]);
+  });
+
+  it('WRITE_TO_SANKHYA=false: READ_ONLY_MODE, nothing saved', async () => {
+    const h = await setup({ SAFE_MODE: 'false', GLOBAL_WRITE_ENABLED: 'true' });
+    const { auth } = await h.userWith(WRITER);
+    const p = await prepare(h, auth, SQL);
+    await expect(execute(h, auth, p)).rejects.toMatchObject({
+      code: 'READ_ONLY_MODE',
+      details: { switch: 'WRITE_TO_SANKHYA' },
+    });
+    expect(saves(h.mock)).toEqual([]);
+  });
+
+  it('PRODUCTION with SAFE_MODE=true: READ_ONLY_MODE even with the phrase', async () => {
+    const h = await setup({
+      GLOBAL_WRITE_ENABLED: 'true',
+      WRITE_TO_SANKHYA: 'true',
+      SANKHYA_ENVIRONMENT: 'PRODUCTION',
+    });
+    const { auth } = await h.userWith(WRITER);
+    const p = await prepare(h, auth, SQL);
+    expect(p.requires.strongConfirmation).toBe('PRODUCTION UPDATE 1 TGFPAR');
+    await expect(
+      execute(h, auth, p, { strongConfirmation: p.requires.strongConfirmation! }),
+    ).rejects.toMatchObject({ code: 'READ_ONLY_MODE', details: { switch: 'SAFE_MODE' } });
+    expect(saves(h.mock)).toEqual([]);
+  });
+
+  it('PRODUCTION with SAFE_MODE=false needs the exact phrase, then writes', async () => {
+    const h = await setup({ ...WRITES, SANKHYA_ENVIRONMENT: 'PRODUCTION' });
+    const { auth } = await h.userWith(WRITER);
+    const wrong = await prepare(h, auth, SQL);
+    await expect(
+      execute(h, auth, wrong, { strongConfirmation: 'PRODUCTION UPDATE 2 TGFPAR' }),
+    ).rejects.toMatchObject({ code: 'CONFIRMATION_INVALID' });
+    expect(saves(h.mock)).toEqual([]);
+    expect(await h.audit('write.denied')).toHaveLength(1);
+    const p = await prepare(h, auth, SQL);
+    const report = await execute(h, auth, p, {
+      strongConfirmation: p.requires.strongConfirmation!,
+    });
+    expect(report.verification).toBe('VERIFIED');
+  });
+
+  it('UPDATE without WHERE stays WHERE_REQUIRED and DELETE on Sankhya OPERATION_NOT_SUPPORTED', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    await expect(prepare(h, auth, "UPDATE TGFPAR SET ATIVO = 'N'")).rejects.toMatchObject({
+      code: 'WHERE_REQUIRED',
+    });
+    await expect(prepare(h, auth, 'DELETE FROM TGFPAR WHERE CODPARC = 1')).rejects.toMatchObject({
+      code: 'OPERATION_NOT_SUPPORTED',
+    });
+    expect(saves(h.mock)).toEqual([]);
+  });
+
+  it('a definite failure on the 2nd save: partial, the 3rd step not attempted', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    const names = [await partner(h.mock, 1), await partner(h.mock, 2), await partner(h.mock, 3)];
+    const p = await prepare(
+      h,
+      auth,
+      "UPDATE TGFPAR SET NOMEPARC = 'Lote' WHERE CODPARC IN (1, 2, 3)",
+    );
+    h.mock.inject({ type: 'rateLimited' }, { service: 'DatasetSP.save', after: 1 });
+    const report = await execute(h, auth, p);
+    expect(report.status).toBe('partial');
+    expect(report.verification).toBe('PARTIALLY_VERIFIED');
+    expect(report.steps.map((s) => s.outcome)).toEqual(['ok', 'error', 'not_attempted']);
+    expect(report.steps[0]!.verified).toBe(true);
+    expect(report.steps[1]!.errorCode).toBe('SANKHYA_RATE_LIMITED');
+    expect(saves(h.mock)).toHaveLength(2);
+    expect(await partner(h.mock, 1)).toBe('Lote');
+    expect(await partner(h.mock, 2)).toBe(names[1]);
+    expect(await partner(h.mock, 3)).toBe(names[2]);
+    const [executed] = await h.audit('PLAN_EXECUTED');
+    expect(executed).toMatchObject({ status: 'partial', errorCode: 'SANKHYA_RATE_LIMITED' });
+  });
+
+  it('the verification read fails: UNVERIFIED, never VERIFIED', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    const p = await prepare(h, auth, SQL);
+    h.mock.inject({ type: 'malformed' }, { service: 'CRUDServiceProvider.loadRecords' });
+    const report = await execute(h, auth, p);
+    expect(report).toMatchObject({ status: 'success', verification: 'UNVERIFIED' });
+    expect(report.steps[0]!.verified).toBeUndefined();
+    expect(await partner(h.mock, 1)).toBe('Novo nome');
+    const [verification] = await h.audit('VERIFICATION');
+    expect(verification).toMatchObject({ status: 'failed' });
+  });
+
+  it('a value the gateway silently ignored: FAILED', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    const before = await partner(h.mock, 1);
+    const p = await prepare(h, auth, SQL);
+    h.mock.inject({ type: 'ignoreWrite' }, { service: 'DatasetSP.save' });
+    const report = await execute(h, auth, p);
+    expect(report.verification).toBe('FAILED');
+    expect(report.steps[0]).toMatchObject({ outcome: 'ok', verified: false });
+    expect(await partner(h.mock, 1)).toBe(before);
+  });
+
+  it('a save timeout: the step is unknown with WRITE_OUTCOME_UNKNOWN, never retried', async () => {
+    const h = await setup({ ...WRITES, SANKHYA_TIMEOUT_MS: '1000' });
+    const { auth } = await h.userWith(WRITER);
+    const p = await prepare(h, auth, SQL);
+    h.mock.inject({ type: 'delay', ms: 1500 }, { service: 'DatasetSP.save' });
+    const report = await execute(h, auth, p);
+    expect(report.steps[0]).toMatchObject({
+      outcome: 'unknown',
+      errorCode: 'WRITE_OUTCOME_UNKNOWN',
+    });
+    expect(report.status).not.toBe('success');
+    expect(report.verification).not.toBe('VERIFIED');
+    expect(saves(h.mock)).toHaveLength(1);
+    const [executed] = await h.audit('PLAN_EXECUTED');
+    expect(executed).toMatchObject({ errorCode: 'WRITE_OUTCOME_UNKNOWN' });
+  });
+
+  it('the same idempotency key twice runs once and returns the same report', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    const p = await prepare(h, auth, SQL);
+    const key = randomUUID();
+    const first = await execute(h, auth, p, { idempotencyKey: key });
+    const second = await execute(h, auth, p, { idempotencyKey: key });
+    expect(second).toEqual(first);
+    expect(saves(h.mock)).toHaveLength(1);
+    expect(await h.audit('PLAN_EXECUTED')).toHaveLength(1);
+    await expect(execute(h, auth, p, { idempotencyKey: randomUUID() })).rejects.toMatchObject({
+      code: 'CONFIRMATION_USED',
+    });
+    expect(saves(h.mock)).toHaveLength(1);
+  });
+
+  it('an invalid token is refused before anything runs, and audited', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    const p = await prepare(h, auth, SQL);
+    const forged = `${p.planId}.${'A'.repeat(43)}`;
+    await expect(execute(h, auth, p, { token: forged })).rejects.toMatchObject({
+      code: 'CONFIRMATION_INVALID',
+    });
+    expect(saves(h.mock)).toEqual([]);
+    const [denied] = await h.audit('write.denied');
+    expect(denied).toMatchObject({ errorCode: 'CONFIRMATION_INVALID' });
+    expect((denied!.details as Record<string, unknown>).stage).toBe('CONFIRM');
+  });
+
+  it('UPDATE without WHERE under an explicit override: phrase plus four-eyes approval, then executes', async () => {
+    // SANKHYA_MAX_ROWS above the policy default also checks that approvals use the same ceilings.
+    const h = await setup({ ...WRITES, SANKHYA_MAX_ROWS: '5000' });
+    const { auth } = await h.userWith(WRITER);
+    const approver = await h.userWith(['APPROVAL.DECIDE', 'DATA.UPDATE', 'QUERY.SELECT']);
+    const sql = "UPDATE TSICID SET UF = 'XX'";
+    await expect(prepare(h, auth, sql)).rejects.toMatchObject({ code: 'WHERE_REQUIRED' });
+    await h.policy({
+      name: 'cities bulk update',
+      effect: 'ALLOW',
+      actions: ['DATA.UPDATE'],
+      entities: ['TSICID'],
+      overrideWhereRequired: true,
+    });
+    const p = await prepare(h, auth, sql);
+    expect(p.preview.affected).toBe(12);
+    expect(p.requires).toEqual({
+      strongConfirmation: 'HOMOLOGATION UPDATE 12 TSICID',
+      approval: true,
+    });
+    expect(saves(h.mock)).toEqual([]);
+    const phrase = { strongConfirmation: p.requires.strongConfirmation! };
+
+    // Not approved yet: refused without consuming the plan.
+    await expect(execute(h, auth, p, phrase)).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(saves(h.mock)).toEqual([]);
+
+    const approval = await h.approvals.request(p.planId, auth.user.id);
+    await h.approvals.decide(approval.id, approver.auth.user.id, 'APPROVE', null);
+    const report = await execute(h, auth, p, phrase);
+    expect(report).toMatchObject({ status: 'success', verification: 'VERIFIED' });
+    expect(report.steps).toHaveLength(12);
+    expect(saves(h.mock)).toHaveLength(12);
+    const left = await h.mock.db.query<{ n: number }>(
+      "SELECT count(*)::int AS n FROM tsicid WHERE uf <> 'XX'",
+    );
+    expect(left.rows[0]!.n).toBe(0);
+    const [executed] = await h.audit('PLAN_EXECUTED');
+    expect(executed).toMatchObject({ approvalId: approval.id });
+  });
+
+  it('DELETE without WHERE stays refused even with an override rule', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    await h.policy({
+      name: 'override',
+      effect: 'ALLOW',
+      actions: ['DATA.DELETE'],
+      entities: ['TSICID'],
+      overrideWhereRequired: true,
+    });
+    await expect(prepare(h, auth, 'DELETE FROM TSICID')).rejects.toMatchObject({
+      code: 'WHERE_REQUIRED',
+    });
+    expect(h.mock.calls).toEqual([]);
+  });
+
+  it('scratch: executes for real in the caller workspace and verifies, without Sankhya', async () => {
+    const h = await setup({ GLOBAL_WRITE_ENABLED: 'true' });
+    const { auth } = await h.userWith(['TEMP.CREATE', 'TEMP.WRITE', 'QUERY.SELECT']);
+    const ws = await h.app.services.scratch.workspace(auth.user.id);
+    await ws.exec('CREATE TABLE tmp_a (id int, v text)');
+    await ws.exec("INSERT INTO tmp_a VALUES (1, 'x'), (2, 'y'), (3, 'z')");
+    const p = await prepare(h, auth, "UPDATE tmp_a SET v = 'new' WHERE id = 2");
+    const report = await execute(h, auth, p);
+    expect(report).toMatchObject({ status: 'success', verification: 'VERIFIED' });
+    expect((await ws.exec('SELECT id, v FROM tmp_a ORDER BY id')).rows).toEqual([
+      [1, 'x'],
+      [2, 'new'],
+      [3, 'z'],
+    ]);
+    expect(h.mock.calls).toEqual([]);
+    expect(await h.audit('PLAN_EXECUTED')).toHaveLength(1);
+  });
+
+  it('scratch: a table changed after the preview gives TARGETS_CHANGED', async () => {
+    const h = await setup({ GLOBAL_WRITE_ENABLED: 'true' });
+    const { auth } = await h.userWith(['TEMP.CREATE', 'TEMP.WRITE', 'QUERY.SELECT']);
+    const ws = await h.app.services.scratch.workspace(auth.user.id);
+    await ws.exec('CREATE TABLE tmp_a (id int, v text)');
+    await ws.exec("INSERT INTO tmp_a VALUES (1, 'x'), (2, 'y')");
+    const p = await prepare(h, auth, "UPDATE tmp_a SET v = 'new' WHERE id = 2");
+    await ws.exec("UPDATE tmp_a SET v = 'other' WHERE id = 2");
+    await expect(execute(h, auth, p)).rejects.toMatchObject({ code: 'TARGETS_CHANGED' });
+    expect((await ws.exec('SELECT v FROM tmp_a WHERE id = 2')).rows).toEqual([['other']]);
+  });
+});
+
+describe('POST /api/query/execute', () => {
+  const SQL = "UPDATE TGFPAR SET NOMEPARC = 'Via rota' WHERE CODPARC = 4";
+
+  it('previews (available), then executes with the token and idempotency key', async () => {
+    const h = await setup(WRITES);
+    const { cookie } = await h.userWith(WRITER);
+    const planned = await h.call(cookie, {
+      method: 'POST',
+      url: '/api/query/preview',
+      payload: { sql: SQL },
+    });
+    expect(planned.statusCode, planned.body).toBe(200);
+    expect(planned.json().execution).toMatchObject({ available: true });
+    expect(saves(h.mock)).toEqual([]);
+    const { planId, token } = planned.json() as { planId: string; token: string };
+    const res = await h.call(cookie, {
+      method: 'POST',
+      url: '/api/query/execute',
+      payload: { planId, token, idempotencyKey: randomUUID() },
+    });
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.headers['cache-control']).toContain('no-store');
+    expect(res.json()).toMatchObject({
+      type: 'execution',
+      planId,
+      status: 'success',
+      verification: 'VERIFIED',
+    });
+    expect(await partner(h.mock, 4)).toBe('Via rota');
+    for (const secret of [...Object.values(MOCK_CREDENTIALS), BASE_ENV.SESSION_SECRET]) {
+      expect(res.body).not.toContain(secret);
+    }
+  });
+
+  it('requires auth, same-origin and a valid body; switches off answer 403 READ_ONLY_MODE', async () => {
+    const h = await setup();
+    const { cookie } = await h.userWith(WRITER);
+    const planned = await h.call(cookie, {
+      method: 'POST',
+      url: '/api/query/preview',
+      payload: { sql: SQL },
+    });
+    const { planId, token } = planned.json() as { planId: string; token: string };
+    const payload = { planId, token, idempotencyKey: randomUUID() };
+    const url = '/api/query/execute';
+    expect((await h.call(null, { method: 'POST', url, payload })).statusCode).toBe(401);
+    const csrf = await h.call(cookie, {
+      method: 'POST',
+      url,
+      payload,
+      headers: { origin: 'https://evil.example.com' },
+    });
+    expect(csrf.statusCode).toBe(403);
+    const bad = await h.call(cookie, { method: 'POST', url, payload: { planId, token } });
+    expect(bad.statusCode).toBe(400);
+    const res = await h.call(cookie, { method: 'POST', url, payload });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error.code).toBe('READ_ONLY_MODE');
+    expect(saves(h.mock)).toEqual([]);
   });
 });
