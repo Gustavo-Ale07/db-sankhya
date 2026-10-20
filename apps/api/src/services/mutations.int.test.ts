@@ -456,14 +456,14 @@ describe('WHERE fidelity of the snapshot', () => {
     'CODPARC = 1 /* trailing */',
   ];
   // Constructs the renderer cannot reproduce faithfully: the preview must refuse, never alter them.
-  const REFUSED = [
-    'NOT (CODPARC > 2)',
-    'UPPER(NOMEPARC) = NOMEPARC',
-    'CODPARC IN (SELECT CODPARC FROM TGFPAR WHERE CODPARC = 1)',
-    'CASE WHEN CODPARC = 1 THEN 1 ELSE 0 END = 1',
-    'CAST(CODPARC AS VARCHAR(10)) = 1',
-    'EXISTS (SELECT 1 FROM TGFPAR)',
-    'CODPARC = (SELECT MAX(CODPARC) FROM TGFPAR)',
+  const REFUSED: Array<[string, string]> = [
+    ['NOT (CODPARC > 2)', 'SQL_UNSUPPORTED'],
+    ['UPPER(NOMEPARC) = NOMEPARC', 'OPERATION_NOT_SUPPORTED'],
+    ['CODPARC IN (SELECT CODPARC FROM TGFPAR WHERE CODPARC = 1)', 'OPERATION_NOT_SUPPORTED'],
+    ['CASE WHEN CODPARC = 1 THEN 1 ELSE 0 END = 1', 'OPERATION_NOT_SUPPORTED'],
+    ['CAST(CODPARC AS VARCHAR(10)) = 1', 'OPERATION_NOT_SUPPORTED'],
+    ['EXISTS (SELECT 1 FROM TGFPAR)', 'OPERATION_NOT_SUPPORTED'],
+    ['CODPARC = (SELECT MAX(CODPARC) FROM TGFPAR)', 'OPERATION_NOT_SUPPORTED'],
   ];
 
   it.each(FAITHFUL)('renders an equivalent predicate: %s', async (where) => {
@@ -480,14 +480,12 @@ describe('WHERE fidelity of the snapshot', () => {
     expect(writeCalls(h.mock)).toEqual([]);
   });
 
-  it.each(REFUSED)('refuses what it cannot render faithfully: %s', async (where) => {
+  it.each(REFUSED)('refuses what it cannot render faithfully: %s', async (where, code) => {
     const h = await setup();
     const { auth } = await h.userWith(WRITER);
     await expect(
       prepare(h, auth, `UPDATE TGFPAR SET ATIVO = 'N' WHERE ${where}`),
-    ).rejects.toMatchObject({
-      code: expect.stringMatching(/^(OPERATION_NOT_SUPPORTED|SQL_UNSUPPORTED|SQL_PARSE_ERROR)$/),
-    });
+    ).rejects.toMatchObject({ code });
     expect(writeCalls(h.mock)).toEqual([]);
     expect(await h.audit('write.denied')).toHaveLength(1);
     expect(await h.audit('PLAN_CREATED')).toHaveLength(0);
@@ -566,6 +564,28 @@ describe('scratch TRANSACTIONAL_DRY_RUN', () => {
     await expect(
       prepare(h, reader.auth, "UPDATE tmp_a SET v = 'n' WHERE id = 2"),
     ).rejects.toMatchObject({ code: 'FORBIDDEN' });
+  });
+
+  it('refuses when the table exceeds the preview cap: no plan, table unchanged', async () => {
+    const h = await setup();
+    const { auth } = await h.userWith(SCRATCH);
+    const ws = await h.app.services.scratch.workspace(auth.user.id);
+    await ws.exec('CREATE TABLE tmp_big (id int, v text)');
+    await ws.exec("INSERT INTO tmp_big SELECT g, 'v' || g FROM generate_series(1, 300) g");
+    // A truncated snapshot would pair the old row 5 with an unrelated row sliding into the window.
+    await expect(
+      prepare(h, auth, "UPDATE tmp_big SET v = 'changed' WHERE id = 5"),
+    ).rejects.toMatchObject({
+      code: 'OPERATION_NOT_SUPPORTED',
+      details: { reason: 'SNAPSHOT_TRUNCATED' },
+    });
+    expect(await h.audit('write.denied')).toHaveLength(1);
+    expect(await h.audit('PLAN_CREATED')).toHaveLength(0);
+    expect((await ws.exec("SELECT count(*)::int FROM tmp_big WHERE v = 'changed'")).rows).toEqual([
+      [0],
+    ]);
+    expect((await ws.exec('SELECT v FROM tmp_big WHERE id = 5')).rows).toEqual([['v5']]);
+    expect((await ws.exec('SELECT count(*)::int FROM tmp_big')).rows).toEqual([[300]]);
   });
 
   it('enforces a maxWriteRows rule on the dry run', async () => {

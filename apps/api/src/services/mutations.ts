@@ -428,6 +428,18 @@ export class MutationService {
         }),
       );
     }
+    // A snapshot cut at the preview cap is a window, not the table: rows shift in and out of it
+    // across the write, so before/after pairing would match unrelated rows. Refuse instead.
+    if (dry.before.truncated || dry.after.truncated) {
+      throw refuse(
+        'PREVIEW',
+        new AppError(
+          'OPERATION_NOT_SUPPORTED',
+          'The table is too large to preview: its rows exceed the scratch preview limit.',
+          { reason: 'SNAPSHOT_TRUNCATED' },
+        ),
+      );
+    }
     const targets = diffSnapshots(write.kind, dry.before, dry.after);
     if (targets.length !== dry.rowCount) {
       throw refuse(
