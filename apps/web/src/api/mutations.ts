@@ -18,6 +18,8 @@ export interface PreviewTarget {
 /** Whether execute would pass the write switches when the preview was made. */
 export interface ExecutionSwitches {
   available: boolean;
+  /** The caller holds the permission to execute this plan (a DATA.PREVIEW-only caller does not). */
+  permitted?: boolean;
   safeMode: boolean;
   globalWriteEnabled: boolean;
   writeToSankhya: boolean;
@@ -32,6 +34,8 @@ export interface PreparedPlan {
   planId: string;
   token: string;
   expiresAt: string;
+  /** Statement kind, computed by the server (SQL plans only; absent on business actions). */
+  operation?: 'INSERT' | 'UPDATE' | 'DELETE';
   capability: { class: string; route: string; reason: string };
   previewKind: PreviewKind;
   previewLabels: PreviewKind[];

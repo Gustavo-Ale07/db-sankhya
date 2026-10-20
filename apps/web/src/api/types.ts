@@ -8,6 +8,7 @@ export type Permission =
   | 'TEMP.WRITE'
   | 'TEMP.DROP'
   | 'TEMP.MATERIALIZE'
+  | 'DATA.PREVIEW'
   | 'DATA.INSERT'
   | 'DATA.UPDATE'
   | 'DATA.DELETE'
