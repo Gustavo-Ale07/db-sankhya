@@ -2,6 +2,7 @@ import { expect, test } from '@playwright/test';
 import type { BrowserContext, Page } from '@playwright/test';
 import {
   adminContext,
+  APPROVER_ROLE,
   call,
   Fixtures,
   nav,
@@ -16,6 +17,8 @@ import {
 
 // Four eyes: an operator plans an UPDATE that a policy marks as needing approval; it cannot run
 // until another person (the administrator) approves it. SANDBOX mock connection, fictitious data.
+// The operator holds APPROVAL.DECIDE too (test-only role seeded by start-server.mjs), so the
+// refusal of their own approval comes from the self-approval rule, not a missing permission.
 test.describe.configure({ mode: 'serial' });
 test.setTimeout(180_000);
 
@@ -35,6 +38,7 @@ let fixtures: Fixtures;
 let connectionId: string;
 let operatorPage: Page;
 let planId: string;
+let planToken: string;
 
 const currentName = async () =>
   (
@@ -57,7 +61,7 @@ test.beforeAll(async ({ browser }) => {
     connectionIds: [connectionId],
     limits: { requireApproval: true },
   });
-  await fixtures.user(OPERATOR.email, OPERATOR.name, OPERATOR.initial, ['OPERATOR']);
+  await fixtures.user(OPERATOR.email, OPERATOR.name, OPERATOR.initial, [APPROVER_ROLE]);
   operator = await userContext(browser, OPERATOR.email, OPERATOR.initial, OPERATOR.changed);
   operatorPage = await openApp(operator, OPERATOR.name);
 });
@@ -87,10 +91,12 @@ test('the operator plans an UPDATE that needs approval; executing it first write
   await page.keyboard.press('ControlOrMeta+Enter');
   const preview = (await (await previewResponse).json()) as {
     planId: string;
+    token: string;
     requires: { approval: boolean };
   };
   expect(preview.requires.approval).toBe(true);
   planId = preview.planId;
+  planToken = preview.token;
 
   const dialog = page.getByRole('dialog', { name: 'Prévia da alteração' });
   await expect(dialog.getByTestId('impact-environment')).toHaveText('SANDBOX');
@@ -105,12 +111,37 @@ test('the operator plans an UPDATE that needs approval; executing it first write
   await expect(dialog.getByTestId('approval-pending')).toContainText('Nada foi gravado');
   expect(await currentName()).toBe(before);
 
-  // The operator asks for approval; they cannot decide it themselves.
+  // The operator asks for approval.
+  const requested = page.waitForResponse(
+    (r) => r.request().method() === 'POST' && new URL(r.url()).pathname === '/api/approvals',
+  );
   await dialog.getByTestId('request-approval').click();
+  const requestRes = await requested;
+  expect(requestRes.status()).toBe(201);
+  const { approval } = (await requestRes.json()) as { approval: { id: string } };
   await expect(dialog.getByTestId('approval-requested')).toBeVisible();
   await shot(page, 'four-eyes-requested');
-  const own = await call(operator.request, 'GET', '/api/approvals/pending');
+
+  // They hold APPROVAL.DECIDE, yet cannot approve their own request.
+  const own = await call(operator.request, 'POST', `/api/approvals/${approval.id}/decision`, {
+    decision: 'APPROVE',
+  });
   expect(own.status()).toBe(403);
+  const ownErr = await refusal(own);
+  expect(ownErr.code).toBe('FORBIDDEN');
+  expect(ownErr.details?.reason).toBe('self_approval');
+  expect(await currentName()).toBe(before);
+
+  // The request is still pending: executing is still refused and writes nothing.
+  const still = await call(operator.request, 'POST', '/api/query/execute', {
+    planId,
+    token: planToken,
+    idempotencyKey: `e2e-still-pending-${STAMP}`,
+  });
+  const stillErr = await refusal(still);
+  expect(stillErr.code).toBe('FORBIDDEN');
+  expect(stillErr.details?.reason).toBe('approval_pending');
+  expect(await currentName()).toBe(before);
 });
 
 test('another person approves it on the Approvals page', async () => {

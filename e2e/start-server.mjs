@@ -21,6 +21,8 @@ const specialistFile = join(e2eDir, 'specialist-password.txt');
 // Keep in sync with SPECIALIST in playwright.config.ts.
 const SPECIALIST_EMAIL = 'especialista@example.com';
 const SPECIALIST_ROLE = 'E2E_ESPECIALISTA';
+// Keep in sync with APPROVER_ROLE in tests/support.ts.
+const APPROVER_ROLE = 'E2E_OPERADOR_APROVADOR';
 rmSync(e2eDir, { recursive: true, force: true });
 // PGlite creates its directory but not the parents.
 mkdirSync(e2eDir, { recursive: true });
@@ -47,30 +49,48 @@ writeFileSync(passwordFile, bootstrapUser([], process.env), { mode: 0o600 });
 const pgliteEntry = createRequire(api('../package.json')).resolve('@electric-sql/pglite');
 const { PGlite } = await import(pathToFileURL(pgliteEntry).href);
 const db = new PGlite(dataDir);
-try {
+/** Inserts a custom (non-system) role holding `permissions`. */
+async function seedRole(key, name, description, permissions) {
   const role = await db.query(
     `INSERT INTO roles (key, name, description, system) VALUES ($1, $2, $3, false) RETURNING id`,
-    [
-      SPECIALIST_ROLE,
-      'Especialista E2E',
-      'Fixture of the e2e run only: DELETE (refused as UNSUPPORTED) and custom DDL artifacts.',
-    ],
+    [key, name, description],
   );
-  const roleId = role.rows[0].id;
-  for (const permission of [
-    'QUERY.SELECT',
-    'TEMP.CREATE',
-    'TEMP.WRITE',
-    'TEMP.DROP',
-    'TEMP.MATERIALIZE',
-    'DATA.DELETE',
-    'DDL.CUSTOM.GENERATE',
-  ]) {
+  for (const permission of new Set(permissions)) {
     await db.query(`INSERT INTO role_permissions (role_id, permission) VALUES ($1, $2)`, [
-      roleId,
+      role.rows[0].id,
       permission,
     ]);
   }
+}
+try {
+  await seedRole(
+    SPECIALIST_ROLE,
+    'Especialista E2E',
+    'Fixture of the e2e run only: DELETE (refused as UNSUPPORTED) and custom DDL artifacts.',
+    [
+      'QUERY.SELECT',
+      'TEMP.CREATE',
+      'TEMP.WRITE',
+      'TEMP.DROP',
+      'TEMP.MATERIALIZE',
+      'DATA.DELETE',
+      'DDL.CUSTOM.GENERATE',
+    ],
+  );
+  // The four-eyes requester also holds APPROVAL.DECIDE, so refusing their own approval proves
+  // the self-approval rule and not a missing permission. It is seeded here, next to the other
+  // test-only role, so the e2e fixtures stay in one place; tests assign it through the admin API.
+  const operator = await db.query(
+    `SELECT rp.permission FROM role_permissions rp JOIN roles r ON r.id = rp.role_id
+      WHERE r.key = 'OPERATOR'`,
+  );
+  if (operator.rows.length === 0) throw new Error('the OPERATOR system role has no permissions');
+  await seedRole(
+    APPROVER_ROLE,
+    'Operador aprovador E2E',
+    'Fixture of the e2e run only: an operator who may decide approvals, never their own.',
+    [...operator.rows.map((r) => r.permission), 'APPROVAL.DECIDE'],
+  );
 } finally {
   await db.close();
 }

@@ -137,11 +137,13 @@ async function previewAndRefuse(page: Page) {
   await dialog.getByTestId('confirmation-input').fill(phrase);
   await expect(execute).toBeEnabled();
 
-  // SAFE_MODE stays on in e2e: the server refuses the PRODUCTION write.
+  // SAFE_MODE stays on in e2e while the other write switches are on: the server refuses the
+  // PRODUCTION write, and its own message names SAFE_MODE as the switch that refused it.
   await execute.click();
   const refusal = dialog.getByTestId('mutation-error');
   await expect(refusal).toContainText('READ_ONLY_MODE');
   await expect(refusal).toContainText('somente leitura');
+  await expect(refusal).toContainText('Writes are disabled (SAFE_MODE).');
   await expect(execute).toBeDisabled();
   expect(calls.filter((c) => c === '/api/query/execute')).toHaveLength(1);
 

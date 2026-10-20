@@ -134,6 +134,9 @@ test('the new administrator logs in through the UI', async ({ browser }) => {
         exact: true,
       }),
     ).toBeVisible();
+    // The schema tree has loaded from the mock gateway before the screenshot.
+    await expect(page.getByTestId('schema-group-TGF')).toBeVisible();
+    await expect(page.getByText('Carregando schema…')).toHaveCount(0);
     await shot(page, 'bootstrap-first-admin');
   } finally {
     await ctx.close();

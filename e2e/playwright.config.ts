@@ -87,10 +87,12 @@ export default defineConfig({
       // Every page shows the DEMO banner: the data is the mock gateway's fictitious dataset.
       DEMO_MODE: 'true',
       // The write switches are on so the lifecycle can reach a VERIFIED write on a SANDBOX
-      // connection (mock gateway only). SAFE_MODE keeps its default (true), so PRODUCTION
-      // writes are still refused, and the runtime kill switch can still turn every write off.
+      // connection (mock gateway only). SAFE_MODE is set on explicitly (a SAFE_MODE=false in the
+      // developer's shell must not leak in), so PRODUCTION writes are still refused, and the
+      // runtime kill switch can still turn every write off.
       GLOBAL_WRITE_ENABLED: 'true',
       WRITE_TO_SANKHYA: 'true',
+      SAFE_MODE: 'true',
     },
   },
 });

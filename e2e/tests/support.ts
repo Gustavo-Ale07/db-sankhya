@@ -14,6 +14,20 @@ import type {
 } from '@playwright/test';
 import { BASE_URL, BOOTSTRAP, E2E_DIR, SPECIALIST } from '../playwright.config';
 
+/**
+ * Partner rows (TGFPAR.CODPARC) each file writes or refuses to write. All mock connections share
+ * one dataset and renamed rows stay renamed for the rest of the run, so a new spec picks a free
+ * value and adds it here.
+ */
+export const RESERVED_CODPARC = {
+  'mutation.spec.ts': [1],
+  'lifecycle.spec.ts': [7, 11, 12, 13],
+  'four-eyes.spec.ts': [21],
+} as const;
+
+/** Role seeded by start-server.mjs: OPERATOR plus APPROVAL.DECIDE (keep the key in sync). */
+export const APPROVER_ROLE = 'E2E_OPERADOR_APROVADOR';
+
 /** Same value explorer.spec.ts and mutation.spec.ts use for the changed bootstrap password. */
 export const CHANGED_PASSWORD = 'E2E-Changed#Pass2026';
 export const SHOTS = process.env.UPDATE_SCREENSHOTS === '1';

@@ -157,15 +157,18 @@ test('DDL: generates the custom-table artifacts for download and executes nothin
   const native = await call(specialist.request, 'POST', '/api/ddl/artifact', {
     sql: 'CREATE TABLE TGFPAR (ID INT PRIMARY KEY)',
   });
-  expect(native.status()).toBeGreaterThanOrEqual(400);
-  expect(native.status()).toBeLessThan(500);
+  // The native-table guard refuses it, before any policy is consulted (not a default-deny 403).
+  expect(native.status()).toBe(400);
+  const nativeErr = await refusal(native);
+  expect(nativeErr.code).toBe('SQL_UNSUPPORTED');
+  expect(nativeErr.message).toContain('Native DDL is forbidden');
+  expect(nativeErr.details?.table).toBe('TGFPAR');
 
   // Only an artifact was produced: the table does not exist in the Sankhya catalog.
   const read = await call(specialist.request, 'POST', '/api/query', {
     sql: `SELECT * FROM ${DDL_TABLE}`,
   });
-  expect(read.status()).toBeGreaterThanOrEqual(400);
-  expect(read.status()).toBeLessThan(500);
+  expect((await refusal(read)).code).toBe('RESOURCE_NOT_FOUND');
   const { items } = await ok<{ items: { action: string; resource: string | null }[] }>(
     admin.request,
     'GET',

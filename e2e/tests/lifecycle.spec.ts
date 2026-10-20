@@ -18,7 +18,7 @@ import { SPECIALIST } from '../playwright.config';
 // The mutation lifecycle on the mock gateway (fictitious data): a CTE read, a refused DELETE,
 // a PRODUCTION UPDATE stopped by SAFE_MODE, a VERIFIED UPDATE on a SANDBOX connection, the plan
 // in the audit log and the kill switch. One admin session walks through it in order.
-// Each write uses its own partner row; mutation.spec.ts uses CODPARC = 1.
+// Each write uses its own partner row (see RESERVED_CODPARC in support.ts).
 test.describe.configure({ mode: 'serial' });
 test.setTimeout(180_000);
 
@@ -125,6 +125,8 @@ test('refuses a DELETE as UNSUPPORTED and deletes nothing', async ({ browser }) 
     const alert = p.getByRole('region', { name: 'Resultados' }).getByRole('alert');
     await expect(alert).toContainText('OPERATION_NOT_SUPPORTED');
     await expect(alert).toContainText('Esta operação não é suportada para a tabela.');
+    // The capability label itself is on screen, verbatim.
+    await expect(alert.getByTestId('capability-badge')).toHaveText('UNSUPPORTED');
     await expect(p.getByRole('dialog', { name: 'Prévia da alteração' })).toHaveCount(0);
     await shot(p, 'lifecycle-delete-unsupported');
   } finally {
@@ -259,10 +261,18 @@ test('the kill switch blocks the execute of a plan made while writes were on', a
     page,
     `UPDATE TGFPAR SET NOMEPARC = '${target}' WHERE CODPARC = ${ROW.killSwitch}`,
   );
-  const plan = (await preview.json()) as { execution: { available: boolean } };
+  const plan = (await preview.json()) as {
+    execution: { available: boolean };
+    requires: { strongConfirmation: string | null };
+  };
   expect(plan.execution.available).toBe(true);
   const dialog = page.getByRole('dialog', { name: 'Prévia da alteração' });
   await expect(dialog.getByTestId('impact-environment')).toHaveText('SANDBOX');
+  // Everything the execute needs is in place, so only the switch can refuse it.
+  if (plan.requires.strongConfirmation) {
+    await dialog.getByTestId('confirmation-input').fill(plan.requires.strongConfirmation);
+  }
+  await expect(dialog.getByTestId('mutation-execute')).toBeEnabled();
 
   // An administrator pulls the emergency switch from the Security page (another tab).
   const security = await admin.newPage();
