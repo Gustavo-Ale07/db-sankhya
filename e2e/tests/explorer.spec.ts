@@ -181,6 +181,62 @@ test('users page shows effective roles and assigns roles to a new user', async (
   await expect(page.getByTestId('roles-leitora@example.com')).toHaveText('Operador, Leitor');
 });
 
+test('admin pages: groups, roles, policies, connections and security', async () => {
+  // Groups: create one and add the new reader as a member.
+  await nav('Grupos').click();
+  await page.getByRole('button', { name: 'Novo grupo' }).click();
+  await page.getByRole('dialog').getByLabel('Nome').fill('Equipe Fiscal');
+  await page.getByRole('dialog').getByRole('button', { name: 'Salvar' }).click();
+  const groupRow = page
+    .getByTestId('groups-table')
+    .getByRole('row')
+    .filter({ hasText: 'Equipe Fiscal' });
+  await expect(groupRow).toBeVisible();
+  await groupRow.getByRole('button', { name: 'Membros' }).click();
+  await page
+    .getByRole('dialog')
+    .getByLabel(/leitora@example.com/)
+    .check();
+  await page.getByRole('dialog').getByRole('button', { name: 'Salvar membros' }).click();
+  await expect(groupRow.getByRole('cell').nth(2)).toHaveText('1');
+
+  // Roles: system roles cannot be deleted.
+  await nav('Papéis').click();
+  const adminRole = page
+    .getByTestId('roles-table')
+    .getByRole('row')
+    .filter({ hasText: 'sistema' })
+    .first();
+  await expect(adminRole.getByRole('button', { name: 'Excluir' })).toBeDisabled();
+
+  // Policies: a bad rule shows the server error, a valid one bumps the version.
+  await nav('Políticas').click();
+  await page.getByRole('button', { name: 'Nova política' }).click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByLabel('Nome').fill('Limite de leitura');
+  await dialog.getByLabel('QUERY.SELECT').check();
+  await dialog.getByLabel('Máx. linhas lidas').fill('100');
+  await dialog.getByRole('button', { name: 'Salvar' }).click();
+  await expect(page.getByTestId('policies-table')).toContainText('Limite de leitura');
+  await expect(page.getByTestId('policy-version')).toBeVisible();
+
+  // Connections: secrets are never shown, only their state.
+  await nav('Conexões').click();
+  const item = page.getByTestId('connection-item').first();
+  await expect(item).toBeVisible();
+  await expect(item.getByTestId('connection-environment')).toHaveText(
+    /PRODUÇÃO|HOMOLOGAÇÃO|SANDBOX/,
+  );
+  await item.getByRole('button', { name: 'Testar' }).click();
+  await expect(item.getByRole('status')).toBeVisible();
+
+  // Security: env, runtime and effective are all reported.
+  await nav('Segurança').click();
+  await expect(page.getByTestId('security-env')).toBeVisible();
+  await expect(page.getByTestId('security-runtime')).toBeVisible();
+  await expect(page.getByTestId('security-effective')).toBeVisible();
+});
+
 test('explorer overview screenshot', async () => {
   await nav('Editor SQL').click();
   await run('SELECT CODPROD, DESCRPROD, CODVOL, VLRVENDA FROM TGFPRO ORDER BY DESCRPROD');

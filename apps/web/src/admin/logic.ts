@@ -14,13 +14,13 @@ export function parseList(text: string): string[] {
 
 export const listText = (items: readonly string[]) => items.join(', ');
 
-/** Blank means "not set" (the rule leaves the limit alone); anything else must be a positive integer. */
+/** Blank means "not set" (the rule leaves the limit alone); anything else must be a non-negative integer. */
 export function parseLimit(text: string): number | undefined | 'invalid' {
   const t = text.trim();
   if (!t) return undefined;
   if (!/^\d+$/.test(t)) return 'invalid';
   const n = Number(t);
-  return Number.isSafeInteger(n) && n > 0 ? n : 'invalid';
+  return Number.isSafeInteger(n) ? n : 'invalid';
 }
 
 export interface PolicyForm {
@@ -108,10 +108,12 @@ export function policyPayload(f: PolicyForm): {
   if (!f.name.trim()) problems.push('Informe o nome da regra.');
   if (f.subjectType !== 'everyone' && !f.subjectId.trim())
     problems.push('Informe o identificador do usuário ou grupo.');
+  if (f.actions.length === 0) problems.push('Selecione ao menos uma ação.');
   const read = parseLimit(f.maxReadRows);
   const write = parseLimit(f.maxWriteRows);
-  if (read === 'invalid') problems.push('Máximo de linhas lidas deve ser um inteiro positivo.');
-  if (write === 'invalid') problems.push('Máximo de linhas escritas deve ser um inteiro positivo.');
+  if (read === 'invalid') problems.push('Máximo de linhas lidas deve ser um inteiro não negativo.');
+  if (write === 'invalid')
+    problems.push('Máximo de linhas escritas deve ser um inteiro não negativo.');
   if (problems.length > 0) return { problems };
   const limits: PolicyLimits = {};
   if (typeof read === 'number') limits.maxReadRows = read;

@@ -125,8 +125,8 @@ export function PoliciesPage() {
       </div>
       <p className="text-xs text-muted">
         Regras refinam o que as permissões já concedem: nunca concedem além delas. DENY vence ALLOW.
-        Listas vazias significam &quot;todos&quot;. Cada alteração gera uma nova versão do conjunto
-        de regras.
+        Ambientes, conexões, tabelas e colunas vazios significam &quot;todos&quot;; as ações são
+        obrigatórias. Cada alteração gera uma nova versão do conjunto de regras.
       </p>
       {currentVersion && (
         <div className="text-xs text-muted" data-testid="policy-version">
@@ -330,7 +330,7 @@ export function PoliciesPage() {
               ))}
             </fieldset>
             <fieldset className="grid grid-cols-1 gap-x-4 gap-y-1 sm:grid-cols-2">
-              <legend className="font-medium">Ações (nenhuma = todas)</legend>
+              <legend className="font-medium">Ações (obrigatório)</legend>
               {[...new Set([...ACTION_OPTIONS, ...f.actions])].map((a) => (
                 <label key={a} className="flex items-center gap-1 font-mono">
                   <input

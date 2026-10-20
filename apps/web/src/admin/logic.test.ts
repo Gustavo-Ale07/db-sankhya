@@ -16,10 +16,10 @@ describe('parseList', () => {
 });
 
 describe('parseLimit', () => {
-  it('accepts blank and positive integers only', () => {
+  it('accepts blank and non-negative integers only', () => {
     expect(parseLimit('')).toBeUndefined();
     expect(parseLimit(' 25 ')).toBe(25);
-    expect(parseLimit('0')).toBe('invalid');
+    expect(parseLimit('0')).toBe(0);
     expect(parseLimit('1.5')).toBe('invalid');
     expect(parseLimit('-3')).toBe('invalid');
     expect(parseLimit('abc')).toBe('invalid');
@@ -31,6 +31,7 @@ describe('policyPayload', () => {
     const { body, problems } = policyPayload({
       ...EMPTY_POLICY,
       name: ' Limite ',
+      actions: ['DATA.UPDATE'],
       maxWriteRows: '10',
       requireApproval: true,
       entities: 'TGFPRO, TGFPAR',
@@ -48,7 +49,7 @@ describe('policyPayload', () => {
   it('reports form-level problems', () => {
     const r = policyPayload({ ...EMPTY_POLICY, subjectType: 'group', maxReadRows: 'x' });
     expect(r.body).toBeUndefined();
-    expect(r.problems).toHaveLength(3);
+    expect(r.problems).toHaveLength(4);
   });
 
   it('round-trips a stored rule through the form', () => {

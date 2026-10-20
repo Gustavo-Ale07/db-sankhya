@@ -143,6 +143,7 @@ describe('PoliciesPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Nova política' }));
     const dialog = openDialog();
     fireEvent.change(within(dialog).getByLabelText('Nome'), { target: { value: 'Regra X' } });
+    fireEvent.click(within(dialog).getByLabelText('QUERY.SELECT'));
     fireEvent.click(within(dialog).getByRole('button', { name: 'Salvar', hidden: true }));
     expect(await within(dialog).findByText(/unknown action FOO/)).toBeTruthy();
   });
