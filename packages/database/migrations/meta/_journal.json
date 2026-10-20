@@ -78,6 +78,13 @@
       "when": 1792438771803,
       "tag": "0010_audit",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1792495098103,
+      "tag": "0011_settings",
+      "breakpoints": true
     }
   ]
 }

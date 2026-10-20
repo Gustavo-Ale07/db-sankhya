@@ -449,6 +449,18 @@ export const bootstrapTokens = pgTable(
   (t) => [uniqueIndex('bootstrap_tokens_token_hash_key').on(t.tokenHash)],
 );
 
+/**
+ * Runtime settings changed by admins, one row per key. `global_write_enabled` is the runtime kill
+ * switch: it can only turn writes off (effective = GLOBAL_WRITE_ENABLED env AND this value).
+ * Never holds secrets.
+ */
+export const settings = pgTable('settings', {
+  key: text('key').primaryKey(),
+  value: jsonb('value').$type<unknown>().notNull(),
+  updatedBy: uuid('updated_by').references(() => users.id, { onDelete: 'set null' }),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
 export type UserRow = typeof users.$inferSelect;
 export type SessionRow = typeof sessions.$inferSelect;
 export type RoleRow = typeof roles.$inferSelect;
@@ -466,3 +478,4 @@ export type NewConnection = typeof connections.$inferInsert;
 export type PolicyRow = typeof policies.$inferSelect;
 export type NewPolicy = typeof policies.$inferInsert;
 export type BootstrapTokenRow = typeof bootstrapTokens.$inferSelect;
+export type SettingRow = typeof settings.$inferSelect;

@@ -19,12 +19,13 @@ import { ExecutionRegistry } from './services/executions';
 import { MetadataService } from './services/metadata';
 import { PolicyService } from './services/policy';
 import { ScratchManager } from './services/scratch';
+import { SecuritySettingsService } from './services/security-settings';
 import { AuditService, HistoryService, SavedQueriesService } from './services/records';
 import { SessionsService } from './services/sessions';
 import { UsersService } from './services/users';
 import { AuthzService } from './services/authz';
 import { createBootstrapService } from './services/bootstrap';
-import { adminRoutes } from './routes/admin';
+import { adminRoutes } from './routes/admin/index';
 import { approvalRoutes } from './routes/approvals';
 import { auditRoutes } from './routes/audit';
 import { authRoutes } from './routes/auth';
@@ -82,6 +83,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     connections,
     metadata: new MetadataService(database.db, { getRuntime: (id) => connections.getRuntime(id) }),
     policies: new PolicyService(database.db, app.log),
+    security: new SecuritySettingsService(database.db, config, app.log),
     scratch: new ScratchManager({ ...config.scratch }),
     redact: redactor,
     executions: new ExecutionRegistry(),
