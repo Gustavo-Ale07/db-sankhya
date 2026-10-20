@@ -58,7 +58,8 @@ Notes:
   on a Sankhya table is `UNSUPPORTED` (see [capabilities.md](capabilities.md)). It applies to
   nothing else either, since scratch deletes use `TEMP.WRITE`.
 - `DATA.PREVIEW` lets a user **see the preview** of an `INSERT` / `UPDATE` / `DELETE` plan on a
-  Sankhya table without the statement permission. It never lets anyone execute: `execute` re-checks
+  Sankhya table without the statement permission, through `POST /api/query/preview` only (rollback
+  plans and business actions still need their own permission). It never lets anyone execute: `execute` re-checks
   the statement permission (`DATA.INSERT` / `DATA.UPDATE` / `DATA.DELETE`) with fresh grants and
   refuses with `FORBIDDEN`, whatever the write switches say. Everything else still applies to the
   preview: the policy rules are evaluated for the **statement** action (so the entity still needs an
@@ -107,5 +108,7 @@ The permission catalog replaced the earlier role model. When the RBAC migration 
 - a legacy `ADMIN` keeps administering the tool but **loses every `DATA.*` permission**. An
   administrator who also wrote data needs the `OPERATOR` role (or a custom role) added;
 - nobody holds `DATA.DELETE` afterwards;
+- migration `0012` grants `DATA.PREVIEW` to `ADMIN` and `OPERATOR` (it grants it again if an
+  administrator removed it before upgrading);
 - write permissions alone change nothing: writes are default-deny until an administrator creates
   matching `ALLOW` policy rules (**Políticas**).
