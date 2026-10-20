@@ -119,7 +119,7 @@ describe('ExplorerPage toolbar', () => {
 
   it('"Consultas salvas" opens a picker; the filter narrows it and a choice opens a new tab', async () => {
     renderPage();
-    fireEvent.click(screen.getByRole('button', { name: 'Abrir consulta salva' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Abrir consultas salvas' }));
     const dialog = await screen.findByRole('dialog', { name: 'Consultas salvas' });
     await within(dialog).findByText('Parceiros ativos');
     // Focus lands on the filter, not on the dialog's close button.
@@ -153,7 +153,7 @@ describe('ExplorerPage toolbar', () => {
 
   it('closes the picker with Escape without opening a tab', async () => {
     renderPage();
-    fireEvent.click(screen.getByRole('button', { name: 'Abrir consulta salva' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Abrir consultas salvas' }));
     const dialog = await screen.findByRole('dialog', { name: 'Consultas salvas' });
     // The browser fires "cancel" on the dialog for Escape.
     fireEvent(dialog, new Event('cancel', { cancelable: true }));

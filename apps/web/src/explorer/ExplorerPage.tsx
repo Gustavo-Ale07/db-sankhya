@@ -489,7 +489,7 @@ export function ExplorerPage({
           className="tbtn"
           onClick={() => setPickerOpen(true)}
           aria-haspopup="dialog"
-          aria-label="Abrir consulta salva"
+          aria-label="Abrir consultas salvas"
           title="Abrir uma consulta salva em nova aba"
         >
           <Icon name="folder" />
