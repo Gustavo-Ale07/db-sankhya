@@ -95,6 +95,8 @@ test('runs a SELECT with a CTE', async () => {
   const grid = page.getByTestId('result-grid');
   await expect(grid).toContainText('DESCRPROD');
   await expect(page.getByTestId('result-status')).toContainText(/linha/);
+  // A read runs straight away: no preview, no confirmation.
+  await expect(page.getByRole('dialog', { name: 'Prévia da alteração' })).toHaveCount(0);
   // The CTE returns exactly the active products of the same read without it.
   const direct = await select(admin.request, "SELECT COUNT(*) FROM TGFPRO WHERE ATIVO = 'S'");
   const viaCte = await select(
@@ -200,18 +202,31 @@ test('SANDBOX UPDATE executes and is VERIFIED', async () => {
   expect(plan.execution.available).toBe(true);
   const dialog = page.getByRole('dialog', { name: 'Prévia da alteração' });
   await expect(dialog.getByTestId('impact-environment')).toHaveText('SANDBOX');
-  await expect(dialog.getByTestId('mutation-diff')).toContainText(SANDBOX_NAME);
+  await expect(dialog.getByTestId('impact-rows')).toHaveText('1 registro será alterado');
+  // The record card: ANTES is the row as read now, DEPOIS the value the UPDATE sets.
+  const field = dialog
+    .getByTestId('mutation-diff')
+    .getByTestId('diff-field')
+    .filter({ hasText: 'NOMEPARC' });
+  await expect(field.getByTestId('diff-before')).toContainText(String(before));
+  await expect(field.getByTestId('diff-after')).toContainText(SANDBOX_NAME);
+  // The preview wrote nothing: the row still holds its old name.
+  expect(await nameOf(ROW.sandbox, sandboxId)).toBe(before);
   if (plan.requires.strongConfirmation) {
     await dialog.getByTestId('confirmation-input').fill(plan.requires.strongConfirmation);
   }
+  await expect(dialog.getByTestId('mutation-execute')).toHaveText('Confirmar alteração');
 
   const response = executeResponse(page);
   await dialog.getByTestId('mutation-execute').click();
   const report = (await (await response).json()) as { status: string; verification: string };
   expect(report.status).toBe('success');
   expect(report.verification).toBe('VERIFIED');
+  await expect(dialog.getByTestId('report-title')).toHaveText('Alteração concluída');
   await expect(dialog.getByTestId('verification-status')).toHaveText('VERIFIED');
   await expect(dialog.getByTestId('execution-steps')).toContainText('sim');
+  // AGORA is the value read back from the gateway after the write.
+  await expect(dialog.getByTestId('step-now').filter({ hasText: SANDBOX_NAME })).toHaveCount(1);
   await shot(page, 'lifecycle-sandbox-verified');
   sandboxPlanId = plan.planId;
   await dialog.getByRole('button', { name: 'Fechar', exact: true }).last().click();
