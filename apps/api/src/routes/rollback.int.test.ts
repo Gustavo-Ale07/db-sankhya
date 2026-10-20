@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance, InjectOptions } from 'fastify';
-import { createDatabase, rolePermissions, roles } from '@dbx/database';
+import { eq } from 'drizzle-orm';
+import { createDatabase, plans, rolePermissions, roles } from '@dbx/database';
 import type { DatabaseHandle } from '@dbx/database';
 import { MOCK_CREDENTIALS, createMockSankhya } from '@dbx/sankhya-client/mock';
 import type { MockSankhya } from '@dbx/sankhya-client/mock';
@@ -40,6 +41,7 @@ type Response = Awaited<ReturnType<FastifyInstance['inject']>>;
 
 interface Harness {
   app: FastifyInstance;
+  database: DatabaseHandle;
   mock: MockSankhya;
   userWith(permissions: Permission[]): Promise<string>;
   call(cookie: string | null, opts: InjectOptions): Promise<Response>;
@@ -122,7 +124,7 @@ async function setup(): Promise<Harness> {
   };
   // Writes are default-deny: grant DATA.* everywhere for the bench.
   await policy({ name: 'writes allowed', effect: 'ALLOW', actions: ['DATA.*'] });
-  return { app, mock, userWith, call, policy };
+  return { app, database, mock, userWith, call, policy };
 }
 
 const WRITER: Permission[] = ['QUERY.SELECT', 'DATA.UPDATE', 'AUDIT.READ'];
@@ -468,5 +470,73 @@ describe('rollback-plan: exact values, scope and failures', () => {
     expect(res.json().error.details).toEqual({ reason: 'ROLLBACK_AUDIT_FAILED' });
     expect(res.body).not.toMatch(/token/i);
     vi.restoreAllMocks();
+  });
+});
+
+describe('plans on an edited or deleted connection', () => {
+  const UPDATE = "UPDATE TGFPAR SET NOMEPARC = 'Novo nome' WHERE CODPARC = 1";
+
+  let n = 0;
+  async function prepared(h: Harness) {
+    const conn = await h.app.services.connections.create({
+      name: `Stored mock ${++n}`,
+      environment: 'HOMOLOGATION',
+      mode: 'mock',
+      baseUrl: 'mock://local',
+      dialect: 'oracle',
+      secrets: { ...MOCK_CREDENTIALS },
+    });
+    const cookie = await h.userWith([...WRITER, 'ADMIN.CONNECTIONS']);
+    const planned = await h.call(cookie, {
+      method: 'POST',
+      url: '/api/query/preview',
+      payload: { sql: UPDATE, connectionId: conn.id },
+    });
+    expect(planned.statusCode, planned.body).toBe(200);
+    const { planId, token } = planned.json() as { planId: string; token: string };
+    return { conn, cookie, planId, token };
+  }
+
+  const statusOf = async (h: Harness, id: string) =>
+    (await h.database.db.select({ status: plans.status }).from(plans).where(eq(plans.id, id)))[0]
+      ?.status;
+
+  it('refuses at execute a plan prepared before the connection was edited', async () => {
+    const h = await setup();
+    const { conn, cookie, planId, token } = await prepared(h);
+    const original = await partner(h.mock, 1);
+    const edit = await h.call(cookie, {
+      method: 'PATCH',
+      url: `/api/admin/connections/${conn.id}`,
+      payload: { name: 'Renamed' },
+    });
+    expect(edit.statusCode, edit.body).toBe(200);
+    expect(await statusOf(h, planId)).toBe('INVALIDATED');
+    const res = await executePlan(h, cookie, planId, token);
+    expect(res.statusCode).not.toBe(200);
+    expect(res.json().error.code).toBe('CONFIRMATION_INVALID');
+    expect(await partner(h.mock, 1)).toBe(original);
+    expect(saves(h.mock)).toHaveLength(0);
+  });
+
+  it('invalidates the plans of a connection whose secrets are replaced or that is deleted', async () => {
+    const h = await setup();
+    const first = await prepared(h);
+    const rotate = await h.call(first.cookie, {
+      method: 'PUT',
+      url: `/api/admin/connections/${first.conn.id}/secrets`,
+      payload: { xToken: MOCK_CREDENTIALS.xToken },
+    });
+    expect(rotate.statusCode, rotate.body).toBe(200);
+    expect(await statusOf(h, first.planId)).toBe('INVALIDATED');
+
+    const second = await prepared(h);
+    const del = await h.call(second.cookie, {
+      method: 'DELETE',
+      url: `/api/admin/connections/${second.conn.id}`,
+    });
+    expect(del.statusCode, del.body).toBe(200);
+    expect(await statusOf(h, second.planId)).toBe('INVALIDATED');
+    expect(saves(h.mock)).toHaveLength(0);
   });
 });

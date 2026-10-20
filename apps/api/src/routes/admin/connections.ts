@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { ENVIRONMENTS } from '@dbx/shared';
 import type { ConnectionPublic, ConnectionSecrets } from '../../services/connections';
 import { connectionIdSchema, noStore, parseBody, requirePermission } from '../../http';
+import { PlansService } from '../../services/plans';
 import { adminAudit } from './shared';
 
 const secretValue = z.string().min(1).max(4096);
@@ -49,8 +50,14 @@ const fieldsOf = (secrets: Partial<ConnectionSecrets> | undefined) =>
 const view = (c: ConnectionPublic) => ({ ...c, editable: c.source !== 'env' });
 
 export async function adminConnectionRoutes(app: FastifyInstance): Promise<void> {
-  const { connections } = app.services;
+  const { connections, config, database } = app.services;
   const { record, attempt } = adminAudit(app);
+  // A plan is bound to the connection as it was previewed: any change to it (fields, secrets,
+  // removal) invalidates its live plans, so they are refused at execute.
+  const plans = new PlansService(database.db, {
+    secret: config.session.secret,
+    ttlSeconds: config.planTtlSeconds,
+  });
 
   app.get('/api/admin/connections', async (request, reply) => {
     noStore(reply);
@@ -91,6 +98,7 @@ export async function adminConnectionRoutes(app: FastifyInstance): Promise<void>
     const updated = await attempt(request, actor, 'connection.update', details, () =>
       connections.update(id, body),
     );
+    await plans.invalidateForConnection(id);
     await record(request, actor, 'connection.update', details);
     return { item: view(updated) };
   });
@@ -104,6 +112,7 @@ export async function adminConnectionRoutes(app: FastifyInstance): Promise<void>
     const rotated = await attempt(request, actor, 'connection.rotate_secrets', details, () =>
       connections.rotateSecrets(id, body),
     );
+    await plans.invalidateForConnection(id);
     await record(request, actor, 'connection.rotate_secrets', details);
     return { item: view(rotated) };
   });
@@ -114,6 +123,7 @@ export async function adminConnectionRoutes(app: FastifyInstance): Promise<void>
     await attempt(request, actor, 'connection.delete', { connectionId: id }, () =>
       connections.delete(id),
     );
+    await plans.invalidateForConnection(id);
     await record(request, actor, 'connection.delete', { connectionId: id });
     return { ok: true };
   });
