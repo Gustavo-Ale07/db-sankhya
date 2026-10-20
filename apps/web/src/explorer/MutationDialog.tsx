@@ -527,7 +527,7 @@ function Report({ report, operation }: { report: ExecutionReport; operation: Ope
       {noValues && (
         <p className="text-muted" data-testid="values-unavailable">
           {report.valuesTruncated
-            ? 'Os valores dos campos não estão disponíveis nesta consulta do resultado (o servidor devolveu o resultado já registrado).'
+            ? 'Alguns valores foram omitidos ou encurtados pelos limites do registro de auditoria.'
             : 'Os valores dos campos não estão disponíveis neste resultado.'}
         </p>
       )}
@@ -1016,7 +1016,7 @@ export function MutationDialog({
             </p>
           )}
 
-          {preview.requires.approval && report === null && (
+          {preview.requires.approval && permitted && report === null && (
             <div
               className="space-y-1 rounded border border-warn/60 px-3 py-2"
               data-testid="approval-required"

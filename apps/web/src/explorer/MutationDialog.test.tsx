@@ -994,6 +994,27 @@ describe('MutationDialog preview redesign', () => {
     expect(executePlan).not.toHaveBeenCalled();
   });
 
+  it('does not offer an approval request to a preview-only caller', () => {
+    render(
+      <MutationDialog
+        preview={preview({
+          requires: { strongConfirmation: null, approval: true },
+          execution: {
+            available: true,
+            permitted: false,
+            safeMode: false,
+            globalWriteEnabled: true,
+            writeToSankhya: true,
+          },
+        })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.queryByTestId('request-approval')).toBeNull();
+    expect(screen.getByTestId('preview-only-note')).toBeTruthy();
+  });
+
   it('disables the confirmation while the write switches are unavailable', () => {
     render(
       <MutationDialog
@@ -1145,7 +1166,9 @@ describe('MutationDialog execution report', () => {
 
   it('says the values are not available in a replay that omits them', async () => {
     await run({ ...report(), valuesTruncated: true });
-    expect(screen.getByTestId('values-unavailable').textContent).toContain('não estão disponíveis');
+    expect(screen.getByTestId('values-unavailable').textContent).toContain(
+      'limites do registro de auditoria',
+    );
   });
 
   it('paginates the steps of a large report', async () => {
