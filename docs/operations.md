@@ -62,7 +62,7 @@ connection credentials cannot be decrypted; replace them". The environment conne
 
 | Variable                   | Default | Meaning                                                 |
 | -------------------------- | ------- | ------------------------------------------------------- |
-| `GLOBAL_WRITE_ENABLED`     | `false` | master switch for every write, scratch included         |
+| `GLOBAL_WRITE_ENABLED`     | `false` | master switch for planned writes and business actions   |
 | `WRITE_TO_SANKHYA`         | `false` | allows writes to Sankhya tables                         |
 | `SAFE_MODE`                | `true`  | blocks writes on `PRODUCTION` connections while on      |
 | `BUSINESS_ACTIONS_ENABLED` | empty   | comma-separated action ids allowed on live connections  |
@@ -76,7 +76,7 @@ With the defaults no write reaches the ERP. To allow writes on a homologation co
 
 ### Emergency stop
 
-An administrator with `ADMIN.SECURITY` can stop every write at once without a restart: **Segurança**
+An administrator with `ADMIN.SECURITY` can stop every planned write and business action at once without a restart: **Segurança**
 → turn writes off, or
 
 ```bash
@@ -106,7 +106,9 @@ running, and is audited as `security.update`. The runtime switch can only turn w
 ```
 
 `effective` is `env` AND `runtime`. If the stored runtime value cannot be read, writes are
-refused ("The write switches could not be read.").
+refused ("The write switches could not be read."). `scratchAvailable` refers only to planned scratch writes;
+statements run directly in the scratch editor (`/api/scratch/exec`) and materialization do not
+check the switches, since they never reach the ERP.
 
 ## Operator notes
 
@@ -116,9 +118,10 @@ These are known behaviours to keep in mind when reading results and audit record
   unreadable answer), or the audit could not be written after it. The change may or may not be in
   the ERP. **Do not repeat the plan.** Check the row in the ERP first, then prepare a new plan if
   it is still needed.
-- **A lost single-step response shows as `PARTIALLY_VERIFIED`.** When a plan with one row loses
-  the gateway's answer, the verification cannot prove the row either way and labels the run
-  `PARTIALLY_VERIFIED`, not `UNVERIFIED`. Check the row in the ERP.
+- **A lost single-step response shows as `PARTIALLY_VERIFIED` at best.** When the gateway's
+  answer is lost, the row is still read back. A match is labelled `PARTIALLY_VERIFIED`, not
+  `VERIFIED`, because the save was never confirmed; a mismatch is `FAILED`; a read that fails is
+  `UNVERIFIED`. Check the row in the ERP before acting.
 - **`INSERT` verification trusts the key returned by the gateway.** The new row is read back by
   the key in the save result and only the inserted columns are compared. If the gateway returned
   the wrong key, the check reads the wrong row. Without a complete key the step is `UNVERIFIED`.
@@ -129,7 +132,8 @@ These are known behaviours to keep in mind when reading results and audit record
   restored as `0`.
 - **Rollback is a new plan.** It is offered only for a fully `VERIFIED` `UPDATE` with complete
   snapshots, needs `DATA.UPDATE` and an `ALLOW` rule, and only the first statement is prepared
-  for you. Rows changed since are flagged as conflicts.
+  for you. Conflicts (rows that changed or no longer exist) are checked only for that prepared
+  first statement.
 - **The `auditSnapshots` policy limit.** A rule with `auditSnapshots: false` (any matching rule
   wins) stops storing the before and after rows. The audit still keeps the counts, the row keys
   (up to 50) and the full SQL text, **including the values in `SET`**. With snapshots off, no

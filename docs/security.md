@@ -24,7 +24,8 @@ anonymous users.
   never receives them and no endpoint returns them.
 - Every structure that leaves the server (responses, history, audit, logs, errors) goes through
   `packages/shared/src/redact.ts`, which replaces values of sensitive keys (`authorization`,
-  `cookie`, `client_secret`, `x-token`, `*token`, `*secret`, `*password`, `*apikey`, …) with
+  `cookie`, `session`, `bearer`, `client_secret`, `x-token`, `*token`, `*secret`, `*password`,
+  `*apikey`, …) with
   `***REDACTED***` and also scrubs the literal configured secret values from any string.
 - Configuration is validated with a schema at boot. In production the server **refuses to
   start** when a secret is short or a placeholder, when the removed `BOOTSTRAP_ADMIN_PASSWORD`
@@ -189,9 +190,9 @@ The decision is made in this order:
    `requireApproval` are on if any rule sets them; `auditSnapshots` is off if any rule turns it
    off. `requirePreview` and `requireConfirmation` are always on.
 5. Any write on a `PRODUCTION` connection requires strong confirmation.
-6. An `UPDATE` or `DELETE` without `WHERE` is refused unless an `ALLOW` rule with
+6. An `UPDATE` of a Sankhya table without `WHERE` is refused unless an `ALLOW` rule with
    `overrideWhereRequired` covers each entity and no rule sets `requireWhere`. The override then
-   forces strong confirmation and approval.
+   forces strong confirmation and approval. A `DELETE` without `WHERE` is always refused.
 
 Defaults when no rule sets a limit: `maxReadRows` 1000, `maxWriteRows` 50, strong confirmation and
 approval off, snapshots on. Hard ceilings: 100000 rows read, 1000 rows written. There is no

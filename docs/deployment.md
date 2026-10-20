@@ -61,10 +61,11 @@ With `NODE_ENV=production` (the image default) the app does not start when, amon
 - `APP_URL` or `TRUSTED_ORIGINS` is not `https://`;
 - `LOG_LEVEL` is `debug` or `trace`;
 - `TRUST_PROXY` is a hop count, or trusts every address while `APP_BIND` publishes the app;
-- `BOOTSTRAP_ADMIN_PASSWORD` is set (it is no longer supported);
-- the `SANKHYA_BASE_URL` host is not in `SANKHYA_ALLOWED_HOSTS`.
+- `BOOTSTRAP_ADMIN_PASSWORD` is set (it is no longer supported).
 
-The startup log names the failing setting. See [troubleshooting.md](troubleshooting.md).
+The startup log names the failing setting. If the `SANKHYA_BASE_URL` host is not in
+`SANKHYA_ALLOWED_HOSTS`, the app starts but the environment connection is not configured; the
+reason is shown on the Status page. See [troubleshooting.md](troubleshooting.md).
 
 ### First administrator
 
@@ -121,8 +122,9 @@ read-only guarantee for `executeQuery` (see [sankhya.md](sankhya.md#executequery
 ### Enabling writes
 
 With the defaults (`GLOBAL_WRITE_ENABLED=false`, `WRITE_TO_SANKHYA=false`, `SAFE_MODE=true`,
-`BUSINESS_ACTIONS_ENABLED` empty) every write is refused with `READ_ONLY_MODE`, and previews still
-work. When writes are needed:
+`BUSINESS_ACTIONS_ENABLED` empty) every planned write and business action is refused with
+`READ_ONLY_MODE`, and previews still work. Statements in the local scratch database are not
+affected; they never reach the ERP. When writes are needed:
 
 1. Grant `DATA.INSERT` / `DATA.UPDATE` through a role (`OPERATOR` or a custom role).
 2. Create policy rules in **Políticas** that `ALLOW` those actions on the tables and environments

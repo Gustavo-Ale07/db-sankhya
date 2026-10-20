@@ -29,8 +29,9 @@ delete service, so a `DELETE` on a Sankhya table is `UNSUPPORTED`.
 OAuth2 `client_credentials` against `<SANKHYA_BASE_URL>/authenticate`, with the per-installation
 token in the `X-Token` header. The access token is cached, fetched once for any number of
 concurrent callers, and refreshed 30 seconds before it expires. If the gateway rejects a token,
-the call authenticates again once and is repeated. That repeat is safe for a write too: a rejected
-token means the request was not accepted.
+the call authenticates again once. A read is then repeated. A write is repeated only when it was
+provably not sent: an HTTP 401, or an HTTP 403 with a token error. A "não autorizado" inside an
+HTTP 200 answer comes from the service, so the write is treated as sent and never repeated.
 
 ### Transport limits
 
@@ -54,7 +55,8 @@ have been applied. The server does not repeat it. Check the row in the ERP befor
 else (see [operations.md](operations.md#operator-notes)).
 
 `DatasetSP.save` has no transaction spanning several calls. A plan that changes several rows can
-stop part way; the verification then reports `PARTIALLY_VERIFIED` or `FAILED` per row.
+stop part way; the run's verification label is then `PARTIALLY_VERIFIED` or `UNVERIFIED`.
+Per-step outcomes show which rows were saved.
 
 ## executeQuery
 

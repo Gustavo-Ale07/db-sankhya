@@ -140,27 +140,31 @@ Body: `{ planId, token, idempotencyKey, strongConfirmation? }`.
 
 The result label is one of:
 
-| Verification         | Meaning                                                                        |
-| -------------------- | ------------------------------------------------------------------------------ |
-| `VERIFIED`           | every step ran and every row read back holds the intended values               |
-| `PARTIALLY_VERIFIED` | some steps were verified, others could not be (not attempted or unknown)       |
-| `UNVERIFIED`         | nothing could be verified (for example, no key to read an inserted row back)   |
-| `FAILED`             | a row read back does not hold the intended values, or a step definitely failed |
+| Verification         | Meaning                                                                      |
+| -------------------- | ---------------------------------------------------------------------------- |
+| `VERIFIED`           | every step ran and every row read back holds the intended values             |
+| `PARTIALLY_VERIFIED` | some steps were verified, others could not be (not attempted or unknown)     |
+| `UNVERIFIED`         | nothing could be verified (for example, no key to read an inserted row back) |
+| `FAILED`             | a row read back does not hold the intended values                            |
 
 An `INSERT` is read back by the key the gateway returned in the save result; only the inserted
-columns are compared. Without a complete key the step stays `UNVERIFIED`. A plan with a single
-step whose answer was lost is reported as `PARTIALLY_VERIFIED`.
+columns are compared. Without a complete key the step stays `UNVERIFIED`. The label applies to
+the whole run, not to each row; per-step outcomes show which rows were saved. A gateway error
+stops the run, which is then labelled by what could be read back (`UNVERIFIED` or
+`PARTIALLY_VERIFIED`); the error itself is in the step outcome. When the gateway's answer is
+lost, the row is still read back: a match is labelled `PARTIALLY_VERIFIED`, not `VERIFIED`,
+because the save was never confirmed.
 
 ### Kill switches
 
 Three switches are checked at re-authorization and again before every gateway save. A switch that
 is off refuses the plan with `READ_ONLY_MODE` ("Writes are disabled (<switch>)"):
 
-| Switch                 | Default | Effect when off / on                                                               |
-| ---------------------- | ------- | ---------------------------------------------------------------------------------- |
-| `GLOBAL_WRITE_ENABLED` | `false` | off: no write at all, scratch included. Effective value = environment AND runtime. |
-| `WRITE_TO_SANKHYA`     | `false` | off: no write to Sankhya tables (scratch writes still run).                        |
-| `SAFE_MODE`            | `true`  | on: no write to a connection whose environment is `PRODUCTION`.                    |
+| Switch                 | Default | Effect when off / on                                                                 |
+| ---------------------- | ------- | ------------------------------------------------------------------------------------ |
+| `GLOBAL_WRITE_ENABLED` | `false` | off: no planned write or business action. Effective value = environment AND runtime. |
+| `WRITE_TO_SANKHYA`     | `false` | off: no write to Sankhya tables (scratch writes still run).                          |
+| `SAFE_MODE`            | `true`  | on: no write to a connection whose environment is `PRODUCTION`.                      |
 
 `GLOBAL_WRITE_ENABLED` has a runtime half stored in the database, changed by an administrator with
 `ADMIN.SECURITY` on the **Segurança** page or `PUT /api/admin/security` (`security.update` audit
@@ -189,9 +193,9 @@ On **Auditoria**, a user with `AUDIT.READ` can ask for a rollback plan of an exe
 (`POST /api/audit/:id/rollback-plan`). It is offered only for a fully `VERIFIED` `UPDATE` of a
 Sankhya table whose snapshots are complete. It is refused when snapshots were disabled
 (`auditSnapshots` false), redacted or clipped, or when a value cannot be written back exactly.
-The server builds `UPDATE` statements that restore the previous values, flags rows that no longer
-exist, and prepares the first statement as a normal plan under the caller's own permissions and
-policy (`rollback.planned` audit event). It is labelled "assisted rollback — requires new preview
+The server builds `UPDATE` statements that restore the previous values and prepares the first statement as a normal plan under the caller's own permissions and
+policy (`rollback.planned` audit event). Conflicts (rows that changed or no longer exist) are
+checked only for that prepared first statement. It is labelled "assisted rollback — requires new preview
 and confirmation": nothing is reverted until that plan is confirmed and executed like any other
 write.
 
