@@ -32,6 +32,7 @@ import { connectionRoutes } from './routes/connections';
 import { dataRoutes } from './routes/data';
 import { queryRoutes } from './routes/query';
 import { scratchRoutes } from './routes/scratch';
+import { ddlRoutes } from './routes/ddl';
 import { systemRoutes } from './routes/system';
 
 export interface BuildAppOptions {
@@ -191,6 +192,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   await app.register(approvalRoutes);
   await app.register(auditRoutes);
   await app.register(scratchRoutes);
+  await app.register(ddlRoutes);
 
   const staticDir = config.staticDir ? resolve(config.staticDir) : undefined;
   if (staticDir && existsSync(staticDir)) {
