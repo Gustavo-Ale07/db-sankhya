@@ -4,6 +4,9 @@ import {
   PREVIEW_KIND_LABEL,
   confirmationMatches,
   isPreviewPointer,
+  isApprovalPending,
+  outcomeOf,
+  previewLabelText,
   previewLabelsOf,
   remainingSeconds,
   formatCountdown,
@@ -30,13 +33,13 @@ describe('preview labels', () => {
     ]);
   });
 
-  it('drops a label the client does not know instead of inventing a text', () => {
-    expect(
-      previewLabelsOf({
-        previewKind: 'SIMULATED_PREVIEW',
-        previewLabels: ['SIMULATED_PREVIEW', 'SOMETHING_NEW' as never],
-      }),
-    ).toEqual(['SIMULATED_PREVIEW']);
+  it('keeps a label the client does not know as its raw code', () => {
+    const labels = previewLabelsOf({
+      previewKind: 'SIMULATED_PREVIEW',
+      previewLabels: ['SIMULATED_PREVIEW', 'SOMETHING_NEW' as never],
+    });
+    expect(labels).toEqual(['SIMULATED_PREVIEW', 'SOMETHING_NEW']);
+    expect(labels.map(previewLabelText)).toEqual(['PRÉVIA SIMULADA', 'SOMETHING_NEW']);
   });
 });
 
@@ -95,5 +98,63 @@ describe('server classification', () => {
       ),
     ).toBe(false);
     expect(isPreviewPointer(new Error('x'))).toBe(false);
+  });
+});
+
+describe('execute outcome', () => {
+  const report = (outcome: 'ok' | 'unknown' | 'error') => ({
+    type: 'execution' as const,
+    planId: 'p',
+    status: 'failed' as const,
+    verification: 'UNVERIFIED' as const,
+    steps: [{ key: { A: 1 }, outcome }],
+  });
+  const err = (status: number, code: string) => new ApiError(status, { code, message: 'x' });
+
+  it('a report is known unless a step outcome is unknown', () => {
+    expect(outcomeOf({ report: report('ok') }).unknown).toBe(false);
+    expect(outcomeOf({ report: report('error') }).unknown).toBe(false);
+    expect(outcomeOf({ report: report('unknown') }).unknown).toBe(true);
+  });
+
+  it.each([
+    [502, 'WRITE_OUTCOME_UNKNOWN'],
+    [0, 'NETWORK_ERROR'],
+    [500, 'INTERNAL_ERROR'],
+    [504, 'HTTP_ERROR'],
+    [409, 'CONFLICT'],
+  ])('%s %s is an unknown outcome', (status, code) => {
+    expect(outcomeOf({ error: err(status, code) })).toEqual({
+      sent: true,
+      unknown: true,
+      errorCode: code,
+    });
+  });
+
+  it.each([
+    [403, 'READ_ONLY_MODE'],
+    [403, 'FORBIDDEN'],
+    [409, 'TARGETS_CHANGED'],
+    [410, 'CONFIRMATION_EXPIRED'],
+    [409, 'CONFIRMATION_USED'],
+  ])('%s %s is a definite refusal', (status, code) => {
+    expect(outcomeOf({ error: err(status, code) }).unknown).toBe(false);
+  });
+
+  it('anything that is not an API answer is unknown', () => {
+    expect(outcomeOf({ error: new Error('boom') }).unknown).toBe(true);
+  });
+
+  it('recognizes the pending-approval refusal', () => {
+    expect(
+      isApprovalPending(
+        new ApiError(403, {
+          code: 'FORBIDDEN',
+          message: 'x',
+          details: { reason: 'approval_pending' },
+        }),
+      ),
+    ).toBe(true);
+    expect(isApprovalPending(err(403, 'FORBIDDEN'))).toBe(false);
   });
 });

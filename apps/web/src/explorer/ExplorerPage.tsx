@@ -64,6 +64,9 @@ export function ExplorerPage({
   } | null>(null);
   const editorApi = useRef<EditorApi | null>(null);
   const aborts = useRef<Record<string, AbortController>>({});
+  // Tabs whose mutation preview is being prepared: a second run (Ctrl+Enter, F5) is ignored
+  // until it answers, so two plans never race for the same dialog.
+  const previewing = useRef(new Set<string>());
   const splitRef = useRef<HTMLDivElement>(null);
 
   const schema = useQuery({
@@ -98,6 +101,7 @@ export function ExplorerPage({
       if (!sql) return;
       // Never run against an environment the banner is not showing.
       if (!connectionId) return;
+      if (previewing.current.has(tabId)) return;
       aborts.current[tabId]?.abort();
       const controller = new AbortController();
       aborts.current[tabId] = controller;
@@ -124,12 +128,20 @@ export function ExplorerPage({
           // executes, so Ctrl+Enter can never write.
           setRun(tabId, { status: 'previewing', sql });
           setResultTab((m) => ({ ...m, [tabId]: 'results' }));
+          previewing.current.add(tabId);
           try {
-            const preview = await previewMutation(sql, connectionId);
-            setRun(tabId, { status: 'mutation', sql, planId: preview.planId });
-            setMutation({ tabId, sql, preview });
+            const preview = await previewMutation(sql, connectionId, controller.signal);
+            // A late answer (tab closed, run superseded) never opens a dialog.
+            if (aborts.current[tabId] === controller && !controller.signal.aborted) {
+              setRun(tabId, { status: 'mutation', sql, planId: preview.planId });
+              setMutation({ tabId, sql, preview });
+            }
           } catch (previewErr) {
-            setRun(tabId, { status: 'error', sql, error: previewErr });
+            if (aborts.current[tabId] === controller) {
+              setRun(tabId, { status: 'error', sql, error: previewErr });
+            }
+          } finally {
+            previewing.current.delete(tabId);
           }
         } else {
           setRun(tabId, { status: 'error', sql, error: err });
@@ -426,12 +438,12 @@ export function ExplorerPage({
           preview={mutation.preview}
           sql={mutation.sql}
           onClose={() => setMutation(null)}
-          onExecuted={(report) =>
+          onOutcome={(outcome) =>
             setRun(mutation.tabId, {
               status: 'mutation',
               sql: mutation.sql,
               planId: mutation.preview.planId,
-              report,
+              outcome,
             })
           }
         />

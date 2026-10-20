@@ -58,8 +58,8 @@ export interface ExecuteInput {
   strongConfirmation?: string;
 }
 
-export const previewMutation = (sql: string, connectionId: string) =>
-  api.post<MutationPreview>('/api/query/preview', { sql, connectionId });
+export const previewMutation = (sql: string, connectionId: string, signal?: AbortSignal) =>
+  api.post<MutationPreview>('/api/query/preview', { sql, connectionId }, signal ? { signal } : {});
 
 export const executePlan = (input: ExecuteInput) =>
   api.post<ExecutionReport>('/api/query/execute', input);

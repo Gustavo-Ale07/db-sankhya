@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import type { Page } from '@playwright/test';
+import type { BrowserContext, Page } from '@playwright/test';
 import { BOOTSTRAP } from '../playwright.config';
 
 // Same value explorer.spec.ts sets when it changes the bootstrap password (that file runs
@@ -40,9 +40,16 @@ async function setSql(page: Page, sql: string) {
 /**
  * Writes are default-deny by policy: without an ALLOW rule the preview itself is FORBIDDEN. The
  * rule only lets the plan be previewed; the write switches (SAFE_MODE, GLOBAL_WRITE_ENABLED)
- * still refuse the execute.
+ * still refuse the execute. It is created once for this file on its own session and removed
+ * afterwards; a failed removal is reported but never hides the test's own result.
  */
-async function allowUpdate(page: Page): Promise<() => Promise<void>> {
+let admin: BrowserContext | undefined;
+let policyId: string | undefined;
+
+test.beforeAll(async ({ browser }, testInfo) => {
+  admin = await browser.newContext({ baseURL: testInfo.project.use.baseURL });
+  const page = await admin.newPage();
+  await login(page);
   const origin = new URL(page.url()).origin;
   const res = await page.request.post('/api/admin/policies', {
     headers: { origin },
@@ -62,23 +69,30 @@ async function allowUpdate(page: Page): Promise<() => Promise<void>> {
     },
   });
   expect(res.status(), await res.text()).toBe(201);
-  const { item } = (await res.json()) as { item: { id: string } };
-  return async () => {
-    const del = await page.request.delete(`/api/admin/policies/${item.id}`, {
-      headers: { origin },
-    });
-    expect(del.ok()).toBe(true);
-  };
-}
+  policyId = ((await res.json()) as { item: { id: string } }).item.id;
+});
+
+test.afterAll(async () => {
+  if (!admin) return;
+  try {
+    if (policyId) {
+      const page = admin.pages()[0];
+      const origin = page ? new URL(page.url()).origin : undefined;
+      const del = await admin.request.delete(`/api/admin/policies/${policyId}`, {
+        headers: origin ? { origin } : {},
+      });
+      if (!del.ok()) console.warn(`E2E policy ${policyId} not removed: HTTP ${del.status()}`);
+    }
+  } catch (err) {
+    console.warn(`E2E policy ${policyId ?? '?'} not removed:`, err);
+  } finally {
+    await admin.close().catch(() => {});
+  }
+});
 
 test('ctrl+enter on UPDATE opens preview and does not write', async ({ page }) => {
   await login(page);
-  const removePolicy = await allowUpdate(page);
-  try {
-    await previewAndRefuse(page);
-  } finally {
-    await removePolicy();
-  }
+  await previewAndRefuse(page);
 });
 
 async function previewAndRefuse(page: Page) {
@@ -98,7 +112,19 @@ async function previewAndRefuse(page: Page) {
   await expect(dialog.getByTestId('mutation-labels')).toContainText('PRÉVIA SIMULADA');
   await expect(dialog.getByTestId('capability-badge')).toBeVisible();
   await expect(dialog.getByTestId('impact-environment')).toHaveText('PRODUCTION');
-  await expect(dialog.getByTestId('mutation-diff')).toContainText(NEW_NAME);
+  const diff = dialog.getByTestId('mutation-diff');
+  await expect(diff).toContainText(NEW_NAME);
+  // Column order: Chave, Coluna, Antes, Depois.
+  const before = (
+    (await diff
+      .locator('tbody tr')
+      .filter({ hasText: 'NOMEPARC' })
+      .locator('td')
+      .nth(2)
+      .textContent()) ?? ''
+  ).trim();
+  expect(before).not.toBe('');
+  expect(before).not.toBe(NEW_NAME);
   expect(calls).toEqual(['/api/query', '/api/query/preview']);
 
   // PRODUCTION needs the typed phrase; execute stays disabled until it matches exactly.
@@ -128,4 +154,5 @@ async function previewAndRefuse(page: Page) {
   const grid = page.getByTestId('result-grid');
   await expect(grid).toContainText('NOMEPARC');
   await expect(grid).not.toContainText(NEW_NAME);
+  await expect(grid).toContainText(before);
 }

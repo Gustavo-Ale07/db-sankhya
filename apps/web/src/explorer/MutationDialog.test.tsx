@@ -134,20 +134,22 @@ describe('MutationDialog', () => {
 
   it('never calls execute on open; only the explicit click does, with the typed phrase', async () => {
     vi.mocked(executePlan).mockResolvedValue(report());
-    const onExecuted = vi.fn();
+    const onOutcome = vi.fn();
     render(
       <MutationDialog
         preview={preview()}
         sql="x"
         onClose={() => {}}
-        onExecuted={onExecuted}
+        onOutcome={onOutcome}
         newKey={() => 'key-1'}
       />,
     );
     expect(executePlan).not.toHaveBeenCalled();
     type(PHRASE);
     fireEvent.click(execButton());
-    await waitFor(() => expect(onExecuted).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(onOutcome).toHaveBeenCalledWith({ sent: true, unknown: false, report: report() }),
+    );
     expect(executePlan).toHaveBeenCalledWith({
       planId: '00000000-0000-4000-8000-000000000001',
       token: 'plan-token-secret',
@@ -176,7 +178,10 @@ describe('MutationDialog', () => {
     expect(execButton().disabled).toBe(true);
     await act(async () => fail(new ApiError(0, { code: 'NETWORK_ERROR', message: 'x' })));
     expect(screen.getByTestId('mutation-error').textContent).toContain('NETWORK_ERROR');
+    // A lost answer is an unknown outcome: warn, and only offer the same-key replay.
+    expect(screen.getByTestId('outcome-unknown').textContent).toContain('mesma chave');
     expect(execButton().disabled).toBe(false);
+    expect(execButton().textContent).toBe('Consultar resultado');
     fireEvent.click(execButton());
     await screen.findByTestId('execution-report');
     expect(executePlan).toHaveBeenCalledTimes(2);
@@ -220,16 +225,23 @@ describe('MutationDialog', () => {
     vi.mocked(executePlan).mockRejectedValue(
       new ApiError(502, { code: 'WRITE_OUTCOME_UNKNOWN', message: 'do not repeat' }),
     );
+    const onOutcome = vi.fn();
     render(
       <MutationDialog
         preview={preview({ requires: { strongConfirmation: null, approval: false } })}
         sql="x"
         onClose={() => {}}
+        onOutcome={onOutcome}
       />,
     );
     fireEvent.click(execButton());
     expect((await screen.findByTestId('outcome-unknown')).textContent).toContain('NÃO repita');
     expect(execButton().disabled).toBe(true);
+    expect(onOutcome).toHaveBeenCalledWith({
+      sent: true,
+      unknown: true,
+      errorCode: 'WRITE_OUTCOME_UNKNOWN',
+    });
   });
 
   it('shows a step with an unknown outcome in the report as do-not-repeat', async () => {
@@ -251,6 +263,86 @@ describe('MutationDialog', () => {
     await screen.findByTestId('execution-report');
     expect(screen.getByTestId('outcome-unknown')).toBeTruthy();
     expect(screen.getByTestId('verification-status').textContent).toBe('UNVERIFIED');
+  });
+
+  it('reports a definite refusal as a known outcome', async () => {
+    vi.mocked(executePlan).mockRejectedValue(
+      new ApiError(403, { code: 'READ_ONLY_MODE', message: 'x' }),
+    );
+    const onOutcome = vi.fn();
+    render(
+      <MutationDialog
+        preview={preview({ requires: { strongConfirmation: null, approval: false } })}
+        sql="x"
+        onClose={() => {}}
+        onOutcome={onOutcome}
+      />,
+    );
+    fireEvent.click(execButton());
+    await screen.findByTestId('mutation-error');
+    expect(onOutcome).toHaveBeenCalledWith({
+      sent: true,
+      unknown: false,
+      errorCode: 'READ_ONLY_MODE',
+    });
+    expect(screen.queryByTestId('outcome-unknown')).toBeNull();
+  });
+
+  it('shows "aguardando aprovação" instead of a permission refusal while approval is pending', async () => {
+    vi.mocked(executePlan).mockRejectedValue(
+      new ApiError(403, {
+        code: 'FORBIDDEN',
+        message: 'x',
+        details: { reason: 'approval_pending' },
+      }),
+    );
+    render(
+      <MutationDialog
+        preview={preview({ requires: { strongConfirmation: null, approval: true } })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    fireEvent.click(execButton());
+    const pending = await screen.findByTestId('approval-pending');
+    expect(pending.textContent).toContain('Aguardando aprovação');
+    expect(pending.textContent).toContain('[FORBIDDEN]');
+    expect(screen.queryByTestId('mutation-error')).toBeNull();
+    // The plan was not consumed: executing again after the approval stays possible.
+    expect(execButton().disabled).toBe(false);
+  });
+
+  it('shows a deleted row as removed, not as NULL values', () => {
+    render(
+      <MutationDialog
+        preview={preview({
+          preview: {
+            affected: 1,
+            targets: [
+              { key: { CODPARC: 1 }, before: { CODPARC: 1, NOMEPARC: 'Antigo' }, after: {} },
+            ],
+          },
+        })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    const diff = screen.getByTestId('mutation-diff').textContent ?? '';
+    expect(diff).toContain('Antigo');
+    expect(diff).toContain('(registro removido)');
+    expect(diff).not.toContain('∅');
+  });
+
+  it('shows an unknown preview label as its raw code', () => {
+    render(
+      <MutationDialog
+        preview={preview({ previewLabels: ['IMPACT_ANALYSIS', 'NEW_KIND' as never] })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    const labels = screen.getAllByTestId('preview-label').map((l) => l.textContent);
+    expect(labels).toEqual(['ANÁLISE DE IMPACTO', 'NEW_KIND']);
   });
 
   it.each([
@@ -283,8 +375,12 @@ describe('MutationDialog', () => {
       />,
     );
     expect(screen.getByTestId('approval-required').textContent).toContain('exige aprovação');
-    fireEvent.click(screen.getByRole('button', { name: 'Solicitar aprovação' }));
+    const ask = screen.getByRole('button', { name: 'Solicitar aprovação' });
+    // Two clicks in the same tick send one request.
+    fireEvent.click(ask);
+    fireEvent.click(ask);
     expect(await screen.findByTestId('approval-requested')).toBeTruthy();
+    expect(requestApproval).toHaveBeenCalledTimes(1);
     expect(requestApproval).toHaveBeenCalledWith('00000000-0000-4000-8000-000000000001');
     expect(executePlan).not.toHaveBeenCalled();
   });
@@ -308,5 +404,23 @@ describe('MutationDialog', () => {
     await act(async () => finish(report()));
     fireEvent.keyDown(dialog, { key: 'Escape' });
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps Tab inside the dialog when focus sits on the dialog container', () => {
+    render(
+      <MutationDialog
+        preview={preview({ requires: { strongConfirmation: null, approval: false } })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    const dialog = screen.getByRole('dialog');
+    const items = [...dialog.querySelectorAll<HTMLElement>('button:not([disabled])')];
+    dialog.focus();
+    fireEvent.keyDown(dialog, { key: 'Tab', shiftKey: true });
+    expect(document.activeElement).toBe(items[items.length - 1]);
+    dialog.focus();
+    fireEvent.keyDown(dialog, { key: 'Tab' });
+    expect(document.activeElement).toBe(items[0]);
   });
 });

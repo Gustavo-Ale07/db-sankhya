@@ -13,12 +13,16 @@ import type {
 } from '../api/mutations';
 import type { Value } from '../api/types';
 import {
-  PREVIEW_KIND_LABEL,
+  REPORT_STATUS_TEXT,
   confirmationMatches,
   formatCountdown,
+  isApprovalPending,
+  outcomeOf,
+  previewLabelText,
   previewLabelsOf,
   remainingSeconds,
 } from './runState';
+import type { MutationOutcome } from './runState';
 
 const VERIFICATION_TEXT: Record<VerificationLabel, string> = {
   VERIFIED: 'Todas as alterações foram lidas de volta e conferem.',
@@ -32,12 +36,6 @@ const VERIFICATION_TONE: Record<VerificationLabel, string> = {
   PARTIALLY_VERIFIED: 'border-warn/60 text-warn',
   UNVERIFIED: 'border-warn/60 text-warn',
   FAILED: 'border-danger/60 text-danger',
-};
-
-const STATUS_TEXT: Record<ExecutionReport['status'], string> = {
-  success: 'concluída',
-  partial: 'parcial',
-  failed: 'falhou',
 };
 
 const OUTCOME_TEXT: Record<StepOutcome, string> = {
@@ -90,10 +88,13 @@ function Diff({ targets }: { targets: PreviewTarget[] }) {
         </thead>
         <tbody>
           {targets.flatMap((t, i) => {
+            // A DELETE target has a `before` and an empty `after`: the row goes away, which is
+            // not the same as its columns becoming NULL.
+            const removed = t.before !== null && Object.keys(t.after).length === 0;
             const cols = [...new Set([...Object.keys(t.before ?? {}), ...Object.keys(t.after)])];
-            const changed = cols.filter(
-              (c) => t.before === null || show(t.before[c]) !== show(t.after[c]),
-            );
+            const changed = removed
+              ? cols
+              : cols.filter((c) => t.before === null || show(t.before[c]) !== show(t.after[c]));
             const rows = changed.length > 0 ? changed : cols.slice(0, 1);
             return rows.map((c, j) => (
               <tr key={`${i}-${c}`} className="border-t border-line align-top">
@@ -102,7 +103,9 @@ function Diff({ targets }: { targets: PreviewTarget[] }) {
                 <td className="px-2 py-1 font-mono text-danger">
                   {t.before === null ? '(novo registro)' : show(t.before[c] as Value)}
                 </td>
-                <td className="px-2 py-1 font-mono text-ok">{show(t.after[c] as Value)}</td>
+                <td className="px-2 py-1 font-mono text-ok">
+                  {removed ? '(registro removido)' : show(t.after[c] as Value)}
+                </td>
               </tr>
             ));
           })}
@@ -117,7 +120,7 @@ function Report({ report }: { report: ExecutionReport }) {
   return (
     <div className="space-y-2" data-testid="execution-report">
       <div className="flex flex-wrap items-center gap-2">
-        <span className="font-semibold">Execução {STATUS_TEXT[report.status]}</span>
+        <span className="font-semibold">Execução {REPORT_STATUS_TEXT[report.status]}</span>
         <span
           className={`badge font-semibold ${VERIFICATION_TONE[report.verification]}`}
           data-testid="verification-status"
@@ -156,7 +159,7 @@ function Report({ report }: { report: ExecutionReport }) {
   );
 }
 
-function UnknownWarning() {
+function UnknownWarning({ canReplay = false }: { canReplay?: boolean }) {
   return (
     <div
       role="alert"
@@ -165,6 +168,30 @@ function UnknownWarning() {
     >
       NÃO repita esta operação. A alteração pode ter sido gravada, mas o resultado não pôde ser
       confirmado. Confira os registros no Sankhya antes de qualquer nova tentativa.
+      {canReplay && (
+        <span className="mt-1 block font-normal">
+          &quot;Consultar resultado&quot; reenvia este mesmo plano com a mesma chave de
+          idempotência: o servidor devolve o resultado já registrado e não grava uma segunda vez.
+        </span>
+      )}
+    </div>
+  );
+}
+
+function ApprovalPending({ error }: { error: unknown }) {
+  const code = error instanceof ApiError ? error.code : 'FORBIDDEN';
+  return (
+    <div
+      role="status"
+      className="rounded border border-warn/60 bg-warn/10 px-3 py-2 text-warn"
+      data-testid="approval-pending"
+    >
+      <div className="font-semibold">
+        Aguardando aprovação <span className="font-mono text-xs opacity-80">[{code}]</span>
+      </div>
+      <div className="mt-0.5 text-xs text-fg/80">
+        Nada foi gravado. Execute de novo depois que um aprovador aprovar este plano.
+      </div>
     </div>
   );
 }
@@ -189,7 +216,11 @@ interface Props {
   preview: MutationPreview;
   sql: string;
   onClose: () => void;
-  onExecuted?: (report: ExecutionReport) => void;
+  /**
+   * Called after every execute that reached the network: with the report, or with an error
+   * whose outcome may be unknown (so the page can keep warning after the dialog closes).
+   */
+  onOutcome?: (outcome: MutationOutcome) => void;
   /** Idempotency key factory; one key per dialog (per plan), reused by every retry. */
   newKey?: () => string;
 }
@@ -199,13 +230,14 @@ interface Props {
  * explicit "Executar" click calls /api/query/execute. The plan token stays in this component's
  * memory and is never stored or logged.
  */
-export function MutationDialog({ preview, sql, onClose, onExecuted, newKey }: Props) {
+export function MutationDialog({ preview, sql, onClose, onOutcome, newKey }: Props) {
   const titleId = useId();
   const confirmId = useId();
   const ref = useRef<HTMLDivElement>(null);
   // One key per plan: a double click or a retry after a lost answer never executes twice.
   const [idempotencyKey] = useState(() => (newKey ?? (() => crypto.randomUUID()))());
   const inFlight = useRef(false);
+  const approvalInFlight = useRef(false);
   const [busy, setBusy] = useState(false);
   const [typed, setTyped] = useState('');
   const [error, setError] = useState<unknown>(null);
@@ -213,13 +245,16 @@ export function MutationDialog({ preview, sql, onClose, onExecuted, newKey }: Pr
   const [approval, setApproval] = useState<'none' | 'requesting' | 'requested'>('none');
   const [approvalError, setApprovalError] = useState<unknown>(null);
   const [now, setNow] = useState(() => Date.now());
+  // Sticky: once any execute answer left the outcome unknown, the warning never goes away.
+  const [unknownSeen, setUnknownSeen] = useState(false);
 
   const remaining = remainingSeconds(preview.expiresAt, now);
   const expired = remaining <= 0;
   const phrase = preview.requires.strongConfirmation;
   const matches = confirmationMatches(typed, phrase);
   const errorCode = error instanceof ApiError ? error.code : null;
-  const outcomeUnknown = errorCode === 'WRITE_OUTCOME_UNKNOWN';
+  const outcomeUnknown = unknownSeen;
+  const approvalPending = isApprovalPending(error);
   const planDead = errorCode !== null && PLAN_DEAD.has(errorCode);
   const canExecute = !busy && !expired && matches && report === null && !planDead;
 
@@ -262,13 +297,19 @@ export function MutationDialog({ preview, sql, onClose, onExecuted, newKey }: Pr
   function onKeyDown(e: ReactKeyboardEvent<HTMLDivElement>) {
     if (e.key !== 'Tab' || !ref.current) return;
     const items = [...ref.current.querySelectorAll<HTMLElement>(FOCUSABLE)];
-    if (items.length === 0) return;
+    if (items.length === 0) {
+      e.preventDefault();
+      return;
+    }
     const first = items[0]!;
     const last = items[items.length - 1]!;
-    if (e.shiftKey && document.activeElement === first) {
+    const active = document.activeElement as HTMLElement | null;
+    // Focus on the container itself (or anything not tabbable) wraps too, so Tab never leaves.
+    const outside = !active || !items.includes(active);
+    if (e.shiftKey && (outside || active === first)) {
       e.preventDefault();
       last.focus();
-    } else if (!e.shiftKey && document.activeElement === last) {
+    } else if (!e.shiftKey && (outside || active === last)) {
       e.preventDefault();
       first.focus();
     }
@@ -287,9 +328,14 @@ export function MutationDialog({ preview, sql, onClose, onExecuted, newKey }: Pr
         ...(phrase !== null ? { strongConfirmation: typed } : {}),
       });
       setReport(res);
-      onExecuted?.(res);
+      const outcome = outcomeOf({ report: res });
+      if (outcome.unknown) setUnknownSeen(true);
+      onOutcome?.(outcome);
     } catch (err) {
       setError(err);
+      const outcome = outcomeOf({ error: err });
+      if (outcome.unknown) setUnknownSeen(true);
+      onOutcome?.(outcome);
     } finally {
       inFlight.current = false;
       setBusy(false);
@@ -297,7 +343,8 @@ export function MutationDialog({ preview, sql, onClose, onExecuted, newKey }: Pr
   }
 
   async function askApproval() {
-    if (approval !== 'none') return;
+    if (approvalInFlight.current || approval !== 'none') return;
+    approvalInFlight.current = true;
     setApproval('requesting');
     setApprovalError(null);
     try {
@@ -306,6 +353,8 @@ export function MutationDialog({ preview, sql, onClose, onExecuted, newKey }: Pr
     } catch (err) {
       setApprovalError(err);
       setApproval('none');
+    } finally {
+      approvalInFlight.current = false;
     }
   }
 
@@ -354,7 +403,7 @@ export function MutationDialog({ preview, sql, onClose, onExecuted, newKey }: Pr
                 title={k}
                 data-testid="preview-label"
               >
-                {PREVIEW_KIND_LABEL[k]}
+                {previewLabelText(k)}
               </span>
             ))}
           </div>
@@ -440,8 +489,9 @@ export function MutationDialog({ preview, sql, onClose, onExecuted, newKey }: Pr
             </div>
           )}
 
-          {outcomeUnknown && <UnknownWarning />}
-          {error !== null && <Refusal error={error} />}
+          {outcomeUnknown && report === null && <UnknownWarning canReplay={!planDead} />}
+          {error !== null &&
+            (approvalPending ? <ApprovalPending error={error} /> : <Refusal error={error} />)}
           {planDead && !outcomeUnknown && (
             <p className="text-muted">Este plano não pode mais ser executado.</p>
           )}
@@ -461,7 +511,7 @@ export function MutationDialog({ preview, sql, onClose, onExecuted, newKey }: Pr
               aria-busy={busy}
               data-testid="mutation-execute"
             >
-              {busy ? 'Executando…' : 'Executar'}
+              {busy ? 'Executando…' : outcomeUnknown ? 'Consultar resultado' : 'Executar'}
             </button>
           )}
         </div>

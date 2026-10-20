@@ -10,7 +10,8 @@ import {
   toTsv,
 } from '../lib/format';
 import { ResultGrid } from './ResultGrid';
-import type { RunState } from './runState';
+import { REPORT_STATUS_TEXT } from './runState';
+import type { MutationOutcome, RunState } from './runState';
 
 export type ResultTab = 'results' | 'json' | 'messages';
 
@@ -33,6 +34,49 @@ function Elapsed({ since }: { since: number }) {
     return () => clearInterval(t);
   }, []);
   return <>{formatDuration(now - since)}</>;
+}
+
+/**
+ * What the results area says about a mutation plan, also after its dialog closed. Once an execute
+ * was sent it never claims that nothing was written; an unknown outcome keeps a do-not-repeat
+ * banner until the tab runs something else.
+ */
+export function MutationStatus({ outcome }: { outcome?: MutationOutcome }) {
+  if (!outcome) {
+    return (
+      <p>
+        Instrução de alteração: revise a prévia. Nada é gravado sem a confirmação explícita no
+        diálogo.
+      </p>
+    );
+  }
+  return (
+    <div className="space-y-2">
+      {outcome.unknown && (
+        <div
+          role="alert"
+          className="rounded border border-danger bg-danger/10 px-3 py-2 font-semibold text-danger"
+          data-testid="mutation-outcome-unknown"
+        >
+          NÃO repita esta alteração. Ela pode ter sido gravada, mas o resultado não foi confirmado
+          {outcome.errorCode ? ` [${outcome.errorCode}]` : ''}. Confira os registros no Sankhya
+          antes de qualquer nova tentativa.
+        </div>
+      )}
+      {outcome.report ? (
+        <p>
+          Alteração executada ({REPORT_STATUS_TEXT[outcome.report.status]}). Verificação:{' '}
+          <strong>{outcome.report.verification}</strong>.
+        </p>
+      ) : outcome.unknown ? null : (
+        <p>
+          Execução recusada pelo servidor
+          {outcome.errorCode ? <span className="font-mono"> [{outcome.errorCode}]</span> : null}.
+          Nada foi gravado.
+        </p>
+      )}
+    </div>
+  );
 }
 
 export function ResultsPanel({ run, tab, onTab }: Props) {
@@ -131,17 +175,7 @@ export function ResultsPanel({ run, tab, onTab }: Props) {
             )}
             {run.status === 'mutation' && (
               <div className="p-3 text-xs" role="status" data-testid="mutation-status">
-                {run.report ? (
-                  <>
-                    Alteração executada ({run.report.status}). Verificação:{' '}
-                    <strong>{run.report.verification}</strong>.
-                  </>
-                ) : (
-                  <>
-                    Instrução de alteração: revise a prévia. Nada é gravado sem a confirmação
-                    explícita no diálogo.
-                  </>
-                )}
+                <MutationStatus {...(run.outcome ? { outcome: run.outcome } : {})} />
               </div>
             )}
             {result && (
