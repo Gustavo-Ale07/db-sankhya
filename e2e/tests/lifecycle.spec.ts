@@ -43,7 +43,7 @@ const nameOf = async (codparc: number, connectionId?: string) =>
 
 test.beforeAll(async ({ browser }) => {
   admin = await adminContext(browser);
-  fixtures = new Fixtures(admin.request);
+  fixtures = new Fixtures(admin.request, browser);
   sandboxId = await fixtures.connection(`E2E Sandbox ${STAMP}`, 'SANDBOX');
   // Writes are default-deny: one rule lets UPDATE on TGFPAR be planned anywhere. It is created
   // before any preview, since a plan is bound to the policy version it was made under.

@@ -36,6 +36,18 @@ export const SPECIALIST = {
   },
 };
 
+/**
+ * An administrator created by start-server.mjs with the ADMIN role only. The bootstrap admin
+ * also holds OPERATOR, and separation of duties refuses policy changes by anyone who can write.
+ */
+export const POLICY_ADMIN = {
+  email: 'politicas@example.com',
+  name: 'Admin Políticas',
+  get password(): string {
+    return readFileSync(join(E2E_DIR, 'policy-admin-password.txt'), 'utf8').trim();
+  },
+};
+
 export default defineConfig({
   testDir: './tests',
   fullyParallel: false,
@@ -73,7 +85,7 @@ export default defineConfig({
       BOOTSTRAP_ADMIN_EMAIL: BOOTSTRAP.email,
       BOOTSTRAP_ADMIN_NAME: 'Admin Demo',
       // OPERATOR is kept on purpose: the refusal test proves writes are denied even for a
-      // write-capable role.
+      // write-capable role, and the policies page shows separation of duties refusing this user.
       BOOTSTRAP_ADMIN_ROLES: 'ADMIN,OPERATOR',
       // Reads go to the default SANKHYA_* connection, served by the in-process mock gateway.
       SANKHYA_MODE: 'mock',

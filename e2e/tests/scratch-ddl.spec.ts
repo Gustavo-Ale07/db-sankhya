@@ -40,7 +40,7 @@ let page: Page;
 
 test.beforeAll(async ({ browser }) => {
   admin = await adminContext(browser);
-  fixtures = new Fixtures(admin.request);
+  fixtures = new Fixtures(admin.request, browser);
   specialist = await specialistContext(browser);
   page = await openApp(specialist, SPECIALIST.name);
 });

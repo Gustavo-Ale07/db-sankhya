@@ -12,7 +12,7 @@ import type {
   BrowserContext,
   Page,
 } from '@playwright/test';
-import { BASE_URL, BOOTSTRAP, E2E_DIR, SPECIALIST } from '../playwright.config';
+import { BASE_URL, BOOTSTRAP, E2E_DIR, POLICY_ADMIN, SPECIALIST } from '../playwright.config';
 
 /**
  * Partner rows (TGFPAR.CODPARC) each file writes or refuses to write. All mock connections share
@@ -177,6 +177,21 @@ export function specialistContext(browser: Browser): Promise<BrowserContext> {
   );
 }
 
+/** Changed password of the policy administrator (seeded by start-server.mjs). */
+export const POLICY_ADMIN_PASSWORD = 'Politicas#Demo2026';
+
+/** The ADMIN-only administrator: separation of duties lets only it change policies. */
+export function policyAdminContext(browser: Browser): Promise<BrowserContext> {
+  return sessionContext(browser, POLICY_ADMIN.email, (ctx) =>
+    apiLogin(
+      ctx,
+      POLICY_ADMIN.email,
+      [POLICY_ADMIN.password, POLICY_ADMIN_PASSWORD],
+      POLICY_ADMIN_PASSWORD,
+    ),
+  );
+}
+
 /** A user created by the admin, logged in on a fresh context (the first password is replaced). */
 export function userContext(
   browser: Browser,
@@ -190,12 +205,23 @@ export function userContext(
 /** Records the fixtures a file creates and removes them in reverse order. */
 export class Fixtures {
   private readonly undo: { label: string; run: () => Promise<APIResponse> }[] = [];
+  private policyAdmin: BrowserContext | undefined;
 
-  constructor(private readonly admin: APIRequestContext) {}
+  /**
+   * `admin` creates connections, roles and users. Policies go through the ADMIN-only policy
+   * administrator, opened on `browser` when first needed: the bootstrap admin also holds
+   * OPERATOR, and separation of duties refuses its policy changes.
+   */
+  constructor(
+    private readonly admin: APIRequestContext,
+    private readonly browser: Browser,
+  ) {}
 
   async policy(body: Record<string, unknown>): Promise<string> {
+    this.policyAdmin ??= await policyAdminContext(this.browser);
+    const policies = this.policyAdmin.request;
     const { item } = await ok<{ item: { id: string } }>(
-      this.admin,
+      policies,
       'POST',
       '/api/admin/policies',
       {
@@ -214,7 +240,7 @@ export class Fixtures {
     );
     this.undo.push({
       label: `policy ${item.id}`,
-      run: () => call(this.admin, 'DELETE', `/api/admin/policies/${item.id}`),
+      run: () => call(policies, 'DELETE', `/api/admin/policies/${item.id}`),
     });
     return item.id;
   }
@@ -262,6 +288,8 @@ export class Fixtures {
       }
     }
     this.undo.length = 0;
+    await this.policyAdmin?.close().catch(() => {});
+    this.policyAdmin = undefined;
   }
 }
 

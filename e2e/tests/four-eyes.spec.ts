@@ -51,7 +51,7 @@ const currentName = async () =>
 
 test.beforeAll(async ({ browser }) => {
   admin = await adminContext(browser);
-  fixtures = new Fixtures(admin.request);
+  fixtures = new Fixtures(admin.request, browser);
   connectionId = await fixtures.connection(`E2E Quatro olhos ${STAMP}`, 'SANDBOX');
   // Only on this connection: UPDATE on TGFPAR is allowed but needs someone else's approval.
   await fixtures.policy({

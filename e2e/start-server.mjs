@@ -18,6 +18,9 @@ const e2eDir = join(tmpdir(), `dbx-e2e-${PORT}`);
 const dataDir = join(e2eDir, 'db');
 const passwordFile = join(e2eDir, 'bootstrap-password.txt');
 const specialistFile = join(e2eDir, 'specialist-password.txt');
+const policyAdminFile = join(e2eDir, 'policy-admin-password.txt');
+// Keep in sync with POLICY_ADMIN in playwright.config.ts.
+const POLICY_ADMIN_EMAIL = 'politicas@example.com';
 // Keep in sync with SPECIALIST in playwright.config.ts.
 const SPECIALIST_EMAIL = 'especialista@example.com';
 const SPECIALIST_ROLE = 'E2E_ESPECIALISTA';
@@ -102,6 +105,16 @@ writeFileSync(
       ...process.env,
       BOOTSTRAP_ADMIN_ROLES: SPECIALIST_ROLE,
     },
+  ),
+  { mode: 0o600 },
+);
+// The bootstrap administrator also holds OPERATOR, so separation of duties refuses its policy
+// changes. Policies are created by this second administrator, who holds ADMIN only.
+writeFileSync(
+  policyAdminFile,
+  bootstrapUser(
+    ['--email', POLICY_ADMIN_EMAIL, '--name', 'Admin Políticas', '--force-additional'],
+    { ...process.env, BOOTSTRAP_ADMIN_ROLES: 'ADMIN' },
   ),
   { mode: 0o600 },
 );

@@ -115,11 +115,16 @@ test('records executed queries in the history', async () => {
   await nav('Editor SQL').click();
 });
 
-test('refuses a mutation: writes are not available yet', async () => {
+test('refuses a mutation under the default policy and leaves the row unchanged', async () => {
+  // Writes are default-deny: with no ALLOW rule the preview itself is refused, so no plan exists.
   await run("UPDATE TGFPAR SET NOMEPARC = 'Teste' WHERE CODPARC = 1");
-  const alert = page.getByRole('region', { name: 'Resultados' }).getByRole('alert');
-  await expect(alert).toContainText('SQL_UNSUPPORTED');
-  await expect(alert).toContainText('Mutations are not available yet.');
+  const results = page.getByRole('region', { name: 'Resultados' });
+  await expect(results.getByRole('alert')).toContainText('FORBIDDEN');
+  await expect(page.getByRole('dialog', { name: 'Prévia da alteração' })).toHaveCount(0);
+
+  await run('SELECT NOMEPARC FROM TGFPAR WHERE CODPARC = 1');
+  await expect(page.getByTestId('result-grid')).toBeVisible();
+  await expect(page.getByTestId('result-grid')).not.toContainText('Teste');
 });
 
 test('materializes a Sankhya read into a scratch table and queries it', async () => {
@@ -209,7 +214,8 @@ test('admin pages: groups, roles, policies, connections and security', async () 
     .first();
   await expect(adminRole.getByRole('button', { name: 'Excluir' })).toBeDisabled();
 
-  // Policies: a bad rule shows the server error, a valid one bumps the version.
+  // Policies: this admin also holds OPERATOR, so separation of duties refuses the change and the
+  // server's refusal is shown; no rule is created.
   await nav('Políticas').click();
   await page.getByRole('button', { name: 'Nova política' }).click();
   const dialog = page.getByRole('dialog');
@@ -217,8 +223,9 @@ test('admin pages: groups, roles, policies, connections and security', async () 
   await dialog.getByLabel('QUERY.SELECT').check();
   await dialog.getByLabel('Máx. linhas lidas').fill('100');
   await dialog.getByRole('button', { name: 'Salvar' }).click();
-  await expect(page.getByTestId('policies-table')).toContainText('Limite de leitura');
-  await expect(page.getByTestId('policy-version')).toBeVisible();
+  await expect(dialog.getByRole('alert')).toContainText('FORBIDDEN');
+  await dialog.getByRole('button', { name: 'Cancelar' }).click();
+  await expect(page.getByTestId('policies-table')).not.toContainText('Limite de leitura');
 
   // Connections: secrets are never shown, only their state.
   await nav('Conexões').click();

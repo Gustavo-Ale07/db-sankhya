@@ -1,6 +1,7 @@
 import { expect, test } from '@playwright/test';
 import type { BrowserContext, Page } from '@playwright/test';
 import { BOOTSTRAP } from '../playwright.config';
+import { call, policyAdminContext } from './support';
 
 // Same value explorer.spec.ts sets when it changes the bootstrap password (that file runs
 // first in a full run; this one also works alone, on the one-time password).
@@ -46,27 +47,23 @@ async function setSql(page: Page, sql: string) {
 let admin: BrowserContext | undefined;
 let policyId: string | undefined;
 
-test.beforeAll(async ({ browser }, testInfo) => {
-  admin = await browser.newContext({ baseURL: testInfo.project.use.baseURL });
-  const page = await admin.newPage();
-  await login(page);
-  const origin = new URL(page.url()).origin;
-  const res = await page.request.post('/api/admin/policies', {
-    headers: { origin },
-    data: {
-      name: 'E2E prévia de UPDATE em TGFPAR',
-      effect: 'ALLOW',
-      subjectType: 'everyone',
-      subjectId: null,
-      environments: [],
-      connectionIds: [],
-      actions: ['DATA.UPDATE'],
-      entities: ['TGFPAR'],
-      columns: [],
-      limits: {},
-      overrideWhereRequired: false,
-      enabled: true,
-    },
+// Created by the ADMIN-only policy administrator: the bootstrap admin also holds OPERATOR, and
+// separation of duties refuses its policy changes.
+test.beforeAll(async ({ browser }) => {
+  admin = await policyAdminContext(browser);
+  const res = await call(admin.request, 'POST', '/api/admin/policies', {
+    name: 'E2E prévia de UPDATE em TGFPAR',
+    effect: 'ALLOW',
+    subjectType: 'everyone',
+    subjectId: null,
+    environments: [],
+    connectionIds: [],
+    actions: ['DATA.UPDATE'],
+    entities: ['TGFPAR'],
+    columns: [],
+    limits: {},
+    overrideWhereRequired: false,
+    enabled: true,
   });
   expect(res.status(), await res.text()).toBe(201);
   policyId = ((await res.json()) as { item: { id: string } }).item.id;
@@ -76,11 +73,7 @@ test.afterAll(async () => {
   if (!admin) return;
   try {
     if (policyId) {
-      const page = admin.pages()[0];
-      const origin = page ? new URL(page.url()).origin : undefined;
-      const del = await admin.request.delete(`/api/admin/policies/${policyId}`, {
-        headers: origin ? { origin } : {},
-      });
+      const del = await call(admin.request, 'DELETE', `/api/admin/policies/${policyId}`);
       if (!del.ok()) console.warn(`E2E policy ${policyId} not removed: HTTP ${del.status()}`);
     }
   } catch (err) {
