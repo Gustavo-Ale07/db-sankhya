@@ -16,6 +16,7 @@ describe('permission catalog', () => {
       'TEMP.WRITE',
       'TEMP.DROP',
       'TEMP.MATERIALIZE',
+      'DATA.PREVIEW',
       'DATA.INSERT',
       'DATA.UPDATE',
       'DATA.DELETE',
@@ -44,26 +45,35 @@ describe('permission catalog', () => {
     );
   });
 
-  it('OPERATOR is VIEWER plus insert and update, not delete', () => {
+  it('OPERATOR is VIEWER plus preview, insert and update, not delete', () => {
     expect([...SYSTEM_ROLE_PERMISSIONS.OPERATOR].sort()).toEqual(
-      [...SYSTEM_ROLE_PERMISSIONS.VIEWER, 'DATA.INSERT', 'DATA.UPDATE'].sort(),
+      [...SYSTEM_ROLE_PERMISSIONS.VIEWER, 'DATA.PREVIEW', 'DATA.INSERT', 'DATA.UPDATE'].sort(),
     );
     expect(SYSTEM_ROLE_PERMISSIONS.OPERATOR).not.toContain('DATA.DELETE');
   });
 
-  it('ADMIN administers but lacks DATA.*, DDL.* and SANKHYA.* (no admin bypass)', () => {
+  it('ADMIN administers and previews but lacks every write DATA.*, DDL.* and SANKHYA.* (no admin bypass)', () => {
     const admin = SYSTEM_ROLE_PERMISSIONS.ADMIN;
     for (const p of PERMISSIONS.filter((x) => x.startsWith('ADMIN.'))) expect(admin).toContain(p);
     for (const p of ['AUDIT.READ', 'APPROVAL.DECIDE', 'QUERY.SELECT', 'TEMP.MATERIALIZE'])
       expect(admin).toContain(p);
-    expect(admin).not.toContain('DATA.UPDATE');
-    for (const p of admin) expect(p).not.toMatch(/^(DATA|DDL|SANKHYA)\./);
+    expect(admin).toContain('DATA.PREVIEW');
+    for (const p of ['DATA.INSERT', 'DATA.UPDATE', 'DATA.DELETE']) expect(admin).not.toContain(p);
+    // DATA.PREVIEW is the only DATA.* an administrator holds: it shows a plan, never executes one.
+    for (const p of admin.filter((x) => x !== 'DATA.PREVIEW'))
+      expect(p).not.toMatch(/^(DATA|DDL|SANKHYA)\./);
+  });
+
+  it('VIEWER cannot preview writes', () => {
+    expect(SYSTEM_ROLE_PERMISSIONS.VIEWER).not.toContain('DATA.PREVIEW');
   });
 
   it('separates policy administration from every write permission, and ADMIN holds none', () => {
+    // DATA.PREVIEW writes nothing, so it is the one DATA.* that does not conflict.
     expect([...POLICY_ADMIN_CONFLICTS].sort()).toEqual(
-      PERMISSIONS.filter((p) => /^(DATA|DDL|SANKHYA)\./.test(p)).sort(),
+      PERMISSIONS.filter((p) => /^(DATA|DDL|SANKHYA)\./.test(p) && p !== 'DATA.PREVIEW').sort(),
     );
+    expect(POLICY_ADMIN_CONFLICTS).not.toContain('DATA.PREVIEW');
     for (const p of POLICY_ADMIN_CONFLICTS) expect(SYSTEM_ROLE_PERMISSIONS.ADMIN).not.toContain(p);
   });
 

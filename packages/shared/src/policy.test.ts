@@ -1272,6 +1272,9 @@ describe('action classification', () => {
       'SANKHYA.BUSINESS_ACTION.EXECUTE',
     ]);
     expect(Object.keys(POLICY_ACTION_CLASS).sort()).toEqual([...PERMISSIONS].sort());
+    // Previewing writes nothing: policy is evaluated on the statement's own write action.
+    expect(POLICY_ACTION_CLASS['DATA.PREVIEW']).toBe('permission-only');
+    expect(isPolicyWriteAction('DATA.PREVIEW')).toBe(false);
   });
 
   it('treats an unknown action as a write (fail closed)', () => {

@@ -186,6 +186,8 @@ export const POLICY_ACTION_CLASS: Readonly<Record<Permission, 'write' | 'permiss
     'TEMP.WRITE': 'permission-only',
     'TEMP.DROP': 'permission-only',
     'TEMP.MATERIALIZE': 'permission-only',
+    // Never a policy action of its own: a preview is evaluated on the statement's write action.
+    'DATA.PREVIEW': 'permission-only',
     'DATA.INSERT': 'write',
     'DATA.UPDATE': 'write',
     'DATA.DELETE': 'write',

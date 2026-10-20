@@ -2,6 +2,10 @@
  * Permission catalog. Permissions say what a user may attempt; the policy engine, the global
  * write switches and approvals can still refuse it. No permission grants DDL on native ERP
  * tables: that is refused for everyone, administrators included.
+ *
+ * DATA.PREVIEW lets a user plan and see the preview of an INSERT / UPDATE / DELETE without
+ * holding its DATA.* permission. It never executes anything: execution still needs the
+ * statement's own permission, and the preview still needs a policy ALLOW for that write action.
  */
 export const PERMISSIONS = [
   'QUERY.SELECT',
@@ -9,6 +13,7 @@ export const PERMISSIONS = [
   'TEMP.WRITE',
   'TEMP.DROP',
   'TEMP.MATERIALIZE',
+  'DATA.PREVIEW',
   'DATA.INSERT',
   'DATA.UPDATE',
   'DATA.DELETE',
@@ -37,14 +42,16 @@ export type SystemRole = (typeof SYSTEM_ROLES)[number];
 
 const TEMP: Permission[] = ['TEMP.CREATE', 'TEMP.WRITE', 'TEMP.DROP', 'TEMP.MATERIALIZE'];
 const VIEWER: Permission[] = ['QUERY.SELECT', ...TEMP];
-const OPERATOR: Permission[] = [...VIEWER, 'DATA.INSERT', 'DATA.UPDATE'];
+const OPERATOR: Permission[] = [...VIEWER, 'DATA.PREVIEW', 'DATA.INSERT', 'DATA.UPDATE'];
 /**
- * Administers the tool. It gets no DATA.*, DDL.* or SANKHYA.* permission by default: an
- * administrator who must also write ERP data needs an additional role.
+ * Administers the tool. Apart from DATA.PREVIEW (see a planned write, never run it) it gets no
+ * DATA.*, DDL.* or SANKHYA.* permission by default: an administrator who must also write ERP
+ * data needs an additional role.
  */
 const ADMIN: Permission[] = [
   'QUERY.SELECT',
   ...TEMP,
+  'DATA.PREVIEW',
   'APPROVAL.DECIDE',
   'AUDIT.READ',
   'ADMIN.USERS',
@@ -58,7 +65,8 @@ const ADMIN: Permission[] = [
 /**
  * Separation of duties: an account holding any of these may not create, change or delete access
  * policy rules. Otherwise it could relax the rules (WHERE override, four-eyes, row caps) that
- * govern its own writes. The ADMIN role holds none of them.
+ * govern its own writes. The ADMIN role holds none of them. DATA.PREVIEW is not among them: it
+ * writes nothing.
  */
 export const POLICY_ADMIN_CONFLICTS: readonly Permission[] = [
   'DATA.INSERT',
