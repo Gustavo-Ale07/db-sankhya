@@ -40,6 +40,13 @@ import type { AuthState } from '../context';
 import type { ApprovalsService } from './approvals';
 import { gatesHold } from './approvals';
 import type { AuthzService } from './authz';
+import {
+  actionEnabled,
+  actionStatement,
+  actionWord,
+  parseActionStatement,
+} from './business-actions';
+import type { BusinessAction } from './business-actions';
 import type { ConnectionsService } from './connections';
 import type { Catalog, CatalogTable } from './metadata';
 import type { MetadataService } from './metadata';
@@ -60,7 +67,7 @@ import { analyzeScratchSql } from './scratch-guard';
 import type { ScratchStatement } from './scratch-guard';
 import type { AuditLifecycleContext, AuditService } from './records';
 import type { SecuritySettingsService } from './security-settings';
-import { labelOf, statusOf, verifyByKey } from './verification';
+import { labelOf, statusOf, valuesMatch, verifyByKey } from './verification';
 import type { ExecutionReport, ExecutionStep } from './verification';
 
 export type { ExecutionReport, ExecutionStep } from './verification';
@@ -97,8 +104,25 @@ export interface PrepareContext {
   meta?: { ip?: string | null; requestId?: string | null };
 }
 
+export interface PrepareActionContext {
+  auth: AuthState;
+  connectionId: string;
+  /** A registered action (see `business-actions.ts`); the caller resolves unknown ids to 404. */
+  action: BusinessAction;
+  /** Unvalidated input; validated against the action's schema after the permission check. */
+  input: unknown;
+  meta?: { ip?: string | null; requestId?: string | null };
+}
+
+export type PreparedAction = PreparedMutation & { action: string };
+
 export interface ExecuteContext {
   auth: AuthState;
+  /**
+   * Set by the business action route: the plan must be a plan of exactly this action. Without
+   * it, the plan must be a SQL plan. A mismatch is CONFIRMATION_INVALID.
+   */
+  actionId?: string;
   planId: string;
   token: string;
   strongConfirmation?: string;
@@ -123,6 +147,8 @@ export interface MutationDeps {
   maxReadRows: number;
   /** SCRATCH_MAX_ROWS: read ceiling of the scratch policy decisions. */
   scratchMaxReadRows?: number;
+  /** BUSINESS_ACTIONS_ENABLED: action ids allowed on live connections (none when absent). */
+  businessActionsEnabled?: readonly string[];
   /** Errors that cannot reach the audit (only ids and codes are logged, never values). */
   logger?: { error(obj: Record<string, unknown>, msg: string): void };
 }
@@ -182,6 +208,18 @@ interface ScratchResolution {
   entity: string;
 }
 
+/** AUTHORIZE → PREVIEW of a business action, at prepare and again at execute. */
+interface ActionResolution {
+  action: BusinessAction;
+  input: Record<string, unknown>;
+  environment: Environment;
+  capability: Capability;
+  decision: PolicyDecision;
+  table: CatalogTable;
+  /** Exactly one: the row the action changes, with its real before values. */
+  targets: PreviewTarget[];
+}
+
 const invalidPlan = (message: string) => new AppError('CONFIRMATION_INVALID', message);
 
 export class MutationService {
@@ -203,7 +241,7 @@ export class MutationService {
         environment = SCRATCH_ENVIRONMENT;
         const s = await this.resolveScratch(auth, write, sql);
         return await this.finishPlan(ctx, {
-          write,
+          operation: write.kind,
           permission: 'TEMP.WRITE',
           environment: SCRATCH_ENVIRONMENT,
           connectionId: SCRATCH_CONNECTION_ID,
@@ -220,7 +258,7 @@ export class MutationService {
         environment = e;
       });
       return await this.finishPlan(ctx, {
-        write,
+        operation: write.kind,
         permission: r.permission,
         environment: r.environment,
         connectionId: ctx.connectionId,
@@ -411,7 +449,8 @@ export class MutationService {
   private async finishPlan(
     ctx: PrepareContext,
     o: {
-      write: WriteClassified;
+      /** INSERT / UPDATE / DELETE, or the word of a business action (summary and phrase). */
+      operation: string;
       permission: Permission;
       environment: Environment;
       connectionId: string;
@@ -424,7 +463,7 @@ export class MutationService {
     },
   ): Promise<PreparedMutation> {
     const { auth, sql } = ctx;
-    const { write, permission, environment, capability, decision, targets, entity } = o;
+    const { operation, permission, environment, capability, decision, targets, entity } = o;
     const { previewKind, previewLabels } = o;
     const affected = targets.length;
     const preview = { targets, affected };
@@ -440,7 +479,7 @@ export class MutationService {
       targets,
       preview,
       previewKind,
-      summary: { action: write.kind, count: affected, entity },
+      summary: { action: operation, count: affected, entity },
     });
     const needsPhrase = decision.limits.requireStrongConfirmation || environment === 'PRODUCTION';
     const prepared: PreparedMutation = {
@@ -454,7 +493,7 @@ export class MutationService {
       impact: { entities: [entity], rows: affected, environment },
       requires: {
         strongConfirmation: needsPhrase
-          ? strongConfirmationPhrase(environment, write.kind, affected, entity)
+          ? strongConfirmationPhrase(environment, operation, affected, entity)
           : null,
         approval: decision.limits.requireApproval,
       },
@@ -475,7 +514,7 @@ export class MutationService {
         statement: sql,
         policyDecision: policySummary(decision),
         details: {
-          operation: write.kind,
+          operation,
           resource: entity,
           affected,
           previewKind,
@@ -491,6 +530,241 @@ export class MutationService {
       },
     );
     return prepared;
+  }
+
+  /**
+   * PARSE → … → IMPACT of a typed business action (Task 11.3). The input is validated against the
+   * action's schema, the connection must allow the action (live connections only run the actions
+   * listed in BUSINESS_ACTIONS_ENABLED), the PolicyEngine decides on the action's permission with
+   * `entities = [action.entity]`, and the row is read for real (IMPACT_ANALYSIS) with the
+   * expected effect applied (SIMULATED_PREVIEW). Nothing is called: the plan runs only through
+   * `execute`.
+   */
+  async prepareAction(ctx: PrepareActionContext): Promise<PreparedAction> {
+    const { action } = ctx;
+    let environment: Environment | null = null;
+    let statement = `ACTION ${action.id}`;
+    const base = { auth: ctx.auth, connectionId: ctx.connectionId, meta: ctx.meta ?? {} };
+    try {
+      const a = await this.resolveAction(ctx.auth, ctx.connectionId, action, ctx.input, (e) => {
+        environment = e;
+      });
+      statement = actionStatement(action, a.input);
+      const prepared = await this.finishPlan(
+        { ...base, sql: statement },
+        {
+          operation: actionWord(action),
+          permission: action.permission,
+          environment: a.environment,
+          connectionId: ctx.connectionId,
+          capability: a.capability,
+          decision: a.decision,
+          targets: a.targets,
+          entity: a.table.name.toUpperCase(),
+          previewKind: 'IMPACT_ANALYSIS',
+          previewLabels: ['IMPACT_ANALYSIS', 'SIMULATED_PREVIEW'],
+        },
+      );
+      return { ...prepared, action: action.id };
+    } catch (err) {
+      await this.auditRefusal({ ...base, sql: statement }, undefined, environment, err);
+      if (err instanceof Refusal) throw new AppError(err.code, err.message, err.details);
+      throw err;
+    }
+  }
+
+  /** AUTHORIZE → PREVIEW of a business action; used by `prepareAction` and again by `execute`. */
+  private async resolveAction(
+    auth: AuthState,
+    connectionId: string,
+    action: BusinessAction,
+    rawInput: unknown,
+    onEnvironment?: (environment: Environment) => void,
+  ): Promise<ActionResolution> {
+    const permission = action.permission;
+    if (!auth.grants.permissions.has(permission)) {
+      throw refuse(
+        'AUTHORIZE',
+        new AppError('FORBIDDEN', 'You do not have permission for this action', { permission }),
+      );
+    }
+    const parsed = action.input.safeParse(rawInput);
+    if (!parsed.success) {
+      throw refuse(
+        'VALIDATE',
+        new AppError('VALIDATION_ERROR', 'The action input is invalid.', {
+          issues: parsed.error.issues.map((i) => ({
+            path: i.path.map(String).join('.'),
+            message: i.message,
+          })),
+        }),
+      );
+    }
+    const input = parsed.data;
+    const { policies, connections, metadata } = this.deps;
+    const groupIds = await this.deps.authz.activeGroupIds(auth.user.id);
+    const access = await authorizeConnection({
+      policies,
+      auth,
+      groupIds,
+      action: 'QUERY.SELECT',
+      connectionId,
+      connections,
+    });
+    if (!access.ok) throw refuse('AUTHORIZE', connectionDenied(), { reasons: access.reasons });
+    const environment = access.environment;
+    onEnvironment?.(environment);
+    // Before any gateway call: a live connection runs only the actions explicitly enabled.
+    const { mode } = await connections.get(connectionId);
+    if (!actionEnabled(action, mode, this.deps.businessActionsEnabled ?? [])) {
+      throw refuse(
+        'AUTHORIZE',
+        new AppError(
+          'OPERATION_NOT_SUPPORTED',
+          `${action.id} is not enabled on live connections (BUSINESS_ACTIONS_ENABLED).`,
+          { action: action.id },
+        ),
+      );
+    }
+
+    const catalog = await metadata.get(connectionId);
+    const table = catalogTable(catalog, action.entity);
+    const entity = table.name.toUpperCase();
+    const known = new Set(table.columns.map((c) => c.name.toUpperCase()));
+    const pk = table.columns.filter((c) => c.pk).map((c) => c.name.toUpperCase());
+    const key = action.key(input);
+    if (
+      pk.length === 0 ||
+      pk.length !== Object.keys(key).length ||
+      !pk.every((k) => key[k] !== undefined)
+    ) {
+      throw refuse(
+        'PLAN',
+        new AppError(
+          'OPERATION_NOT_SUPPORTED',
+          `${entity}: the action key does not match the primary key of the catalog.`,
+        ),
+      );
+    }
+    if (!table.entityName) {
+      throw refuse(
+        'PLAN',
+        new AppError(
+          'OPERATION_NOT_SUPPORTED',
+          `${entity} has no entity name in the data dictionary: it cannot be verified.`,
+        ),
+      );
+    }
+    const effect = action.effect(input);
+    const selected = [...new Set([...pk, ...action.columns, ...Object.keys(effect)])].map((c) =>
+      columnOf(c, known),
+    );
+    const decision = await evaluateFor({
+      policies,
+      auth,
+      groupIds,
+      action: permission,
+      environment,
+      connectionId,
+      entities: [entity],
+      columns: selected.map((name) => ({ table: entity, name })),
+      hasWhere: true,
+      defaults: { maxReadRows: this.deps.maxReadRows },
+    });
+    if (decision.effect !== 'ALLOW') {
+      throw refuse('AUTHORIZE', new AppError('FORBIDDEN', 'The action was denied by policy'), {
+        reasons: decision.reasons,
+        matchedRuleIds: decision.matchedRuleIds,
+        policyVersion: decision.policyVersion,
+      });
+    }
+    if (decision.limits.maxWriteRows < 1) {
+      throw refuse(
+        'PREVIEW',
+        new AppError('WRITE_ROW_LIMIT_EXCEEDED', 'The action changes more rows than allowed.', {
+          maxWriteRows: decision.limits.maxWriteRows,
+        }),
+      );
+    }
+
+    // ---------------------------------------------------------------- PREVIEW (the real row)
+    const where = pk.map((k) => `${k} = ${literalSql(key[k]!)}`).join(' AND ');
+    const runtime = await connections.getRuntime(connectionId);
+    const out = await executeRead({
+      runtime,
+      catalog,
+      sql: `SELECT ${selected.join(', ')} FROM ${entity} WHERE ${where}`,
+      maxRows: 2,
+      signal: new AbortController().signal,
+      decide: async (analysis) => {
+        const t = readTargets(analysis, catalog);
+        const read = await evaluateFor({
+          policies,
+          auth,
+          groupIds,
+          action: 'QUERY.SELECT',
+          environment,
+          connectionId,
+          entities: t.entities,
+          columns: t.columns,
+          defaults: { maxReadRows: 2 },
+        });
+        return read.effect === 'ALLOW'
+          ? { effect: 'ALLOW', maxRows: read.limits.maxReadRows }
+          : { effect: 'DENY', reason: 'The action was denied by policy' };
+      },
+    });
+    if (out.rows.length !== 1) {
+      throw refuse(
+        'PREVIEW',
+        out.rows.length === 0
+          ? new AppError('RESOURCE_NOT_FOUND', `${entity}: the row does not exist.`)
+          : new AppError(
+              'OPERATION_NOT_SUPPORTED',
+              `${entity}: the key matches more than one row.`,
+            ),
+      );
+    }
+    const index = out.columns.map((c) => c.toUpperCase());
+    const before: RecordValues = {};
+    for (const name of selected) {
+      const i = index.indexOf(name);
+      before[name] = i === -1 ? null : toValue(out.rows[0]![i]);
+    }
+    // A row already in the target state would read back as VERIFIED whether or not the action
+    // did anything: refuse it instead.
+    if (Object.entries(effect).every(([c, v]) => valuesMatch(v, before[c.toUpperCase()]))) {
+      throw refuse(
+        'PREVIEW',
+        new AppError('OPERATION_NOT_SUPPORTED', `${entity}: the row is already in that state.`),
+      );
+    }
+    const targetKey: RecordValues = {};
+    for (const k of pk) targetKey[k] = before[k] ?? null;
+    if (!keyComplete(targetKey, pk)) {
+      throw refuse(
+        'PREVIEW',
+        new AppError('OPERATION_NOT_SUPPORTED', `${entity}: the row has no complete primary key.`),
+      );
+    }
+    const after: RecordValues = { ...before };
+    for (const [c, v] of Object.entries(effect)) after[c.toUpperCase()] = v;
+    const capability: Capability = {
+      class: 'SUPPORTED',
+      route: 'SANKHYA_ACTION',
+      reason: `Business action ${action.id} on ${entity}.`,
+      action: 'SANKHYA.BUSINESS_ACTION.EXECUTE',
+      actions: ['SANKHYA.BUSINESS_ACTION.EXECUTE'],
+    };
+    return {
+      action,
+      input,
+      environment,
+      capability,
+      decision,
+      table,
+      targets: [{ key: targetKey, before, after }],
+    };
   }
 
   /**
@@ -741,28 +1015,52 @@ export class MutationService {
     const scratch = plan.connectionId === SCRATCH_CONNECTION_ID;
 
     // ---------------------------------------------------------------- RE-AUTHORIZE
-    let write: WriteClassified;
-    let resolved: { sankhya: SankhyaResolution } | { scratch: ScratchResolution };
+    let write: WriteClassified | undefined;
+    let operation: string;
+    let resolved:
+      | { sankhya: SankhyaResolution }
+      | { scratch: ScratchResolution }
+      | { action: ActionResolution };
     let decision: PolicyDecision;
     let targets: PreviewTarget[];
     let entity: string;
     try {
-      write = parseWrite(classifyStatement(plan.sql));
-      lctx.capability = scratch ? 'TEMP.WRITE' : PERMISSION[write.kind];
-      validateWrite(write);
+      // A business action plan runs only through its own route, a SQL plan never through one.
+      const act = actionPlanOf(plan);
+      if (act !== undefined || ctx.actionId !== undefined) {
+        if (act?.action.id !== ctx.actionId) {
+          throw refuse('RE-AUTHORIZE', invalidPlan('This plan cannot be executed here.'));
+        }
+        lctx.capability = act!.action.permission;
+        operation = actionWord(act!.action);
+      } else {
+        write = parseWrite(classifyStatement(plan.sql));
+        lctx.capability = scratch ? 'TEMP.WRITE' : PERMISSION[write.kind];
+        operation = write.kind;
+        validateWrite(write);
+      }
       const fresh: AuthState = { ...auth, grants: await this.deps.authz.grants(auth.user.id) };
       await this.assertPolicyVersion(plan);
 
-      if (scratch) {
-        if (!SCRATCH_TABLE.test(write.table))
+      if (act) {
+        const a = await this.resolveAction(fresh, plan.connectionId, act.action, act.input);
+        if (a.environment !== plan.environment) {
+          throw refuse('RE-AUTHORIZE', invalidPlan('The connection changed after the preview.'));
+        }
+        resolved = { action: a };
+        decision = a.decision;
+        targets = a.targets;
+        entity = a.table.name.toUpperCase();
+      } else if (scratch) {
+        if (!SCRATCH_TABLE.test(write!.table))
           throw refuse('RE-AUTHORIZE', invalidPlan('The plan no longer matches its statement.'));
-        const s = await this.resolveScratch(fresh, write, plan.sql);
+        const s = await this.resolveScratch(fresh, write!, plan.sql);
         resolved = { scratch: s };
         decision = s.decision;
         targets = s.targets;
         entity = s.entity;
       } else {
-        const r = await this.resolveSankhya(fresh, plan.connectionId, write, 'execute');
+        const r = await this.resolveSankhya(fresh, plan.connectionId, write!, 'execute');
         if (r.environment !== plan.environment) {
           throw refuse('RE-AUTHORIZE', invalidPlan('The connection changed after the preview.'));
         }
@@ -772,7 +1070,11 @@ export class MutationService {
         entity = r.table.name.toUpperCase();
       }
       const capability =
-        'sankhya' in resolved ? resolved.sankhya.capability : resolved.scratch.capability;
+        'sankhya' in resolved
+          ? resolved.sankhya.capability
+          : 'action' in resolved
+            ? resolved.action.capability
+            : resolved.scratch.capability;
       if (canonical(capability) !== canonical(plan.capability)) {
         throw refuse('RE-AUTHORIZE', invalidPlan('The capability changed after the preview.'));
       }
@@ -813,10 +1115,13 @@ export class MutationService {
     // ---------------------------------------------------------------- EXECUTE + VERIFY
     let steps: ExecutionStep[];
     try {
+      const guard = () => this.stillAllowed(plan);
       steps =
         'sankhya' in resolved
-          ? await this.runSankhya(plan, write, resolved.sankhya, () => this.stillAllowed(plan))
-          : await this.runScratch(resolved.scratch);
+          ? await this.runSankhya(plan, write!, resolved.sankhya, guard)
+          : 'action' in resolved
+            ? await this.runAction(plan, resolved.action, guard)
+            : await this.runScratch(resolved.scratch);
     } catch (err) {
       // Nothing was sent (the runtime could not be built, for example): a failed execution.
       await this.deps.audit.recordPlanExecuted(lctx, {
@@ -827,7 +1132,7 @@ export class MutationService {
         errorMessage: err instanceof Error ? err.message : String(err),
         statement: plan.sql,
         policyDecision: policySummary(decision),
-        details: { operation: write.kind, resource: entity },
+        details: { operation, resource: entity },
       });
       throw err;
     }
@@ -854,7 +1159,7 @@ export class MutationService {
           : null,
         statement: plan.sql,
         policyDecision: policySummary(decision),
-        details: { operation: write.kind, resource: entity, report },
+        details: { operation, resource: entity, report },
         before: attempted.flatMap((t) => (t.before ? [t.before] : [])),
         after: attempted.map((t) => t.after),
         auditSnapshots: decision.limits.auditSnapshots,
@@ -923,6 +1228,9 @@ export class MutationService {
       const fields = update ? r.setColumns : Object.keys(t.after);
       return Object.fromEntries(fields.map((f) => [f, t.after[f] ?? null]));
     });
+    // The key each step is read back by: an INSERT without a complete key gets the one the
+    // gateway generated, or stays incomplete (never verified).
+    const keys = r.targets.map((t) => t.key);
     for (let i = 0; i < r.targets.length; i++) {
       const t = r.targets[i]!;
       const stop = await guard();
@@ -938,9 +1246,17 @@ export class MutationService {
             values,
           }
         : { values };
+      // INSERT without a complete key: the gateway generates it. The missing key columns are
+      // listed without a value, so the saved row comes back with them.
+      const generated = update || keyComplete(t.key, pk) ? [] : pk.filter((k) => !(k in values));
+      const fields = [...Object.keys(values), ...generated];
       try {
-        await runtime.client.save({ entityName, fields: Object.keys(values), records: [record] });
-        steps[i] = { key: t.key, outcome: 'ok' };
+        const res = await runtime.client.save({ entityName, fields, records: [record] });
+        if (generated.length > 0) {
+          const key = generatedKey(res.results[0], fields, pk, r.table);
+          if (key) keys[i] = key;
+        }
+        steps[i] = { key: keys[i]!, outcome: 'ok' };
       } catch (err) {
         // Anything but a definite gateway answer may have been applied: unknown, never retried.
         const code = isAppError(err) ? err.code : 'WRITE_OUTCOME_UNKNOWN';
@@ -960,13 +1276,59 @@ export class MutationService {
     const results = await verifyByKey(runtime.client, {
       entityName,
       pk,
-      targets: check.map(({ i }) => ({ key: r.targets[i]!.key, expected: expected[i]! })),
+      targets: check.map(({ i }) => ({ key: keys[i]!, expected: expected[i]! })),
     });
     check.forEach(({ i }, n) => {
       const verified = results[n];
       if (verified !== undefined) steps[i] = { ...steps[i]!, verified };
     });
     return steps;
+  }
+
+  /**
+   * One business action call, never retried, guarded like a save; then the row is read back by
+   * key and compared with the action's expected effect.
+   */
+  private async runAction(
+    plan: PlanRow,
+    a: ActionResolution,
+    guard: () => Promise<AppError | null>,
+  ): Promise<ExecutionStep[]> {
+    const runtime = await this.deps.connections.getRuntime(plan.connectionId);
+    const t = a.targets[0]!;
+    const stop = await guard();
+    if (stop) return [{ key: t.key, outcome: 'not_attempted', errorCode: stop.code }];
+    let step: ExecutionStep;
+    try {
+      await runtime.client.call(
+        {
+          module: a.action.module,
+          serviceName: a.action.id,
+          requestBody: a.action.requestBody(a.input),
+        },
+        { idempotent: false },
+      );
+      step = { key: t.key, outcome: 'ok' };
+    } catch (err) {
+      // Anything but a definite gateway answer may have been applied: unknown, never retried.
+      const code = isAppError(err) ? err.code : 'WRITE_OUTCOME_UNKNOWN';
+      step = {
+        key: t.key,
+        outcome: code === 'WRITE_OUTCOME_UNKNOWN' ? 'unknown' : 'error',
+        errorCode: code,
+      };
+    }
+    if (step.outcome === 'error') return [step];
+    const pk = a.table.columns.filter((c) => c.pk).map((c) => c.name.toUpperCase());
+    const expected = Object.fromEntries(
+      Object.entries(a.action.effect(a.input)).map(([c, v]) => [c.toUpperCase(), v]),
+    );
+    const [verified] = await verifyByKey(runtime.client, {
+      entityName: a.table.entityName!,
+      pk,
+      targets: [{ key: t.key, expected }],
+    });
+    return [verified === undefined ? step : { ...step, verified }];
   }
 
   /**
@@ -1134,6 +1496,20 @@ export class MutationService {
       },
     });
   }
+}
+
+/**
+ * The action and input of a business action plan, or undefined for a SQL plan. A plan marked as
+ * an action whose statement no longer parses to a registered action is refused.
+ */
+function actionPlanOf(
+  plan: PlanRow,
+): { action: BusinessAction; input: Record<string, unknown> } | undefined {
+  const route = (plan.capability as { route?: unknown } | null)?.route;
+  if (route !== 'SANKHYA_ACTION') return undefined;
+  const parsed = parseActionStatement(plan.sql);
+  if (!parsed) throw refuse('RE-AUTHORIZE', invalidPlan('The plan no longer matches its action.'));
+  return parsed;
 }
 
 /** PARSE: AST classification only; anything the parser cannot positively identify is refused. */
@@ -1517,6 +1893,34 @@ function insertTarget(stmt: InsertStatement, table: CatalogTable): PreviewTarget
     if (c.pk && name in after) key[name] = after[name] ?? null;
   }
   return { key, before: null, after };
+}
+
+/**
+ * The primary key of a row the gateway created, from the save result (aligned with `fields`).
+ * Undefined unless every key column came back with a value: a guessed key is never verified.
+ */
+function generatedKey(
+  row: unknown[] | undefined,
+  fields: string[],
+  pk: string[],
+  table: CatalogTable,
+): RecordValues | undefined {
+  if (!Array.isArray(row) || pk.length === 0) return undefined;
+  const key: RecordValues = {};
+  for (const k of pk) {
+    const i = fields.indexOf(k);
+    let v: unknown = i === -1 ? undefined : row[i];
+    // Some gateways wrap values as {"$": "..."}.
+    if (typeof v === 'object' && v !== null && !Array.isArray(v) && '$' in v) {
+      v = (v as { $: unknown }).$;
+    }
+    if (typeof v !== 'string' && typeof v !== 'number') return undefined;
+    const text = String(v).trim();
+    if (text === '') return undefined;
+    const type = table.columns.find((c) => c.name.toUpperCase() === k)?.type;
+    key[k] = (type === 'integer' || type === 'decimal') && NUMERIC.test(text) ? Number(text) : text;
+  }
+  return key;
 }
 
 /** Gateway values to JSON-safe scalars. */

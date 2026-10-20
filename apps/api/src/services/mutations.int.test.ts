@@ -913,6 +913,60 @@ describe('MutationService.execute', () => {
     expect(verification).toMatchObject({ status: 'failed' });
   });
 
+  it('INSERT without the key: reads back the generated key and verifies by it (VERIFIED)', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    const max = Number(
+      (await h.mock.db.query<{ n: number }>('SELECT MAX(codparc) AS n FROM tgfpar')).rows[0]!.n,
+    );
+    const p = await prepare(
+      h,
+      auth,
+      "INSERT INTO TGFPAR (NOMEPARC, ATIVO) VALUES ('Parceiro gerado', 'S')",
+    );
+    expect(p.preview.targets[0]!.key).toEqual({});
+    const report = await execute(h, auth, p);
+    expect(report).toMatchObject({
+      status: 'success',
+      verification: 'VERIFIED',
+      steps: [{ key: { CODPARC: max + 1 }, outcome: 'ok', verified: true }],
+    });
+    expect(saves(h.mock)).toHaveLength(1);
+    expect(await partner(h.mock, max + 1)).toBe('Parceiro gerado');
+  });
+
+  it('INSERT whose generated key never comes back: UNVERIFIED, never VERIFIED', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    const p = await prepare(
+      h,
+      auth,
+      "INSERT INTO TGFPAR (NOMEPARC, ATIVO) VALUES ('Parceiro perdido', 'S')",
+    );
+    h.mock.inject({ type: 'responseLost' }, { service: 'DatasetSP.save' });
+    const report = await execute(h, auth, p);
+    expect(report.verification).toBe('UNVERIFIED');
+    expect(report.steps[0]).toMatchObject({ key: {}, outcome: 'unknown' });
+    expect(report.steps[0]!.verified).toBeUndefined();
+    expect(saves(h.mock)).toHaveLength(1);
+  });
+
+  it('INSERT with an explicit key still verifies by that key', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    const p = await prepare(
+      h,
+      auth,
+      "INSERT INTO TGFPAR (CODPARC, NOMEPARC, ATIVO) VALUES (9001, 'Com chave', 'S')",
+    );
+    const report = await execute(h, auth, p);
+    expect(report).toMatchObject({
+      verification: 'VERIFIED',
+      steps: [{ key: { CODPARC: 9001 }, outcome: 'ok', verified: true }],
+    });
+    expect(await partner(h.mock, 9001)).toBe('Com chave');
+  });
+
   it('a value the gateway silently ignored: FAILED', async () => {
     const h = await setup(WRITES);
     const { auth } = await h.userWith(WRITER);
@@ -1226,6 +1280,218 @@ describe('MutationService.execute', () => {
     await ws.exec("UPDATE tmp_a SET v = 'other' WHERE id = 2");
     await expect(execute(h, auth, p)).rejects.toMatchObject({ code: 'TARGETS_CHANGED' });
     expect((await ws.exec('SELECT v FROM tmp_a WHERE id = 2')).rows).toEqual([['other']]);
+  });
+});
+
+describe('business actions', () => {
+  const ACTOR: Permission[] = ['QUERY.SELECT', 'SANKHYA.BUSINESS_ACTION.EXECUTE'];
+  const BASE = '/api/actions/CACSP.cancelarNota';
+  const INPUT = { nunota: 7, justificativa: 'Nota emitida em duplicidade' };
+  const allowActions = (h: Harness) =>
+    h.policy({
+      name: 'actions allowed',
+      effect: 'ALLOW',
+      actions: ['SANKHYA.BUSINESS_ACTION.EXECUTE'],
+    });
+  const actionCalls = (mock: MockSankhya) =>
+    mock.calls.filter((c) => c.serviceName === 'CACSP.cancelarNota');
+  const statusOf = async (mock: MockSankhya, nunota: number) =>
+    (
+      await mock.db.query<{ statusnota: string }>(
+        'SELECT statusnota FROM tgfcab WHERE nunota = $1',
+        [nunota],
+      )
+    ).rows[0]?.statusnota;
+  const prepareAction = (h: Harness, cookie: string, input: unknown = INPUT, url = BASE) =>
+    h.call(cookie, { method: 'POST', url: `${url}/prepare`, payload: { input } });
+  const executeAction = (
+    h: Harness,
+    cookie: string,
+    planned: { planId: string; token: string },
+    url = BASE,
+  ) =>
+    h.call(cookie, {
+      method: 'POST',
+      url: `${url}/execute`,
+      payload: { planId: planned.planId, token: planned.token, idempotencyKey: randomUUID() },
+    });
+
+  it('prepare plans without calling the action; execute calls it once and verifies', async () => {
+    const h = await setup(WRITES);
+    await allowActions(h);
+    const { cookie } = await h.userWith(ACTOR);
+    const before = await statusOf(h.mock, 7);
+    expect(before).not.toBe('C');
+
+    const planned = await prepareAction(h, cookie);
+    expect(planned.statusCode, planned.body).toBe(200);
+    expect(planned.json()).toMatchObject({
+      type: 'preview',
+      action: 'CACSP.cancelarNota',
+      previewKind: 'IMPACT_ANALYSIS',
+      previewLabels: ['IMPACT_ANALYSIS', 'SIMULATED_PREVIEW'],
+      capability: { route: 'SANKHYA_ACTION', action: 'SANKHYA.BUSINESS_ACTION.EXECUTE' },
+      preview: {
+        affected: 1,
+        targets: [
+          {
+            key: { NUNOTA: 7 },
+            before: { NUNOTA: 7, STATUSNOTA: before },
+            after: { NUNOTA: 7, STATUSNOTA: 'C' },
+          },
+        ],
+      },
+      impact: { entities: ['TGFCAB'], rows: 1 },
+    });
+    expect(actionCalls(h.mock)).toEqual([]);
+    expect(writeCalls(h.mock)).toEqual([]);
+
+    const res = await executeAction(h, cookie, planned.json());
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json()).toMatchObject({
+      type: 'execution',
+      status: 'success',
+      verification: 'VERIFIED',
+      steps: [{ key: { NUNOTA: 7 }, outcome: 'ok', verified: true }],
+    });
+    expect(actionCalls(h.mock)).toHaveLength(1);
+    expect(await statusOf(h.mock, 7)).toBe('C');
+    const [executed] = await h.audit('PLAN_EXECUTED');
+    expect(executed).toMatchObject({
+      status: 'success',
+      capability: 'SANKHYA.BUSINESS_ACTION.EXECUTE',
+    });
+  });
+
+  it('an unknown action id is 404, and nothing is planned or called', async () => {
+    const h = await setup(WRITES);
+    await allowActions(h);
+    const { cookie } = await h.userWith(ACTOR);
+    const res = await prepareAction(h, cookie, INPUT, '/api/actions/CACSP.naoExiste');
+    expect(res.statusCode).toBe(404);
+    expect(res.json().error.code).toBe('NOT_FOUND');
+    const exec = await executeAction(
+      h,
+      cookie,
+      { planId: randomUUID(), token: 'x.y' },
+      '/api/actions/CACSP.naoExiste',
+    );
+    expect(exec.statusCode).toBe(404);
+    expect(h.mock.calls).toEqual([]);
+    expect(await h.audit('PLAN_CREATED')).toEqual([]);
+  });
+
+  it('without SANKHYA.BUSINESS_ACTION.EXECUTE: FORBIDDEN, no gateway call', async () => {
+    const h = await setup(WRITES);
+    await allowActions(h);
+    const { cookie } = await h.userWith(['QUERY.SELECT', 'DATA.UPDATE']);
+    const res = await prepareAction(h, cookie);
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error.code).toBe('FORBIDDEN');
+    expect(h.mock.calls).toEqual([]);
+  });
+
+  it('a policy without an ALLOW for the action: FORBIDDEN, no gateway call', async () => {
+    const h = await setup(WRITES);
+    const { cookie } = await h.userWith(ACTOR);
+    const res = await prepareAction(h, cookie);
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error.code).toBe('FORBIDDEN');
+    expect(actionCalls(h.mock)).toEqual([]);
+  });
+
+  it('an invalid input is refused before anything runs', async () => {
+    const h = await setup(WRITES);
+    await allowActions(h);
+    const { cookie } = await h.userWith(ACTOR);
+    for (const input of [
+      { nunota: 7, justificativa: 'curta' },
+      { nunota: -1, justificativa: 'Nota emitida em duplicidade' },
+      { nunota: 7, justificativa: 'Nota emitida em duplicidade', extra: 1 },
+    ]) {
+      const res = await prepareAction(h, cookie, input);
+      expect(res.statusCode, JSON.stringify(input)).toBe(400);
+      expect(res.json().error.code).toBe('VALIDATION_ERROR');
+    }
+    expect(h.mock.calls).toEqual([]);
+  });
+
+  it('a note already in the target state is refused (no VERIFIED without a change)', async () => {
+    const h = await setup(WRITES);
+    await allowActions(h);
+    const { cookie } = await h.userWith(ACTOR);
+    await h.mock.db.query("UPDATE tgfcab SET statusnota = 'C' WHERE nunota = 7");
+    const res = await prepareAction(h, cookie);
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe('OPERATION_NOT_SUPPORTED');
+    expect(actionCalls(h.mock)).toEqual([]);
+  });
+
+  it('a live connection without BUSINESS_ACTIONS_ENABLED: OPERATION_NOT_SUPPORTED, no gateway call', async () => {
+    const h = await setup({ ...WRITES, SANKHYA_MODE: 'live' });
+    await allowActions(h);
+    const { cookie } = await h.userWith(ACTOR);
+    const res = await prepareAction(h, cookie);
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe('OPERATION_NOT_SUPPORTED');
+    expect(h.mock.calls).toEqual([]);
+  });
+
+  it('the kill switch turned off: execute is READ_ONLY_MODE with no action call', async () => {
+    const h = await setup(WRITES);
+    await allowActions(h);
+    const { cookie } = await h.userWith(ACTOR);
+    const before = await statusOf(h.mock, 7);
+    const planned = await prepareAction(h, cookie);
+    expect(planned.statusCode, planned.body).toBe(200);
+    await h.app.services.security.setGlobalWrite(false, null);
+    const res = await executeAction(h, cookie, planned.json());
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error.code).toBe('READ_ONLY_MODE');
+    expect(actionCalls(h.mock)).toHaveLength(0);
+    expect(await statusOf(h.mock, 7)).toBe(before);
+    const [denied] = await h.audit('PLAN_DENIED');
+    expect(denied).toMatchObject({ errorCode: 'READ_ONLY_MODE' });
+  });
+
+  it('the note changed after the preview: TARGETS_CHANGED, no action call', async () => {
+    const h = await setup(WRITES);
+    await allowActions(h);
+    const { cookie } = await h.userWith(ACTOR);
+    const planned = await prepareAction(h, cookie);
+    const other = (await statusOf(h.mock, 7)) === 'A' ? 'P' : 'A';
+    await h.mock.db.query('UPDATE tgfcab SET statusnota = $1 WHERE nunota = 7', [other]);
+    const res = await executeAction(h, cookie, planned.json());
+    expect(res.json().error.code).toBe('TARGETS_CHANGED');
+    expect(actionCalls(h.mock)).toEqual([]);
+  });
+
+  it('an action plan never runs through /api/query/execute, nor a SQL plan through an action', async () => {
+    const h = await setup(WRITES);
+    await allowActions(h);
+    const { cookie } = await h.userWith([...ACTOR, 'DATA.UPDATE']);
+    const planned = await prepareAction(h, cookie);
+    const viaQuery = await h.call(cookie, {
+      method: 'POST',
+      url: '/api/query/execute',
+      payload: {
+        planId: planned.json().planId as string,
+        token: planned.json().token as string,
+        idempotencyKey: randomUUID(),
+      },
+    });
+    expect(viaQuery.json().error.code).toBe('CONFIRMATION_INVALID');
+    expect(actionCalls(h.mock)).toEqual([]);
+
+    const sqlPlan = await h.call(cookie, {
+      method: 'POST',
+      url: '/api/query/preview',
+      payload: { sql: "UPDATE TGFPAR SET NOMEPARC = 'X' WHERE CODPARC = 2" },
+    });
+    expect(sqlPlan.statusCode, sqlPlan.body).toBe(200);
+    const viaAction = await executeAction(h, cookie, sqlPlan.json());
+    expect(viaAction.json().error.code).toBe('CONFIRMATION_INVALID');
+    expect(saves(h.mock)).toEqual([]);
   });
 });
 

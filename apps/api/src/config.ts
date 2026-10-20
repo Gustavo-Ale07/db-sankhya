@@ -115,6 +115,11 @@ const envSchema = z.object({
   SAFE_MODE: bool(true),
   WRITE_TO_SANKHYA: bool(false),
   GLOBAL_WRITE_ENABLED: bool(false),
+  /**
+   * Business action ids (e.g. `CACSP.cancelarNota`) allowed on `live` connections. Empty (the
+   * default) disables every action on a live connection: fail closed.
+   */
+  BUSINESS_ACTIONS_ENABLED: csv(''),
   PLAN_TTL_SECONDS: int(300, 30, 3600),
   /** Lifetime of a plan that requires approval (four eyes), in minutes. */
   APPROVAL_TTL_MINUTES: int(60, 1, 24 * 60),
@@ -190,6 +195,8 @@ export interface AppConfig {
   safeMode: boolean;
   writeToSankhya: boolean;
   globalWriteEnabled: boolean;
+  /** BUSINESS_ACTIONS_ENABLED: action ids allowed on live connections (empty: none). */
+  businessActionsEnabled: string[];
   demoMode: boolean;
   planTtlSeconds: number;
   /** APPROVAL_TTL_MINUTES: lifetime of plans that require approval. */
@@ -365,6 +372,7 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
     safeMode: e.SAFE_MODE,
     writeToSankhya: e.WRITE_TO_SANKHYA,
     globalWriteEnabled: e.GLOBAL_WRITE_ENABLED,
+    businessActionsEnabled: e.BUSINESS_ACTIONS_ENABLED,
     demoMode: e.DEMO_MODE,
     planTtlSeconds: e.PLAN_TTL_SECONDS,
     approvalTtlMinutes: e.APPROVAL_TTL_MINUTES,

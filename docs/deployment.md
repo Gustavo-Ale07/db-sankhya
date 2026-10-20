@@ -195,6 +195,8 @@ before upgrading.
 - [ ] Strong, unique `SESSION_SECRET` and `POSTGRES_PASSWORD`; `.env` readable only by root
       (`chmod 600 .env`).
 - [ ] `SAFE_MODE=true`, `GLOBAL_WRITE_ENABLED=false`, `WRITE_TO_SANKHYA=false` (the defaults).
+- [ ] `BUSINESS_ACTIONS_ENABLED` empty, or listing only actions whose request body was validated
+      against the official gateway documentation (see docs/architecture.md, Business actions).
 - [ ] Users have the least roles they need (`VIEWER` by default; `ADMIN` does not write ERP data).
 - [ ] Backups scheduled and restore tested.
 - [ ] Host firewall allows only 80/443 (and SSH).

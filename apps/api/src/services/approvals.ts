@@ -18,6 +18,7 @@ import type {
 import { classifyStatement } from '@dbx/sql-engine';
 import type { AuthzService } from './authz';
 import type { ConsumePlanInput, ConsumedPlan, PlansService } from './plans';
+import { parseActionStatement } from './business-actions';
 import { SCRATCH_CONNECTION_ID } from './read-policy';
 import { SCRATCH_TABLE_NAME } from './scratch-guard';
 import type { PolicyService, PolicySnapshot } from './policy';
@@ -130,6 +131,17 @@ function scopeOf(plan: PlanRow): PlanScope | undefined {
   } | null;
   if (typeof cap !== 'object' || cap === null || cap.blocked) return undefined;
   if (cap.class !== 'SUPPORTED' && cap.class !== 'SCRATCH_ONLY') return undefined;
+  if (cap.route === 'SANKHYA_ACTION') {
+    // A business action plan: its statement must still parse to a registered action whose
+    // permission is the only frozen capability action.
+    const parsed = cap.class === 'SUPPORTED' ? parseActionStatement(plan.sql) : undefined;
+    if (!parsed) return undefined;
+    const perm = parsed.action.permission;
+    const acts = cap.actions;
+    if (cap.action !== perm || !Array.isArray(acts) || acts.length !== 1 || acts[0] !== perm)
+      return undefined;
+    return { actions: [perm], primary: perm, entities: [parsed.action.entity], hasWhere: true };
+  }
   if (cap.route !== 'SANKHYA_SAVE' && cap.route !== 'SCRATCH' && cap.route !== 'HYBRID')
     return undefined;
   const actions = cap.actions;

@@ -462,6 +462,58 @@ describe('ApprovalsService.request: plan scope', () => {
   });
 });
 
+describe('ApprovalsService: business action plans', () => {
+  const ACTION_CAPABILITY: Capability = {
+    class: 'SUPPORTED',
+    route: 'SANKHYA_ACTION',
+    reason: 'typed business action',
+    action: 'SANKHYA.BUSINESS_ACTION.EXECUTE',
+    actions: ['SANKHYA.BUSINESS_ACTION.EXECUTE'],
+  };
+  const actionPlan = (sql: string, capability: Capability = ACTION_CAPABILITY) =>
+    plansService.create(
+      newPlan({
+        sql,
+        capability,
+        targets: [{ key: { NUNOTA: 7 }, before: { STATUSNOTA: 'L' } }],
+        previewKind: 'IMPACT_ANALYSIS',
+        summary: { action: 'CACSP_CANCELARNOTA', count: 1, entity: 'TGFCAB' },
+      }),
+    );
+  const STATEMENT =
+    'ACTION CACSP.cancelarNota {"justificativa":"Nota emitida em duplicidade","nunota":7}';
+
+  it('scopes the plan to the action permission and entity', async () => {
+    await addRole('ACTION_APPROVER', ['APPROVAL.DECIDE', 'SANKHYA.BUSINESS_ACTION.EXECUTE']);
+    const approver = await addUser('iris@example.com', 'ACTION_APPROVER');
+    const plan = await actionPlan(STATEMENT);
+    const approval = await service.request(plan.id, requester);
+    // OPERATOR holds no SANKHYA.BUSINESS_ACTION.EXECUTE: a DATA.UPDATE decider cannot approve.
+    await expectCode(service.decide(approval.id, decider, 'APPROVE', null), 'FORBIDDEN');
+    // The permission alone is not enough: the policy must ALLOW the action on TGFCAB.
+    await rule('ALLOW', approver, ['SANKHYA.BUSINESS_ACTION.EXECUTE'], ['TGFPAR']);
+    await expectCode(service.decide(approval.id, approver, 'APPROVE', null), 'FORBIDDEN');
+    await rule('ALLOW', approver, ['SANKHYA.BUSINESS_ACTION.EXECUTE'], ['TGFCAB']);
+    await service.decide(approval.id, approver, 'APPROVE', null);
+    expect(await planStatus(plan.id)).toBe('APPROVED');
+  });
+
+  it('refuses action plans whose statement or capability does not match the registry', async () => {
+    const unknown = await actionPlan('ACTION CACSP.outraAcao {"nunota":7}');
+    await expectCode(service.request(unknown.id, requester), 'VALIDATION_ERROR');
+    const badInput = await actionPlan('ACTION CACSP.cancelarNota {"nunota":7}');
+    await expectCode(service.request(badInput.id, requester), 'VALIDATION_ERROR');
+    const widened = await actionPlan(STATEMENT, {
+      ...ACTION_CAPABILITY,
+      actions: ['SANKHYA.BUSINESS_ACTION.EXECUTE', 'DATA.UPDATE'],
+    });
+    await expectCode(service.request(widened.id, requester), 'VALIDATION_ERROR');
+    const sqlUnderAction = await actionPlan("UPDATE TGFCAB SET STATUSNOTA = 'C' WHERE NUNOTA = 7");
+    await expectCode(service.request(sqlUnderAction.id, requester), 'VALIDATION_ERROR');
+    expect(await database.db.select().from(approvals)).toHaveLength(0);
+  });
+});
+
 describe('ApprovalsService.decide: the decider holds every capability permission', () => {
   it('never lets ADMIN alone approve an ERP write, even with an everyone ALLOW rule', async () => {
     const adminOnly = await addUser('fabi@example.com', 'ADMIN');

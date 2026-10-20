@@ -14,8 +14,18 @@ export const CAPABILITY_CLASSES = [
 ] as const;
 export type CapabilityClass = (typeof CAPABILITY_CLASSES)[number];
 
+/**
+ * `SANKHYA_ACTION` is never produced by `resolveCapability`: it marks a plan for a typed business
+ * action of the API registry (a gateway service call, not a SQL statement).
+ */
 export type CapabilityRoute =
-  'SANKHYA_READ' | 'SANKHYA_SAVE' | 'SCRATCH' | 'HYBRID' | 'DDL_ARTIFACT' | 'NONE';
+  | 'SANKHYA_READ'
+  | 'SANKHYA_SAVE'
+  | 'SANKHYA_ACTION'
+  | 'SCRATCH'
+  | 'HYBRID'
+  | 'DDL_ARTIFACT'
+  | 'NONE';
 
 /** Subset of the RBAC permission strings (Stage 8) a capability can require. */
 export type CapabilityAction =
@@ -27,6 +37,7 @@ export type CapabilityAction =
   | 'DATA.INSERT'
   | 'DATA.UPDATE'
   | 'DATA.DELETE'
+  | 'SANKHYA.BUSINESS_ACTION.EXECUTE'
   | 'DDL.CUSTOM.GENERATE';
 
 export interface Capability {

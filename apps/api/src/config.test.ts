@@ -42,6 +42,7 @@ describe('loadConfig', () => {
     expect(c.safeMode).toBe(true);
     expect(c.globalWriteEnabled).toBe(false);
     expect(c.writeToSankhya).toBe(false);
+    expect(c.businessActionsEnabled).toEqual([]);
     expect(c).not.toHaveProperty('ai');
     expect(c.port).toBe(3001);
     expect(c.session.hours).toBe(12);
@@ -50,6 +51,13 @@ describe('loadConfig', () => {
 
   it('refuses NODE_ENV=test together with APP_ENV=production', () => {
     expect(() => loadConfig({ NODE_ENV: 'test', APP_ENV: 'production' })).toThrow(ConfigError);
+  });
+
+  it('reads BUSINESS_ACTIONS_ENABLED as a list of action ids, empty when blank', () => {
+    expect(loadConfig({ BUSINESS_ACTIONS_ENABLED: '' }).businessActionsEnabled).toEqual([]);
+    expect(
+      loadConfig({ BUSINESS_ACTIONS_ENABLED: ' CACSP.cancelarNota , ' }).businessActionsEnabled,
+    ).toEqual(['CACSP.cancelarNota']);
   });
 
   it('treats an empty DATABASE_URL (as shipped in .env.example) as unset', () => {
