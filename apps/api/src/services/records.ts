@@ -260,6 +260,12 @@ export class AuditService {
     ]);
     return { items, total: totals[0]?.n ?? 0 };
   }
+
+  /** One event by id, or null. */
+  async get(id: string): Promise<AuditEventRow | null> {
+    const [row] = await this.db.select().from(auditEvents).where(eq(auditEvents.id, id)).limit(1);
+    return row ?? null;
+  }
 }
 
 function escapeLike(s: string): string {

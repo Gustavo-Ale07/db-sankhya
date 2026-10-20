@@ -1,9 +1,21 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { ENVIRONMENTS } from '@dbx/shared';
+import { AppError, ENVIRONMENTS } from '@dbx/shared';
 import type { AuditEventRow } from '@dbx/database';
-import { connectionIdSchema, noStore, parseBody, requirePermission } from '../http';
+import {
+  clientIp,
+  connectionIdSchema,
+  noStore,
+  parseBody,
+  requirePermission,
+  uuidParam,
+} from '../http';
+import { createMutationService } from '../services/mutation-factory';
+import type { PreparedMutation } from '../services/mutations';
 import { AUDIT_STATUSES } from '../services/records';
+import { ROLLBACK_LABEL, analyzeRollback } from '../services/rollback';
+import type { RollbackTarget } from '../services/rollback';
+import { valuesMatch } from '../services/verification';
 
 /** Largest page a search may request. */
 const MAX_PAGE_SIZE = 200;
@@ -65,7 +77,7 @@ const toAudit = (a: AuditEventRow) => ({
 });
 
 export async function auditRoutes(app: FastifyInstance): Promise<void> {
-  const { audit } = app.services;
+  const { audit, redact } = app.services;
 
   app.get('/api/audit', async (request, reply) => {
     noStore(reply);
@@ -80,6 +92,96 @@ export async function auditRoutes(app: FastifyInstance): Promise<void> {
     });
     return { items: items.map(toAudit), total };
   });
+
+  // ------------------------------------------------------------ POST /api/audit/:id/rollback-plan
+  // Assisted rollback of a VERIFIED UPDATE (Task 13.2). The first rollback statement is prepared
+  // through MutationService.prepare under the caller's own permissions and policy: a new plan,
+  // a new preview, and the usual confirmation at /api/query/execute. Nothing is written here.
+  const mutations = createMutationService(app);
+  app.post('/api/audit/:id/rollback-plan', async (request, reply) => {
+    noStore(reply);
+    const auth = requirePermission(request, 'AUDIT.READ');
+    const { id } = parseBody(uuidParam, request.params);
+    const event = await audit.get(id);
+    if (!event) throw new AppError('NOT_FOUND', 'Audit event not found');
+    const analysis = analyzeRollback(event);
+    if (!analysis.ok) {
+      throw new AppError('CONFLICT', `No rollback plan for this event: ${analysis.reason}`, {
+        reason: analysis.reason,
+      });
+    }
+    const first = analysis.targets[0]!;
+    const prepared = await mutations.prepare({
+      auth,
+      sql: first.sql,
+      connectionId: analysis.connectionId,
+      meta: { ip: clientIp(request), requestId: request.id },
+    });
+    const conflict = conflictOf(first, prepared);
+    await audit.record({
+      action: 'rollback.planned',
+      status: 'info',
+      userId: auth.user.id,
+      userEmail: auth.user.email,
+      ip: clientIp(request),
+      requestId: request.id,
+      operation: 'UPDATE',
+      resource: analysis.entity,
+      statement: first.sql,
+      connectionId: analysis.connectionId,
+      environment: prepared.impact.environment,
+      planId: prepared.planId,
+      details: {
+        sourceEventId: event.id,
+        sourcePlanId: event.planId,
+        statements: analysis.targets.length,
+        conflict: conflict.detected,
+      },
+    });
+    // The plan token is the caller's own confirmation credential: returned outside the redactor.
+    const { token, ...shown } = prepared;
+    const body = redact({
+      type: 'rollback-plan',
+      label: ROLLBACK_LABEL,
+      sourceEventId: event.id,
+      sql: first.sql,
+      displaySql: analysis.targets.map((t) => t.sql).join(';\n'),
+      statements: analysis.targets.length,
+      conflict,
+      plan: shown,
+    }) as Record<string, unknown> & { plan: Record<string, unknown> };
+    return { ...body, plan: { ...body.plan, token } };
+  });
+}
+
+/**
+ * The values the row holds now (the new preview's before) against the snapshot's after: any
+ * difference means someone changed the row after the original write.
+ */
+function conflictOf(target: RollbackTarget, prepared: PreparedMutation) {
+  const row = prepared.preview.targets.find((t) =>
+    Object.entries(target.key).every(([k, v]) => valuesMatch(v, t.key[k])),
+  );
+  const before = row?.before;
+  if (!before) {
+    return {
+      detected: true,
+      columns: [],
+      message: 'The row no longer exists: it was removed or re-keyed after the original write.',
+    };
+  }
+  const columns = Object.entries(target.expectedCurrent)
+    .filter(([column, expected]) => !valuesMatch(expected, before[column]))
+    .map(([column, expected]) => ({ column, expected, current: before[column] ?? null }));
+  return columns.length
+    ? {
+        detected: true,
+        columns,
+        message:
+          'The row changed after the original write: restoring the old values would overwrite ' +
+          'those later changes. Review the preview before confirming.',
+      }
+    : { detected: false, columns, message: null };
 }
 
 function endOfDay(value: string | Date): Date {
