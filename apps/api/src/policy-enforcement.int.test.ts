@@ -650,6 +650,34 @@ describe('scratch routes', () => {
     expect(zeroed.json().rowCount).toBe(0);
   });
 
+  it('refuses UPDATE and DELETE without a restricting WHERE, like the planned scratch path', async () => {
+    const h = await setup();
+    // An ALLOW rule on TEMP.WRITE does not lift the WHERE requirement (there is no override).
+    await h.policy({ effect: 'ALLOW', actions: ['TEMP.WRITE'] });
+    const { cookie } = await h.viewer();
+    expect((await exec(h, cookie, 'CREATE TABLE tmp_w (a int)')).statusCode).toBe(200);
+    expect((await exec(h, cookie, 'INSERT INTO tmp_w VALUES (1), (2), (3)')).statusCode).toBe(200);
+    for (const sqlText of [
+      'DELETE FROM tmp_w',
+      'UPDATE tmp_w SET a = 0',
+      'DELETE FROM tmp_w WHERE 1 = 1',
+      'UPDATE tmp_w SET a = 0 WHERE a = a',
+    ]) {
+      const res = await exec(h, cookie, sqlText);
+      expect(res.statusCode, sqlText).toBe(400);
+      expect(codeOf(res), sqlText).toBe('WHERE_REQUIRED');
+    }
+    const intact = await exec(h, cookie, 'SELECT a FROM tmp_w ORDER BY a');
+    expect(intact.json().rows).toEqual([[1], [2], [3]]);
+
+    const upd = await exec(h, cookie, 'UPDATE tmp_w SET a = 20 WHERE a = 2');
+    expect(upd.statusCode, upd.body).toBe(200);
+    const del = await exec(h, cookie, 'DELETE FROM tmp_w WHERE a = 1');
+    expect(del.statusCode, del.body).toBe(200);
+    const after = await exec(h, cookie, 'SELECT a FROM tmp_w ORDER BY a');
+    expect(after.json().rows).toEqual([[3], [20]]);
+  });
+
   it('evaluates the read policy before listing scratch tables', async () => {
     const h = await setup();
     const { cookie } = await h.viewer();

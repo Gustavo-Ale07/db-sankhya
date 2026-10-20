@@ -202,9 +202,9 @@ describe('ScratchManager', () => {
     expect((await ws.exec("SELECT repeat('x', 100) AS s")).rows).toHaveLength(1);
     await ws.exec('CREATE TABLE tmp_a (v text)');
     await ws.exec("INSERT INTO tmp_a SELECT repeat('y', 1000) FROM generate_series(1, 20)");
-    expect(await codeOf(ws.transactionalDryRun("UPDATE tmp_a SET v = 'z' WHERE true"))).toBe(
-      'QUERY_LIMIT_EXCEEDED',
-    );
+    expect(
+      await codeOf(ws.transactionalDryRun("UPDATE tmp_a SET v = 'z' WHERE id IS NOT NULL")),
+    ).toBe('QUERY_LIMIT_EXCEEDED');
   }, 60_000);
 
   it('rolls back a write whose RETURNING result passes maxResultBytes (R1)', async () => {
@@ -346,6 +346,7 @@ describe('ScratchManager', () => {
       tables: ['tmp_a'],
       target: null,
       mutating: false,
+      hasWhere: true,
     });
     expect(res.rowCount).toBe(2);
     expect(await ws.tables()).toEqual([{ name: 'tmp_a', rows: 2 }]);

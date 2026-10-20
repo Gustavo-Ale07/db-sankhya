@@ -65,7 +65,8 @@ covers the table on its own. The override then forces strong confirmation and ap
   `/execute`.
 - **Scratch statements** run directly with `POST /api/scratch/exec`. A scratch `INSERT` /
   `UPDATE` / `DELETE` can also be planned through `POST /api/query/preview`, which gives a
-  `TRANSACTIONAL_DRY_RUN` preview.
+  `TRANSACTIONAL_DRY_RUN` preview. On both paths a scratch `UPDATE` or `DELETE` needs a `WHERE`
+  that restricts rows, with no override (`WHERE_REQUIRED`).
 - **Hybrid work** is done in two steps. `POST /api/scratch/materialize` copies the rows of a Sankhya
   read into a `tmp_` table, capped at `MATERIALIZE_MAX_ROWS` and the policy's `maxReadRows`. Scratch
   statements then use that table. The write planner accepts only the `SANKHYA_SAVE` and `SCRATCH`

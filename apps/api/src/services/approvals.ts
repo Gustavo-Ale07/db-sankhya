@@ -166,7 +166,8 @@ function scopeOf(plan: PlanRow): PlanScope | undefined {
     actions: [...new Set(actions)],
     primary,
     entities: [...new Set([classified.table, ...classified.sourceTables])],
-    hasWhere: classified.hasWhere,
+    // An INSERT has no WHERE to give (the TEMP.WRITE rule only asks UPDATE and DELETE for one).
+    hasWhere: classified.kind === 'INSERT' || classified.hasWhere,
   };
 }
 

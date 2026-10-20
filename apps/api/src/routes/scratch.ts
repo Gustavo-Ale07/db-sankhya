@@ -141,6 +141,7 @@ export async function scratchRoutes(app: FastifyInstance): Promise<void> {
         environment: SCRATCH_ENVIRONMENT,
         connectionId: SCRATCH_CONNECTION_ID,
         entities: tables,
+        hasWhere: stmt.hasWhere,
         ...(stmt.columns ? { columns: stmt.columns } : {}),
         defaults: { maxReadRows: config.scratch.maxRows },
       });

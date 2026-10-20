@@ -214,3 +214,52 @@ export function exprToSql(expr: Expr): string {
       return `${expr.fn}(${expr.distinct ? 'DISTINCT ' : ''}${expr.arg === '*' ? '*' : exprToSql(expr.arg)})`;
   }
 }
+
+/** True when the expression references a column (or an aggregate over one). */
+export function hasColumn(e: Expr): boolean {
+  switch (e.kind) {
+    case 'literal':
+      return false;
+    case 'column':
+      return true;
+    case 'compare':
+    case 'arith':
+    case 'and':
+    case 'or':
+      return hasColumn(e.left) || hasColumn(e.right);
+    case 'not':
+    case 'neg':
+    case 'isNull':
+      return hasColumn(e.expr);
+    case 'in':
+      return hasColumn(e.expr) || e.list.some(hasColumn);
+    case 'between':
+      return hasColumn(e.expr) || hasColumn(e.low) || hasColumn(e.high);
+    case 'like':
+      return hasColumn(e.expr) || hasColumn(e.pattern);
+    case 'aggregate':
+      return true;
+  }
+}
+
+/**
+ * True when a WHERE matches every row: a column-free (constant) condition, or a column compared
+ * with itself. Shared by every write path so they refuse the same conditions.
+ */
+export function isTrivialWhere(e: Expr): boolean {
+  if (!hasColumn(e)) return true;
+  if (e.kind === 'and') return isTrivialWhere(e.left) && isTrivialWhere(e.right);
+  if (e.kind === 'or') return isTrivialWhere(e.left) || isTrivialWhere(e.right);
+  if (
+    e.kind === 'compare' &&
+    e.op === '=' &&
+    e.left.kind === 'column' &&
+    e.right.kind === 'column'
+  ) {
+    return (
+      e.left.name.toUpperCase() === e.right.name.toUpperCase() &&
+      (e.left.table ?? '').toUpperCase() === (e.right.table ?? '').toUpperCase()
+    );
+  }
+  return false;
+}

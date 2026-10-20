@@ -76,7 +76,9 @@
  * 6. UPDATE/DELETE without WHERE: DENY, unless one matching ALLOW rule with
  *    `overrideWhereRequired` covers every requested entity on its own and no matching rule sets
  *    `limits.requireWhere`. The override forces `requireStrongConfirmation` and `requireApproval`.
- *    `limits.requireWhere` reports whether the statement needs a WHERE.
+ *    `limits.requireWhere` reports whether the statement needs a WHERE. `TEMP.WRITE` (scratch
+ *    INSERT, UPDATE and DELETE) without WHERE is always DENY, with no override; a scratch INSERT
+ *    passes `hasWhere: true`, since it has no WHERE to give.
  * 7. Defaults: see `DEFAULT_LIMITS`.
  */
 import { PERMISSIONS, type Permission } from './permissions';
@@ -141,6 +143,10 @@ export interface PolicyRequest {
   entities: string[];
   /** Every referenced column; `undefined` means unknown and is treated as `*`. */
   columns?: PolicyColumn[];
+  /**
+   * Whether the statement restricts its rows with a WHERE. A statement with no WHERE to give (an
+   * INSERT, a business action) may pass true; a scratch INSERT must, since `TEMP.WRITE` covers it.
+   */
   hasWhere: boolean;
 }
 
@@ -332,7 +338,7 @@ export interface TableDenies {
  * DENY rules decide the effect: a request is denied exactly when it is malformed or a DENY rule
  * that matches the context overlaps it, which is what `evaluatePolicy` decides. Returns null,
  * meaning deny everything, when `evaluatePolicy` would deny every request of the context: the
- * action is unknown, a write or not held, the environment or context is malformed, or any enabled
+ * action is unknown, a write, `TEMP.WRITE` or not held, the environment or context is malformed, or any enabled
  * rule is invalid. Never throws.
  */
 export function compileDenyChecker(
@@ -345,6 +351,8 @@ export function compileDenyChecker(
     const environment = readOwn(context, 'environment');
     if (typeof action !== 'string' || !PERMISSION_SET.has(action)) return null;
     if (isPolicyWriteAction(action)) return null;
+    // A checker answers for hasWhere false, which TEMP.WRITE always denies.
+    if (action === 'TEMP.WRITE') return null;
     if (typeof environment !== 'string' || !ENVIRONMENT_SET.has(environment)) return null;
     const base = {
       userId: readOwn(context, 'userId'),
@@ -638,6 +646,12 @@ function evaluate(
       limits.requireWhere = true;
       if (!req.hasWhere) return deny(`${req.action} without WHERE is not allowed`);
     }
+  }
+  if (req.action === 'TEMP.WRITE') {
+    // Scratch UPDATE/DELETE always need a WHERE, with no override, as on both scratch paths.
+    // A scratch INSERT has no WHERE to give and is sent with hasWhere true.
+    limits.requireWhere = true;
+    if (!req.hasWhere) return deny('TEMP.WRITE without WHERE is not allowed');
   }
 
   if (write && req.environment === 'PRODUCTION') {

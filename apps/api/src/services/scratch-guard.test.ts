@@ -18,7 +18,7 @@ describe('analyzeScratchSql', () => {
     ['CREATE TEMP TABLE tmp_a (id int)', 'CREATE TABLE', 'TEMP.CREATE', 'tmp_a'],
     ['CREATE TABLE tmp_a (id int)', 'CREATE TABLE', 'TEMP.CREATE', 'tmp_a'],
     ['INSERT INTO tmp_a VALUES (1)', 'INSERT', 'TEMP.WRITE', 'tmp_a'],
-    ['UPDATE tmp_a SET id = 2', 'UPDATE', 'TEMP.WRITE', 'tmp_a'],
+    ['UPDATE tmp_a SET id = 2 WHERE id = 1', 'UPDATE', 'TEMP.WRITE', 'tmp_a'],
     ['DELETE FROM tmp_a WHERE id = 1', 'DELETE', 'TEMP.WRITE', 'tmp_a'],
     ['ALTER TABLE tmp_a ADD COLUMN n text', 'ALTER TABLE', 'TEMP.CREATE', 'tmp_a'],
     ['DROP TABLE tmp_a', 'DROP TABLE', 'TEMP.DROP', 'tmp_a'],
@@ -26,6 +26,29 @@ describe('analyzeScratchSql', () => {
     const stmt = analyzeScratchSql(sql);
     expect(stmt).toMatchObject({ command, action, target, mutating: command !== 'SELECT' });
     expect(stmt.tables).toContain('tmp_a');
+  });
+
+  it.each([
+    'UPDATE tmp_a SET id = 2',
+    'DELETE FROM tmp_a',
+    'UPDATE tmp_a SET id = 2 WHERE 1 = 1',
+    'DELETE FROM tmp_a WHERE id = id',
+    'DELETE FROM tmp_a WHERE id = 1 OR 2 > 1',
+  ])('refuses %s as WHERE_REQUIRED, like the planned scratch path', (sql) => {
+    expect(codeOf(sql)).toBe('WHERE_REQUIRED');
+  });
+
+  it('accepts UPDATE and DELETE with a WHERE that restricts rows, and reports it', () => {
+    expect(analyzeScratchSql('UPDATE tmp_a SET n = n + 1 WHERE id > 10')).toMatchObject({
+      command: 'UPDATE',
+      hasWhere: true,
+    });
+    expect(analyzeScratchSql('DELETE FROM tmp_a WHERE id = 1 AND 1 = 1')).toMatchObject({
+      command: 'DELETE',
+      hasWhere: true,
+    });
+    // INSERT has no WHERE to give: the policy engine is told it needs none.
+    expect(analyzeScratchSql('INSERT INTO tmp_a VALUES (1)').hasWhere).toBe(true);
   });
 
   it('allows CTEs and joins between scratch tables', () => {
@@ -185,7 +208,7 @@ describe('analyzeScratchSql', () => {
 
     it('is left undefined for statements other than SELECT', () => {
       expect(analyzeScratchSql('INSERT INTO tmp_a SELECT id FROM tmp_b').columns).toBeUndefined();
-      expect(analyzeScratchSql('UPDATE tmp_a SET id = 2').columns).toBeUndefined();
+      expect(analyzeScratchSql('UPDATE tmp_a SET id = 2 WHERE id = 1').columns).toBeUndefined();
     });
   });
 });

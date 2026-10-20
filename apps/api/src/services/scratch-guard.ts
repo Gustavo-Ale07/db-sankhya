@@ -8,7 +8,7 @@
  */
 import { AppError } from '@dbx/shared';
 import type { PolicyColumn } from '@dbx/shared';
-import { classifyStatement, type Classified } from '@dbx/sql-engine';
+import { classifyStatement, isTrivialWhere, type Classified } from '@dbx/sql-engine';
 import parserPkg from 'node-sql-parser';
 
 const { Parser } = parserPkg;
@@ -33,6 +33,11 @@ export interface ScratchStatement {
   /** The table written by INSERT/UPDATE/DELETE/CREATE/ALTER/DROP. */
   target: string | null;
   mutating: boolean;
+  /**
+   * False only for an UPDATE or DELETE without a WHERE, which `analyzeScratchSql` refuses anyway.
+   * An INSERT has no WHERE to give and reports true, which is what the policy engine expects.
+   */
+  hasWhere: boolean;
   /**
    * Columns a SELECT reads, for column policy rules (see `selectColumns`). Undefined for every
    * other command: the policy engine then treats each table as `*`, which every column rule hits.
@@ -129,12 +134,14 @@ export function analyzeScratchSql(input: string): ScratchStatement {
     tables: first.tables,
     target: first.target,
     mutating: first.command !== 'SELECT',
+    hasWhere: first.hasWhere,
     ...(first.command === 'SELECT' ? { columns: selectColumns(first.ast, first.tables) } : {}),
   };
 }
 
 interface Checked {
   command: ScratchCommand;
+  hasWhere: boolean;
   action: ScratchAction;
   tables: string[];
   target: string | null;
@@ -151,6 +158,7 @@ function check(input: string): Checked {
     );
   }
   const { command, action } = COMMANDS[classified.kind];
+  const hasWhere = assertWhere(classified);
 
   // 2. The PostgreSQL AST (the classifier may have accepted a T-SQL-only read; scratch is PG).
   let ast: Node;
@@ -199,7 +207,30 @@ function check(input: string): Checked {
     target = classified.table;
     accept(target);
   }
-  return { command, action, tables: [...tables].sort(), target, ast };
+  return { command, action, hasWhere, tables: [...tables].sort(), target, ast };
+}
+
+/**
+ * Scratch UPDATE and DELETE always need a WHERE that restricts rows, with no override: the same
+ * rule, code and messages as the planned scratch path (`validateWrite` in mutations.ts).
+ * Returns the `hasWhere` the policy engine is given (true for every other statement).
+ */
+function assertWhere(classified: Exclude<Classified, { kind: 'UNKNOWN' }>): boolean {
+  if (classified.kind !== 'UPDATE' && classified.kind !== 'DELETE') return true;
+  if (!classified.hasWhere) {
+    throw new AppError(
+      'WHERE_REQUIRED',
+      `${classified.kind} without WHERE affects every row and is blocked.`,
+    );
+  }
+  const where = classified.stmt && 'where' in classified.stmt ? classified.stmt.where : undefined;
+  if (where && isTrivialWhere(where)) {
+    throw new AppError(
+      'WHERE_REQUIRED',
+      `${classified.kind} with a condition that does not restrict rows is blocked.`,
+    );
+  }
+  return true;
 }
 
 /** Cross-check of the classifier against the PostgreSQL AST root. */

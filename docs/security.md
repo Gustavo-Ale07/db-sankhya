@@ -199,7 +199,10 @@ The decision is made in this order:
 5. Any write on a `PRODUCTION` connection requires strong confirmation.
 6. An `UPDATE` of a Sankhya table without `WHERE` is refused unless an `ALLOW` rule with
    `overrideWhereRequired` covers each entity and no rule sets `requireWhere`. The override then
-   forces strong confirmation and approval. A `DELETE` without `WHERE` is always refused.
+   forces strong confirmation and approval. A `DELETE` without `WHERE` is always refused, and so
+   is a scratch (`TEMP.WRITE`) `UPDATE` or `DELETE` without `WHERE`, with no override, whether it
+   runs directly or through a plan. A `WHERE` that does not restrict rows (`1 = 1`, `a = a`) counts
+   as none.
 
 Defaults when no rule sets a limit: `maxReadRows` 1000, `maxWriteRows` 50, strong confirmation and
 approval off, snapshots on. Hard ceilings: 100000 rows read, 1000 rows written. There is no

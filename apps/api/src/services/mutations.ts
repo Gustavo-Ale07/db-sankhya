@@ -27,7 +27,7 @@
  */
 import { AppError, SNAPSHOT_MAX_ROWS, isAppError } from '@dbx/shared';
 import type { Environment, ErrorCode, Permission, PolicyColumn, PolicyDecision } from '@dbx/shared';
-import { classifyStatement, resolveCapability } from '@dbx/sql-engine';
+import { classifyStatement, isTrivialWhere, resolveCapability } from '@dbx/sql-engine';
 import type {
   Capability,
   Classified,
@@ -823,7 +823,8 @@ export class MutationService {
       environment: SCRATCH_ENVIRONMENT,
       connectionId: SCRATCH_CONNECTION_ID,
       entities: [...new Set([...stmt.tables, stmt.target])],
-      hasWhere: write.hasWhere,
+      // An INSERT has no WHERE to give; the TEMP.WRITE rule only asks UPDATE and DELETE for one.
+      hasWhere: write.kind === 'INSERT' || write.hasWhere,
       ...(this.deps.scratchMaxReadRows !== undefined
         ? { defaults: { maxReadRows: this.deps.scratchMaxReadRows } }
         : {}),
@@ -1796,51 +1797,6 @@ export function renderExpr(e: Expr, qualifiers: Set<string>, known: Set<string>)
         new AppError('OPERATION_NOT_SUPPORTED', 'Aggregates are not allowed in a write.'),
       );
   }
-}
-
-/** True when a column-free (constant) condition, or a column compared with itself, makes the WHERE match every row. */
-function hasColumn(e: Expr): boolean {
-  switch (e.kind) {
-    case 'literal':
-      return false;
-    case 'column':
-      return true;
-    case 'compare':
-    case 'arith':
-    case 'and':
-    case 'or':
-      return hasColumn(e.left) || hasColumn(e.right);
-    case 'not':
-    case 'neg':
-    case 'isNull':
-      return hasColumn(e.expr);
-    case 'in':
-      return hasColumn(e.expr) || e.list.some(hasColumn);
-    case 'between':
-      return hasColumn(e.expr) || hasColumn(e.low) || hasColumn(e.high);
-    case 'like':
-      return hasColumn(e.expr) || hasColumn(e.pattern);
-    case 'aggregate':
-      return true;
-  }
-}
-
-function isTrivialWhere(e: Expr): boolean {
-  if (!hasColumn(e)) return true;
-  if (e.kind === 'and') return isTrivialWhere(e.left) && isTrivialWhere(e.right);
-  if (e.kind === 'or') return isTrivialWhere(e.left) || isTrivialWhere(e.right);
-  if (
-    e.kind === 'compare' &&
-    e.op === '=' &&
-    e.left.kind === 'column' &&
-    e.right.kind === 'column'
-  ) {
-    return (
-      e.left.name.toUpperCase() === e.right.name.toUpperCase() &&
-      (e.left.table ?? '').toUpperCase() === (e.right.table ?? '').toUpperCase()
-    );
-  }
-  return false;
 }
 
 const notSimulable = () =>

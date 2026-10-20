@@ -375,6 +375,26 @@ const cases: Case[] = [
     effect: 'ALLOW',
   },
   {
+    name: 'a scratch UPDATE/DELETE (TEMP.WRITE) without WHERE is denied',
+    request: req({ action: 'TEMP.WRITE', entities: ['tmp_a'], hasWhere: false }),
+    rules: [],
+    effect: 'DENY',
+    reason: /TEMP.WRITE without WHERE/,
+  },
+  {
+    name: 'a WHERE override never applies to TEMP.WRITE',
+    request: req({ action: 'TEMP.WRITE', entities: ['tmp_a'], hasWhere: false }),
+    rules: [rule({ id: 'override', actions: ['TEMP.WRITE'], overrideWhereRequired: true })],
+    effect: 'DENY',
+    reason: /TEMP.WRITE without WHERE/,
+  },
+  {
+    name: 'TEMP.WRITE with a WHERE (or an INSERT, which passes hasWhere) is allowed',
+    request: req({ action: 'TEMP.WRITE', entities: ['tmp_a'], hasWhere: true }),
+    rules: [],
+    effect: 'ALLOW',
+  },
+  {
     name: 'a WHERE override is ignored unless its rule covers every entity',
     request: update({ hasWhere: false, entities: ['TGFPAR', 'TSIUSU'] }),
     rules: [
@@ -1351,6 +1371,8 @@ describe('compileDenyChecker', () => {
   it('is null whenever evaluatePolicy would deny every request of the context', () => {
     const perms = new Set<Permission>(['QUERY.SELECT', 'DATA.UPDATE']);
     expect(compileDenyChecker({ ...ctx, action: 'DATA.UPDATE' }, [], perms)).toBeNull();
+    // A checker answers for hasWhere false, which TEMP.WRITE always denies.
+    expect(compileDenyChecker({ ...ctx, action: 'TEMP.WRITE' }, [], ALL)).toBeNull();
     expect(compileDenyChecker(ctx, [], new Set<Permission>())).toBeNull();
     expect(compileDenyChecker(ctx, [rule({ id: 'bad', actions: [] })], perms)).toBeNull();
     expect(
