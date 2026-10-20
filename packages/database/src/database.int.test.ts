@@ -24,6 +24,23 @@ describe('database', () => {
     await expect(handle.ping()).resolves.toBeUndefined();
   });
 
+  it('seeds DATA.PREVIEW on ADMIN and OPERATOR only, and re-running the seed is harmless', async () => {
+    const holders = async () =>
+      (
+        await handle.db
+          .select({ key: roles.key })
+          .from(rolePermissions)
+          .innerJoin(roles, eq(roles.id, rolePermissions.roleId))
+          .where(eq(rolePermissions.permission, 'DATA.PREVIEW'))
+      )
+        .map((r) => r.key)
+        .sort();
+    expect(await holders()).toEqual(['ADMIN', 'OPERATOR']);
+    const seed = readFileSync(join(defaultMigrationsDir(), '0012_data_preview.sql'), 'utf8');
+    await handle.db.execute(sql.raw(seed));
+    expect(await holders()).toEqual(['ADMIN', 'OPERATOR']);
+  });
+
   it('enforces unique lower-case e-mails', async () => {
     const [u] = await handle.db
       .insert(users)

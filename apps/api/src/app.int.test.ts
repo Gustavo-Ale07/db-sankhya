@@ -1015,7 +1015,8 @@ describe('self-escalation', () => {
     const me = (await h.call(admin, { method: 'GET', url: '/api/auth/me' })).json().user as {
       permissions: string[];
     };
-    expect(me.permissions.filter((p) => /^(DATA|DDL|SANKHYA)\./.test(p))).toEqual([]);
+    // DATA.PREVIEW (seeded on ADMIN) shows a plan and never runs one; no write permission leaks.
+    expect(me.permissions.filter((p) => /^(DATA|DDL|SANKHYA)\./.test(p))).toEqual(['DATA.PREVIEW']);
 
     const denied = await h.call(admin, { method: 'GET', url: '/api/audit?status=denied' });
     expect(

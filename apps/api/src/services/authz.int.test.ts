@@ -89,12 +89,14 @@ describe('AuthzService', () => {
     expect(grants.permissions.size).toBe(0);
   });
 
-  it('does not give ADMIN any DATA.*, DDL.* or SANKHYA.* permission', async () => {
+  it('gives ADMIN no write DATA.*, DDL.* or SANKHYA.* permission, only DATA.PREVIEW', async () => {
     const admin = await newUser('admin@example.com', ['ADMIN']);
     const perms = await authz.effectivePermissions(admin);
     expect(perms.has('ADMIN.USERS')).toBe(true);
-    expect(perms.has('DATA.UPDATE')).toBe(false);
-    for (const p of perms) expect(p).not.toMatch(/^(DATA|DDL|SANKHYA)\./);
+    expect(perms.has('DATA.PREVIEW')).toBe(true);
+    for (const p of ['DATA.INSERT', 'DATA.UPDATE', 'DATA.DELETE'] as const)
+      expect(perms.has(p)).toBe(false);
+    for (const p of perms) if (p !== 'DATA.PREVIEW') expect(p).not.toMatch(/^(DATA|DDL|SANKHYA)\./);
   });
 
   it('ignores permission strings outside the catalog (fail closed)', async () => {
