@@ -14,6 +14,15 @@ export interface ExecutionStep {
   errorCode?: string;
   /** true: read back and every field matched; false: a mismatch or a missing row; absent: not read. */
   verified?: boolean;
+  /** The row before the change, restricted to the `expected` fields; null for an INSERT. */
+  before?: Record<string, unknown> | null;
+  /** What the plan meant to write: the fields it set, with their intended values. */
+  expected?: Record<string, unknown>;
+  /**
+   * The same fields as the server read them back after the write. Only ever from the real
+   * read-back (never copied from `expected`); absent when the row could not be read or is gone.
+   */
+  observed?: Record<string, unknown>;
 }
 
 export interface ExecutionReport {
@@ -70,17 +79,26 @@ export interface VerifyTarget {
   expected: Record<string, unknown>;
 }
 
+/** The read-back of one target. */
+export interface VerifyResult {
+  /** true: every field matched; false: a mismatch or the row is gone; absent: not read. */
+  verified?: boolean;
+  /** The row as read, restricted to the keys of `expected`; absent unless the row was read. */
+  observed?: Record<string, unknown>;
+}
+
 /**
- * Reads the targets back with `loadRecords` (idempotent) and returns, per target, true (every
- * field matched), false (a mismatch, or the row is gone) or undefined (it could not be read: a
- * failed read never counts as verified). Targets without a complete key are never verified.
+ * Reads the targets back with `loadRecords` (idempotent) and returns, per target, `verified`
+ * true (every field matched), false (a mismatch, or the row is gone) or absent (it could not be
+ * read: a failed read never counts as verified), plus the `observed` values of exactly the
+ * expected fields when the row was read. Targets without a complete key are never verified.
  */
 export async function verifyByKey(
   client: Pick<SankhyaClient, 'loadRecords'>,
   input: { entityName: string; pk: string[]; targets: VerifyTarget[] },
-): Promise<Array<boolean | undefined>> {
+): Promise<VerifyResult[]> {
   const { entityName, pk, targets } = input;
-  const out: Array<boolean | undefined> = targets.map(() => undefined);
+  const out: VerifyResult[] = targets.map(() => ({}));
   const readable = targets
     .map((t, i) => ({ t, i }))
     .filter(({ t }) => pk.length > 0 && pk.every((k) => cell(t.key[k]) !== null));
@@ -114,9 +132,18 @@ export async function verifyByKey(
     }
     for (const { t, i } of chunk) {
       const row = rows.get(keySig(pk, t.key));
-      out[i] =
-        row !== undefined &&
-        Object.entries(t.expected).every(([field, value]) => valuesMatch(value, row[field]));
+      if (row === undefined) {
+        out[i] = { verified: false };
+        continue;
+      }
+      out[i] = {
+        verified: Object.entries(t.expected).every(([field, value]) =>
+          valuesMatch(value, row[field]),
+        ),
+        observed: Object.fromEntries(
+          Object.keys(t.expected).map((field) => [field, cell(row[field])]),
+        ),
+      };
     }
   }
   return out;
