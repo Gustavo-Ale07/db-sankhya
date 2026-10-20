@@ -120,8 +120,8 @@ describe('loadConfig', () => {
     expect(problemsOf({ ...PROD, TRUST_PROXY: '0' })).toEqual([]);
   });
 
-  it('ignores settings of removed features', () => {
-    expect(problemsOf({ AI_PROVIDER: 'openai' })).toEqual([]);
+  it('ignores unknown keys, such as settings of removed features', () => {
+    expect(problemsOf({ RETIRED_FEATURE_PROVIDER: 'example' })).toEqual([]);
     expect(loadConfig({ WRITE_CONFIRMATION_TTL_SECONDS: '5' })).not.toHaveProperty(
       'writeConfirmationTtlSeconds',
     );
