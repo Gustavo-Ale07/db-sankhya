@@ -9,6 +9,8 @@ export interface PendingApproval {
   planId: string;
   planHash: string;
   requestedBy: string;
+  /** Display name of the requester; null when the account no longer exists. */
+  requestedByName?: string | null;
   createdAt: string;
   expiresAt: string;
   plan: {

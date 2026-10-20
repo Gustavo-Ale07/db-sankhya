@@ -89,7 +89,12 @@ export function ApprovalsPage() {
               <dl className="grid grid-cols-2 gap-x-4 gap-y-1 md:grid-cols-3">
                 <div>
                   <dt className="text-muted">Solicitante</dt>
-                  <dd className="font-mono break-all">{a.requestedBy}</dd>
+                  <dd data-testid="approval-requester">
+                    {a.requestedByName ?? 'Usuário removido'}
+                    <span className="block font-mono text-[11px] break-all text-muted">
+                      {a.requestedBy}
+                    </span>
+                  </dd>
                 </div>
                 <div>
                   <dt className="text-muted">Ambiente</dt>

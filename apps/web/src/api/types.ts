@@ -203,3 +203,66 @@ export interface SystemStatus {
   roles: string[];
   permissions: Permission[];
 }
+
+export interface GroupInfo {
+  id: string;
+  name: string;
+  description: string | null;
+  active: boolean;
+  memberIds: string[];
+  roleKeys: string[];
+}
+
+export type PolicyEffect = 'ALLOW' | 'DENY';
+export type PolicySubjectType = 'user' | 'group' | 'everyone';
+
+export interface PolicyLimits {
+  maxReadRows?: number;
+  maxWriteRows?: number;
+  requireWhere?: boolean;
+  requirePreview?: boolean;
+  requireConfirmation?: boolean;
+  requireStrongConfirmation?: boolean;
+  requireApproval?: boolean;
+}
+
+export interface PolicyRule {
+  id: string;
+  name: string;
+  effect: PolicyEffect;
+  subjectType: PolicySubjectType;
+  subjectId: string | null;
+  environments: ConnectionEnvironment[];
+  connectionIds: string[];
+  actions: string[];
+  entities: string[];
+  columns: string[];
+  limits: PolicyLimits;
+  overrideWhereRequired: boolean;
+  enabled: boolean;
+  updatedAt: string;
+}
+
+/** An admin view of a connection: secrets only as states, never values. */
+export interface AdminConnection {
+  id: string;
+  name: string;
+  environment: ConnectionEnvironment;
+  mode: 'live' | 'mock';
+  baseUrl: string;
+  dialect: 'oracle' | 'mssql';
+  enabled: boolean;
+  source: 'env' | 'database';
+  editable: boolean;
+  status: 'READY' | 'NOT_CONFIGURED' | 'DISABLED';
+  secrets: { clientId: string; clientSecret: 'SET' | 'NOT_SET'; xToken: 'SET' | 'NOT_SET' };
+  secretsRotatedAt: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+}
+
+export interface GlobalWriteState {
+  env: boolean;
+  runtime: boolean;
+  effective: boolean;
+}

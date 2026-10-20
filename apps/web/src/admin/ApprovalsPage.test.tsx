@@ -15,6 +15,7 @@ const base = (id: string, withSql: boolean): PendingApproval => ({
   planId: `plan-${id}`,
   planHash: 'h',
   requestedBy: 'requester-1',
+  requestedByName: 'Ana Exemplo',
   createdAt: '2026-01-01T10:00:00.000Z',
   expiresAt: '2026-01-01T11:00:00.000Z',
   plan: {
@@ -54,6 +55,7 @@ describe('ApprovalsPage', () => {
     expect(screen.getByTestId('approval-sql').textContent).toContain('UPDATE TGFPRO');
     expect(screen.getAllByTestId('approval-no-sql')).toHaveLength(1);
     expect(screen.getAllByText('PRODUCTION')).toHaveLength(2);
+    expect(screen.getAllByTestId('approval-requester')[0]!.textContent).toContain('Ana Exemplo');
   });
 
   it('approves only after confirmation, then refreshes', async () => {
