@@ -181,7 +181,11 @@ test('users page shows effective roles and assigns roles to a new user', async (
     .filter({ hasText: 'leitora@example.com' })
     .getByRole('button', { name: 'Papéis' })
     .click();
-  await page.getByRole('dialog').getByLabel('Operador').check();
+  // Anchored: the e2e-only role E2E_OPERADOR_APROVADOR is listed too.
+  await page
+    .getByRole('dialog')
+    .getByRole('checkbox', { name: /^Operador / })
+    .check();
   await page.getByRole('dialog').getByRole('button', { name: 'Salvar papéis' }).click();
   await expect(page.getByTestId('roles-leitora@example.com')).toHaveText('Operador, Leitor');
 });
