@@ -30,6 +30,7 @@ node scripts/permissions-doc.mjs --check   # fails when the table and the code d
 | `TEMP.WRITE`                      | permission-only | yes    | yes      | yes   |
 | `TEMP.DROP`                       | permission-only | yes    | yes      | yes   |
 | `TEMP.MATERIALIZE`                | permission-only | yes    | yes      | yes   |
+| `DATA.PREVIEW`                    | permission-only |        | yes      | yes   |
 | `DATA.INSERT`                     | write           |        | yes      |       |
 | `DATA.UPDATE`                     | write           |        | yes      |       |
 | `DATA.DELETE`                     | write           |        |          |       |
@@ -48,13 +49,24 @@ node scripts/permissions-doc.mjs --check   # fails when the table and the code d
 
 Notes:
 
-- `ADMIN` administers the tool. It has no `DATA.*`, `DDL.*` or `SANKHYA.*` permission, and there is
-  no administrator bypass anywhere. An administrator who must also write ERP data needs a second
+- `ADMIN` administers the tool. It has no write `DATA.*` permission (`DATA.INSERT`, `DATA.UPDATE`,
+  `DATA.DELETE`) and no `DDL.*` or `SANKHYA.*` permission, and there is no administrator bypass
+  anywhere. Its only `DATA.*` permission is `DATA.PREVIEW`. An administrator who must also write ERP data needs a second
   role.
 - No seeded role holds `DATA.DELETE`, `DDL.CUSTOM.GENERATE` or `SANKHYA.BUSINESS_ACTION.EXECUTE`.
   Grant them through a custom role. `DATA.DELETE` has no effect on Sankhya tables today: a `DELETE`
   on a Sankhya table is `UNSUPPORTED` (see [capabilities.md](capabilities.md)). It applies to
   nothing else either, since scratch deletes use `TEMP.WRITE`.
+- `DATA.PREVIEW` lets a user **see the preview** of an `INSERT` / `UPDATE` / `DELETE` plan on a
+  Sankhya table without the statement permission. It never lets anyone execute: `execute` re-checks
+  the statement permission (`DATA.INSERT` / `DATA.UPDATE` / `DATA.DELETE`) with fresh grants and
+  refuses with `FORBIDDEN`, whatever the write switches say. Everything else still applies to the
+  preview: the policy rules are evaluated for the **statement** action (so the entity still needs an
+  explicit `ALLOW` for that action, and column / row `DENY` rules refuse it), the snapshot read is
+  checked as `QUERY.SELECT`, and the `WHERE` rules hold. The preview response reports
+  `operation` and `execution.permitted` (whether the caller holds the permission to execute it).
+  A plan the owner may not execute cannot be submitted for approval either. `DATA.PREVIEW` is not a
+  policy action and does not conflict with `ADMIN.POLICIES`.
 - No permission allows DDL on native ERP tables. It is refused for every role.
 - Permission strings outside the catalog are ignored when roles are resolved.
 
@@ -67,6 +79,7 @@ Notes:
 | `TEMP.WRITE`                      | scratch `INSERT` / `UPDATE` / `DELETE` (`POST /api/scratch/exec`, and plans for `tmp_` tables through `POST /api/query/preview`)                                       |
 | `TEMP.DROP`                       | scratch `DROP TABLE` (`POST /api/scratch/exec`)                                                                                                                        |
 | `TEMP.MATERIALIZE`                | `POST /api/scratch/materialize` (with `QUERY.SELECT`), evaluated on both the scratch side and the Sankhya source side                                                  |
+| `DATA.PREVIEW`                    | `POST /api/query/preview` for Sankhya `INSERT` / `UPDATE` / `DELETE` without the statement permission; never `execute`; policy evaluated on the statement action       |
 | `DATA.INSERT`                     | `INSERT` plans on Sankhya tables (`POST /api/query/preview`, `POST /api/query/execute`)                                                                                |
 | `DATA.UPDATE`                     | `UPDATE` plans on Sankhya tables, including assisted rollback plans                                                                                                    |
 | `DATA.DELETE`                     | checked for `DELETE` statements; a Sankhya `DELETE` is still refused as unsupported                                                                                    |
@@ -77,13 +90,14 @@ Notes:
 | `ADMIN.USERS`                     | `/api/admin/users` (assigning roles also needs `ADMIN.ROLES`)                                                                                                          |
 | `ADMIN.GROUPS`                    | `/api/admin/groups` (granting roles to a group also needs `ADMIN.ROLES`)                                                                                               |
 | `ADMIN.ROLES`                     | `/api/admin/roles`                                                                                                                                                     |
-| `ADMIN.POLICIES`                  | `/api/admin/policies` (changing a rule is refused to an account that also holds a `DATA.*`, `DDL.*` or `SANKHYA.*` permission)                                         |
+| `ADMIN.POLICIES`                  | `/api/admin/policies` (changing a rule is refused to an account that also holds a write `DATA.*`, `DDL.*` or `SANKHYA.*` permission)                                   |
 | `ADMIN.CONNECTIONS`               | `/api/admin/connections` (create, edit, replace secrets, test, delete)                                                                                                 |
 | `ADMIN.SECURITY`                  | `GET` / `PUT /api/admin/security` (the runtime write kill switch), cancelling another user's running query                                                             |
 
 Authenticated routes that need no specific permission: `GET /api/status`, `GET /api/auth/me`,
 logout, password change, history, saved queries, `POST /api/query/cancel` for one's own
-executions, and `POST /api/approvals` (the plan owner asks for approval). `GET /health/live`,
+executions, and `POST /api/approvals` (the plan owner asks for approval; the owner must hold the permissions
+the plan needs to execute). `GET /health/live`,
 `GET /health/ready` and `GET /api/meta` are public.
 
 ## Upgrading from an earlier version
