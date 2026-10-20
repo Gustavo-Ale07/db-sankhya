@@ -7,7 +7,7 @@ import type { Environment, Permission, PolicyColumn, PolicyDecision } from '@dbx
 import type { ReadAnalysis } from '@dbx/sql-engine';
 import type { AuthState } from '../context';
 import type { ConnectionsService } from './connections';
-import type { Catalog } from './metadata';
+import type { Catalog, CatalogTable } from './metadata';
 import type { PolicyService } from './policy';
 
 /**
@@ -145,4 +145,70 @@ export async function authorizeConnection(
   const decision = await evaluateFor({ ...check, environment, entities: [], columns: [] });
   if (decision.effect !== 'ALLOW') return { ok: false, reasons: decision.reasons };
   return { ok: true, environment, decision };
+}
+
+/**
+ * The part of `catalog` the user may read with QUERY.SELECT, so the schema browser and
+ * autocomplete never disclose names a read would be denied on. A table is omitted when a read of
+ * it (no column) is denied; a column is omitted when a read of that one column is denied. A
+ * foreign key that names an omitted table or column at either end is omitted too. The shape of
+ * the catalog is unchanged.
+ *
+ * Cost: `PolicyService.evaluate` takes one request, but runs in memory over the cached rule set,
+ * so this makes no database call per table. Per table: one evaluation without columns, one with
+ * every column, and one per column only when that combined check is denied.
+ *
+ * Fails closed: if any evaluation throws, no table is returned.
+ */
+export async function visibleCatalog(
+  check: Omit<PolicyCheck, 'action' | 'entities' | 'columns' | 'hasWhere'>,
+  catalog: Catalog,
+  onError?: (err: unknown) => void,
+): Promise<Catalog> {
+  const read = (entity: string, columns: PolicyColumn[]) =>
+    evaluateFor({ ...check, action: 'QUERY.SELECT', entities: [entity], columns });
+  try {
+    const kept: CatalogTable[] = [];
+    const hiddenTables = new Set<string>();
+    /** `TABLE\0COLUMN`, upper-cased. */
+    const hiddenColumns = new Set<string>();
+    const key = (table: string, column: string) =>
+      `${table.toUpperCase()}\u0000${column.toUpperCase()}`;
+    for (const table of catalog.tables) {
+      const entity = table.name.toUpperCase();
+      if ((await read(entity, [])).effect !== 'ALLOW') {
+        hiddenTables.add(entity);
+        continue;
+      }
+      const all = table.columns.map((c) => ({ table: entity, name: c.name }));
+      if (all.length === 0 || (await read(entity, all)).effect === 'ALLOW') {
+        kept.push(table);
+        continue;
+      }
+      const columns = [];
+      for (const c of table.columns) {
+        if ((await read(entity, [{ table: entity, name: c.name }])).effect === 'ALLOW') {
+          columns.push(c);
+        } else {
+          hiddenColumns.add(key(entity, c.name));
+        }
+      }
+      kept.push({ ...table, columns });
+    }
+    if (hiddenTables.size === 0 && hiddenColumns.size === 0) return catalog;
+    // A foreign key is dropped when it names a hidden table or column at either end.
+    const tables = kept.map((t) => {
+      const foreignKeys = t.foreignKeys.filter(
+        (fk) =>
+          !hiddenColumns.has(key(t.name, fk.column)) &&
+          !hiddenTables.has(fk.refTable.toUpperCase()) &&
+          !hiddenColumns.has(key(fk.refTable, fk.refColumn)),
+      );
+      return foreignKeys.length === t.foreignKeys.length ? t : { ...t, foreignKeys };
+    });
+    return { ...catalog, tables };
+  } catch (err) {
+    onError?.(err);
+    return { ...catalog, tables: [] };
+  }
 }

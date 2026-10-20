@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest';
 import { analyzeRead } from '@dbx/sql-engine';
 import { evaluatePolicy } from '@dbx/shared';
 import type { Permission, PolicyRule } from '@dbx/shared';
+import type { AuthState } from '../context';
 import type { Catalog } from './metadata';
-import { readTargets } from './read-policy';
+import type { PolicyService } from './policy';
+import { readTargets, visibleCatalog } from './read-policy';
 
 const table = (name: string, columns: string[]) => ({
   name,
@@ -117,5 +119,77 @@ describe('readTargets', () => {
     expect(decide('SELECT COUNT(EMAIL) FROM TGFPAR')).toBe('DENY');
     expect(decide('SELECT COUNT(*) FROM (SELECT * FROM TGFPAR) x')).toBe('DENY');
     expect(decide('SELECT * FROM TSICID')).toBe('ALLOW');
+  });
+});
+
+describe('visibleCatalog', () => {
+  const fake = (rules: PolicyRule[]) =>
+    ({
+      evaluate: (req: Parameters<typeof evaluatePolicy>[0], perms: Set<Permission>) =>
+        Promise.resolve(evaluatePolicy(req, rules, perms)),
+    }) as unknown as PolicyService;
+  const auth = {
+    user: { id: 'u1' },
+    grants: { permissions: new Set<Permission>(['QUERY.SELECT']) },
+  } as unknown as AuthState;
+  const withFks: Catalog = {
+    ...CATALOG,
+    tables: [
+      {
+        ...table('TGFPAR', ['CODPARC', 'NOMEPARC', 'EMAIL', 'CODCID']),
+        foreignKeys: [
+          { column: 'CODCID', refTable: 'TSICID', refColumn: 'CODCID' },
+          { column: 'EMAIL', refTable: 'TGFEMPTY', refColumn: 'X' },
+        ],
+      },
+      table('TSICID', ['CODCID', 'NOMECID']),
+      table('TGFEMPTY', []),
+    ],
+  };
+  const run = (rules: PolicyRule[]) =>
+    visibleCatalog(
+      { policies: fake(rules), auth, groupIds: [], environment: 'SANDBOX', connectionId: 'c1' },
+      withFks,
+    );
+  const shape = (c: Catalog) =>
+    Object.fromEntries(c.tables.map((t) => [t.name, t.columns.map((x) => x.name)]));
+
+  it('returns the catalog unchanged when nothing is denied', async () => {
+    expect(await run([])).toEqual(withFks);
+  });
+
+  it('drops denied columns and the foreign keys that would name them', async () => {
+    const out = await run([DENY_EMAIL]);
+    expect(shape(out)).toEqual({
+      TGFPAR: ['CODPARC', 'NOMEPARC', 'CODCID'],
+      TSICID: ['CODCID', 'NOMECID'],
+      TGFEMPTY: [],
+    });
+    expect(out.tables[0]!.foreignKeys).toEqual([
+      { column: 'CODCID', refTable: 'TSICID', refColumn: 'CODCID' },
+    ]);
+  });
+
+  it('drops denied tables and foreign keys into them', async () => {
+    const out = await run([{ ...DENY_EMAIL, columns: [], entities: ['TSICID'] }]);
+    expect(Object.keys(shape(out))).toEqual(['TGFPAR', 'TGFEMPTY']);
+    expect(out.tables[0]!.foreignKeys).toEqual([
+      { column: 'EMAIL', refTable: 'TGFEMPTY', refColumn: 'X' },
+    ]);
+  });
+
+  it('serves no table when an evaluation throws', async () => {
+    const policies = {
+      evaluate: () => Promise.reject(new Error('boom')),
+    } as unknown as PolicyService;
+    const errors: unknown[] = [];
+    const out = await visibleCatalog(
+      { policies, auth, groupIds: [], environment: 'SANDBOX', connectionId: 'c1' },
+      withFks,
+      (e) => errors.push(e),
+    );
+    expect(out.tables).toEqual([]);
+    expect(out.fetchedAt).toBe(withFks.fetchedAt);
+    expect(errors).toHaveLength(1);
   });
 });

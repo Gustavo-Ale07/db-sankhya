@@ -10,7 +10,7 @@ import {
   requirePermission,
 } from '../http';
 import { ENV_CONNECTION_ID } from '../services/connections';
-import { authorizeConnection, connectionDenied } from '../services/read-policy';
+import { authorizeConnection, connectionDenied, visibleCatalog } from '../services/read-policy';
 
 const schemaQuery = z.object({ connectionId: connectionIdSchema.optional() }).strict();
 
@@ -81,10 +81,11 @@ export async function systemRoutes(app: FastifyInstance): Promise<void> {
     }
     // The catalog is only loaded for a connection the policy lets this user read; an unknown
     // connection gets the same answer as a denied one.
+    const groupIds = await authz.activeGroupIds(auth.user.id);
     const access = await authorizeConnection({
       policies,
       auth,
-      groupIds: await authz.activeGroupIds(auth.user.id),
+      groupIds,
       action: 'QUERY.SELECT',
       connectionId,
       connections,
@@ -106,8 +107,14 @@ export async function systemRoutes(app: FastifyInstance): Promise<void> {
       });
       throw err;
     }
+    // Only the tables and columns this user may read are listed (names are disclosure too).
+    const catalog = await visibleCatalog(
+      { policies, auth, groupIds, environment: access.environment, connectionId },
+      await metadata.get(connectionId),
+      (err) => request.log.error({ err }, 'Catalog policy filter failed: serving no table'),
+    );
     noStore(reply);
-    return redact({ connectionId, catalog: await metadata.get(connectionId) });
+    return redact({ connectionId, catalog });
   });
 
   app.get('/api/status', async (request, reply) => {

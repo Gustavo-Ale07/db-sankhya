@@ -316,6 +316,98 @@ describe('per-connection authorization (SR1)', () => {
   });
 });
 
+interface SchemaTable {
+  name: string;
+  columns: Array<{ name: string }>;
+}
+const catalogOf = async (h: Harness, cookie: string) => {
+  const res = await h.call(cookie, { method: 'GET', url: '/api/schema' });
+  expect(res.statusCode, res.body).toBe(200);
+  const body = res.json() as { connectionId: string; catalog: { tables: SchemaTable[] } };
+  return { body, tables: body.catalog.tables, raw: res.body };
+};
+const tableOf = (tables: SchemaTable[], name: string) => tables.find((t) => t.name === name);
+
+describe('catalog filtering by read policy', () => {
+  it('serves the full catalog when no rule denies anything', async () => {
+    const h = await setup();
+    const { cookie } = await h.viewer();
+    const { body, tables } = await catalogOf(h, cookie);
+    expect(body.connectionId).toBe('env-default');
+    expect(Object.keys(body.catalog).sort()).toEqual(
+      expect.arrayContaining(['fetchedAt', 'source', 'tables']),
+    );
+    const full = await h.app.services.metadata.get('env-default');
+    expect(tables).toEqual(JSON.parse(JSON.stringify(full.tables)));
+    expect(tableOf(tables, 'TGFPAR')!.columns.map((c) => c.name)).toContain('EMAIL');
+  });
+
+  it('omits a table denied by an entity rule', async () => {
+    const h = await setup();
+    await h.policy({ entities: ['TSICID'] });
+    const { cookie } = await h.viewer();
+    const { tables, raw } = await catalogOf(h, cookie);
+    expect(tableOf(tables, 'TSICID')).toBeUndefined();
+    expect(raw).not.toContain('TSICID');
+    expect(tableOf(tables, 'TGFPAR')).toBeDefined();
+    // Consistent with the read path.
+    expect((await query(h, cookie, { sql: 'SELECT CODCID FROM TSICID' })).statusCode).toBe(403);
+  });
+
+  it('omits a column denied by a column rule and keeps the rest of the table', async () => {
+    const h = await setup();
+    await h.policy({ columns: ['TGFPAR.EMAIL'] });
+    const { cookie } = await h.viewer();
+    const { tables } = await catalogOf(h, cookie);
+    const par = tableOf(tables, 'TGFPAR')!;
+    const names = par.columns.map((c) => c.name);
+    expect(names).not.toContain('EMAIL');
+    expect(names).toEqual(expect.arrayContaining(['CODPARC', 'NOMEPARC']));
+    // A bare column pattern hides only that column, on the tables that have it.
+    const full = await h.app.services.metadata.get('env-default');
+    const fullPar = full.tables.find((t) => t.name === 'TGFPAR')!;
+    expect(names).toHaveLength(fullPar.columns.length - 1);
+  });
+
+  it('applies rules to an administrator too (no bypass)', async () => {
+    const h = await setup();
+    await h.policy({ entities: ['TSICID'] });
+    await h.policy({ columns: ['EMAIL'] });
+    const admin = await h.login();
+    const { tables } = await catalogOf(h, admin);
+    expect(tableOf(tables, 'TSICID')).toBeUndefined();
+    for (const t of tables) expect(t.columns.map((c) => c.name)).not.toContain('EMAIL');
+  });
+
+  it('scopes the filter to the subject of the rule', async () => {
+    const h = await setup();
+    const denied = await h.viewer();
+    const other = await h.viewer();
+    await h.policy({ subjectType: 'user', subjectId: denied.id, entities: ['TGF*'] });
+    const mine = await catalogOf(h, denied.cookie);
+    expect(mine.tables.some((t) => t.name.startsWith('TGF'))).toBe(false);
+    expect(tableOf(mine.tables, 'TSICID')).toBeDefined();
+    const theirs = await catalogOf(h, other.cookie);
+    expect(tableOf(theirs.tables, 'TGFPAR')).toBeDefined();
+  });
+
+  it('serves no table when the policy evaluation fails (fail closed)', async () => {
+    const h = await setup();
+    const { cookie } = await h.viewer();
+    await catalogOf(h, cookie); // connection authorized and catalog cached
+    const policies = h.app.services.policies;
+    const real = policies.evaluate.bind(policies);
+    let calls = 0;
+    policies.evaluate = async (...args) => {
+      // The connection check passes; the per-table evaluation then breaks.
+      if (++calls === 1) return real(...args);
+      throw new Error('boom');
+    };
+    const { tables } = await catalogOf(h, cookie);
+    expect(tables).toEqual([]);
+  });
+});
+
 describe('policies at startup', () => {
   it('logs a corrupt stored rule at boot, keeps running and denies reads', async () => {
     const h = await setup({}, async (database) => {
