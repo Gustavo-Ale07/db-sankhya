@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { Writable } from 'node:stream';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance, InjectOptions } from 'fastify';
 import { and, eq } from 'drizzle-orm';
 import { createDatabase, rolePermissions, roles } from '@dbx/database';
@@ -1459,6 +1459,85 @@ describe('execution report: before, expected and observed', () => {
     const replayed = await execute(h, auth, p, { idempotencyKey: key });
     expect(replayed).toMatchObject({ verification: 'VERIFIED' });
     expect(replayed.steps).toEqual([{ key: { CODPARC: 1 }, outcome: 'ok', verified: true }]);
+  });
+
+  it('INSERT: a column the caller may not read (QUERY.SELECT) is never shown, not even expected', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    await h.policy({ name: 'hide ativo', actions: ['QUERY.SELECT'], columns: ['TGFPAR.ATIVO'] });
+    const p = await prepare(
+      h,
+      auth,
+      "INSERT INTO TGFPAR (NOMEPARC, ATIVO) VALUES ('Parceiro oculto', 'S')",
+    );
+    const report = await execute(h, auth, p);
+    // The label still comes from the full server-side comparison.
+    expect(report.verification).toBe('VERIFIED');
+    expect(report.steps[0]).toMatchObject({
+      before: null,
+      expected: { NOMEPARC: 'Parceiro oculto' },
+      observed: { NOMEPARC: 'Parceiro oculto' },
+    });
+    expect(report.steps[0]!.expected).not.toHaveProperty('ATIVO');
+    expect(report.steps[0]!.observed).not.toHaveProperty('ATIVO');
+  });
+
+  it('a read no longer allowed at read-back time: no values shown (fail closed), label unchanged', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    const p = await prepare(h, auth, SQL);
+    const policies = h.app.services.policies;
+    const evaluate = policies.evaluate.bind(policies);
+    // A rule change that lands between the save and the read-back.
+    const spy = vi.spyOn(policies, 'evaluate').mockImplementation(async (req, perms, opts) => {
+      const decision = await evaluate(req, perms, opts);
+      return req.action === 'QUERY.SELECT' && saves(h.mock).length > 0
+        ? { ...decision, effect: 'DENY' }
+        : decision;
+    });
+    try {
+      const report = await execute(h, auth, p);
+      expect(report.verification).toBe('VERIFIED');
+      expect(report.steps).toEqual([{ key: { CODPARC: 1 }, outcome: 'ok', verified: true }]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('the policy check of the read-back fails: no values shown, the report still returns', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    const p = await prepare(h, auth, SQL);
+    const policies = h.app.services.policies;
+    const evaluate = policies.evaluate.bind(policies);
+    const spy = vi.spyOn(policies, 'evaluate').mockImplementation(async (req, perms, opts) => {
+      if (req.action === 'QUERY.SELECT' && saves(h.mock).length > 0) throw new Error('boom');
+      return evaluate(req, perms, opts);
+    });
+    try {
+      const report = await execute(h, auth, p);
+      expect(report.verification).toBe('VERIFIED');
+      expect(report.steps[0]).not.toHaveProperty('observed');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('an unknown outcome (response lost): observed and verified come from the real read-back, one save', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    const p = await prepare(h, auth, SQL);
+    h.mock.inject({ type: 'responseLost' }, { service: 'DatasetSP.save' });
+    const report = await execute(h, auth, p);
+    expect(report.steps[0]).toMatchObject({
+      outcome: 'unknown',
+      errorCode: 'WRITE_OUTCOME_UNKNOWN',
+      verified: true,
+      expected: { NOMEPARC: 'Novo nome' },
+      observed: { NOMEPARC: 'Novo nome' },
+    });
+    expect(report.verification).not.toBe('VERIFIED');
+    expect(saves(h.mock)).toHaveLength(1);
   });
 
   it('a business action reports the effect field before, expected and as read back', async () => {

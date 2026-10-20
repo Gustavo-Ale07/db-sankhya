@@ -67,7 +67,7 @@ import { analyzeScratchSql } from './scratch-guard';
 import type { ScratchStatement } from './scratch-guard';
 import type { AuditLifecycleContext, AuditService } from './records';
 import type { SecuritySettingsService } from './security-settings';
-import { labelOf, statusOf, valuesMatch, verifyByKey } from './verification';
+import { labelOf, reportForAudit, statusOf, valuesMatch, verifyByKey } from './verification';
 import type { ExecutionReport, ExecutionStep, VerifyResult } from './verification';
 
 export type { ExecutionReport, ExecutionStep } from './verification';
@@ -1190,6 +1190,8 @@ export class MutationService {
       throw err;
     }
 
+    if (!scratch) steps = await this.readableValues(auth, plan, entity, steps);
+
     // ---------------------------------------------------------------- AUDIT
     const report: ExecutionReport = {
       status: statusOf(steps),
@@ -1212,11 +1214,14 @@ export class MutationService {
           : null,
         statement: plan.sql,
         policyDecision: policySummary(decision),
-        // auditSnapshots=false: the stored report (and so a replay) keeps no row values either.
+        // The stored report (and so a replay) keeps no row values under auditSnapshots=false,
+        // and otherwise only within the snapshot limits.
         details: {
           operation,
           resource: entity,
-          report: decision.limits.auditSnapshots === false ? withoutValues(report) : report,
+          report: reportForAudit(report, {
+            snapshots: decision.limits.auditSnapshots !== false,
+          }),
         },
         before: attempted.flatMap((t) => (t.before ? [t.before] : [])),
         after: attempted.map((t) => t.after),
@@ -1420,6 +1425,61 @@ export class MutationService {
       verified = undefined;
     }
     return verified === undefined ? steps : steps.map((st) => ({ ...st, verified }));
+  }
+
+  /**
+   * The row values a caller may see in the report: only the written columns the current policy
+   * still lets them read (QUERY.SELECT, checked per column right after the read-back). A column
+   * that is not readable, or any failure of the check, leaves its values out (fail closed). The
+   * verification label is not affected: it comes from the full server-side comparison.
+   */
+  private async readableValues(
+    auth: AuthState,
+    plan: PlanRow,
+    entity: string,
+    steps: ExecutionStep[],
+  ): Promise<ExecutionStep[]> {
+    const fields = ['before', 'expected', 'observed'] as const;
+    const columns = [
+      ...new Set(steps.flatMap((st) => fields.flatMap((f) => Object.keys(st[f] ?? {})))),
+    ];
+    if (columns.length === 0) return steps;
+    const readable = new Set<string>();
+    try {
+      const fresh: AuthState = { ...auth, grants: await this.deps.authz.grants(auth.user.id) };
+      const groupIds = await this.deps.authz.activeGroupIds(auth.user.id);
+      for (const name of columns) {
+        const read = await evaluateFor({
+          policies: this.deps.policies,
+          auth: fresh,
+          groupIds,
+          action: 'QUERY.SELECT',
+          environment: plan.environment,
+          connectionId: plan.connectionId,
+          entities: [entity],
+          columns: [{ table: entity, name }],
+          defaults: { maxReadRows: this.deps.maxReadRows },
+        });
+        if (read.effect === 'ALLOW') readable.add(name);
+      }
+    } catch {
+      readable.clear();
+    }
+    return steps.map((st) => {
+      const { before, expected, observed, ...rest } = st;
+      const out: ExecutionStep = rest;
+      if (before === null) out.before = null;
+      for (const [f, v] of [
+        ['before', before],
+        ['expected', expected],
+        ['observed', observed],
+      ] as const) {
+        if (!v) continue;
+        const kept = Object.entries(v).filter(([c]) => readable.has(c));
+        if (kept.length > 0) out[f] = Object.fromEntries(kept);
+      }
+      return out;
+    });
   }
 
   /** The stored report of the original execution; never executes. */
@@ -1700,16 +1760,6 @@ function pick(
 ): Record<string, unknown> | null {
   if (!row) return null;
   return Object.fromEntries(Object.keys(fields).map((f) => [f, row[f] ?? null]));
-}
-
-/** The report without any row value (before / expected / observed), for auditSnapshots=false. */
-function withoutValues(report: ExecutionReport): ExecutionReport {
-  return {
-    ...report,
-    steps: report.steps.map(
-      ({ before: _b, expected: _e, observed: _o, ...step }): ExecutionStep => step,
-    ),
-  };
 }
 
 function isReport(v: unknown): v is ExecutionReport {
