@@ -5,6 +5,7 @@ import {
   confirmationMatches,
   isPreviewPointer,
   isApprovalPending,
+  mergeOutcome,
   outcomeOf,
   previewLabelText,
   previewLabelsOf,
@@ -156,5 +157,41 @@ describe('execute outcome', () => {
       ),
     ).toBe(true);
     expect(isApprovalPending(err(403, 'FORBIDDEN'))).toBe(false);
+  });
+});
+
+describe('outcome across retries of one plan', () => {
+  const err = (status: number, code: string) =>
+    outcomeOf({ error: new ApiError(status, { code, message: 'x' }) });
+  const lost = err(0, 'NETWORK_ERROR');
+
+  it.each([
+    [429, 'RATE_LIMITED'],
+    [400, 'CONFIRMATION_INVALID'],
+    [403, 'FORBIDDEN'],
+  ])('stays unknown when NETWORK_ERROR is followed by %s %s', (status, code) => {
+    expect(mergeOutcome(lost, err(status, code))).toEqual({
+      sent: true,
+      unknown: true,
+      errorCode: 'NETWORK_ERROR',
+    });
+  });
+
+  it('is cleared by a replayed report', () => {
+    const report = {
+      type: 'execution' as const,
+      planId: 'p',
+      status: 'success' as const,
+      verification: 'VERIFIED' as const,
+      steps: [{ key: { A: 1 }, outcome: 'ok' as const }],
+    };
+    const merged = mergeOutcome(err(502, 'HTTP_ERROR'), outcomeOf({ report }));
+    expect(merged).toEqual({ sent: true, unknown: false, report });
+  });
+
+  it('a known answer after a known one is just the latest', () => {
+    expect(mergeOutcome(err(403, 'READ_ONLY_MODE'), err(403, 'FORBIDDEN')).errorCode).toBe(
+      'FORBIDDEN',
+    );
   });
 });

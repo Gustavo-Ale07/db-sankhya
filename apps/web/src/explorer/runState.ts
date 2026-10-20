@@ -55,6 +55,20 @@ export function outcomeOf(
   return { sent: true, unknown, errorCode: err.code };
 }
 
+/**
+ * Folds the answer of a new execute of the same plan into what is already known. Once an outcome
+ * was unknown it stays unknown (keeping its first error code): a later refusal, rate limit or
+ * expiry says nothing about the earlier attempt. Only a report clears it, because the server
+ * replays the recorded result of that plan for the same key: a definite answer.
+ */
+export function mergeOutcome(
+  prev: MutationOutcome | undefined,
+  next: MutationOutcome,
+): MutationOutcome {
+  if (!prev?.unknown || next.report) return next;
+  return { sent: true, unknown: true, ...(prev.errorCode ? { errorCode: prev.errorCode } : {}) };
+}
+
 /** FORBIDDEN because the plan still waits for its four-eyes approval (nothing was consumed). */
 export function isApprovalPending(err: unknown): boolean {
   return (

@@ -17,6 +17,7 @@ import {
   confirmationMatches,
   formatCountdown,
   isApprovalPending,
+  mergeOutcome,
   outcomeOf,
   previewLabelText,
   previewLabelsOf,
@@ -170,8 +171,9 @@ function UnknownWarning({ canReplay = false }: { canReplay?: boolean }) {
       confirmado. Confira os registros no Sankhya antes de qualquer nova tentativa.
       {canReplay && (
         <span className="mt-1 block font-normal">
-          &quot;Consultar resultado&quot; reenvia este mesmo plano com a mesma chave de
-          idempotência: o servidor devolve o resultado já registrado e não grava uma segunda vez.
+          &quot;Consultar resultado&quot; reenvia o mesmo pedido, com a mesma chave de idempotência:
+          se a primeira tentativa foi registrada, o servidor só devolve o resultado; se ela não
+          chegou ao servidor, a alteração é executada agora, uma única vez.
         </span>
       )}
     </div>
@@ -238,6 +240,8 @@ export function MutationDialog({ preview, sql, onClose, onOutcome, newKey }: Pro
   const [idempotencyKey] = useState(() => (newKey ?? (() => crypto.randomUUID()))());
   const inFlight = useRef(false);
   const approvalInFlight = useRef(false);
+  // Everything known about this plan's executes so far (sticky once unknown).
+  const outcomeSoFar = useRef<MutationOutcome | undefined>(undefined);
   const [busy, setBusy] = useState(false);
   const [typed, setTyped] = useState('');
   const [error, setError] = useState<unknown>(null);
@@ -245,7 +249,7 @@ export function MutationDialog({ preview, sql, onClose, onOutcome, newKey }: Pro
   const [approval, setApproval] = useState<'none' | 'requesting' | 'requested'>('none');
   const [approvalError, setApprovalError] = useState<unknown>(null);
   const [now, setNow] = useState(() => Date.now());
-  // Sticky: once any execute answer left the outcome unknown, the warning never goes away.
+  // Sticky once an answer left the outcome unknown; only a replayed report clears it.
   const [unknownSeen, setUnknownSeen] = useState(false);
 
   const remaining = remainingSeconds(preview.expiresAt, now);
@@ -256,7 +260,10 @@ export function MutationDialog({ preview, sql, onClose, onOutcome, newKey }: Pro
   const outcomeUnknown = unknownSeen;
   const approvalPending = isApprovalPending(error);
   const planDead = errorCode !== null && PLAN_DEAD.has(errorCode);
-  const canExecute = !busy && !expired && matches && report === null && !planDead;
+  // After an unknown outcome the same-key resend stays possible past the countdown: the server
+  // replays a recorded result before checking the expiry.
+  const canExecute =
+    !busy && (!expired || outcomeUnknown) && matches && report === null && !planDead;
 
   useEffect(() => {
     if (report) return;
@@ -328,18 +335,21 @@ export function MutationDialog({ preview, sql, onClose, onOutcome, newKey }: Pro
         ...(phrase !== null ? { strongConfirmation: typed } : {}),
       });
       setReport(res);
-      const outcome = outcomeOf({ report: res });
-      if (outcome.unknown) setUnknownSeen(true);
-      onOutcome?.(outcome);
+      record(outcomeOf({ report: res }));
     } catch (err) {
       setError(err);
-      const outcome = outcomeOf({ error: err });
-      if (outcome.unknown) setUnknownSeen(true);
-      onOutcome?.(outcome);
+      record(outcomeOf({ error: err }));
     } finally {
       inFlight.current = false;
       setBusy(false);
     }
+  }
+
+  function record(next: MutationOutcome) {
+    const outcome = mergeOutcome(outcomeSoFar.current, next);
+    outcomeSoFar.current = outcome;
+    setUnknownSeen(outcome.unknown);
+    onOutcome?.(outcome);
   }
 
   async function askApproval() {
@@ -426,7 +436,9 @@ export function MutationDialog({ preview, sql, onClose, onOutcome, newKey }: Pro
               {report
                 ? 'plano utilizado'
                 : expired
-                  ? 'expirado: gere uma nova prévia'
+                  ? outcomeUnknown
+                    ? 'expirado (o reenvio com a mesma chave continua possível)'
+                    : 'expirado: gere uma nova prévia'
                   : formatCountdown(remaining)}
             </dd>
           </dl>

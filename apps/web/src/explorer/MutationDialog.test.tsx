@@ -423,4 +423,79 @@ describe('MutationDialog', () => {
     fireEvent.keyDown(dialog, { key: 'Tab' });
     expect(document.activeElement).toBe(items[0]);
   });
+
+  it.each([
+    [429, 'RATE_LIMITED'],
+    [400, 'CONFIRMATION_INVALID'],
+    [403, 'FORBIDDEN'],
+  ])('keeps the outcome unknown when NETWORK_ERROR is followed by %s %s', async (status, code) => {
+    vi.mocked(executePlan)
+      .mockRejectedValueOnce(new ApiError(0, { code: 'NETWORK_ERROR', message: 'x' }))
+      .mockRejectedValueOnce(new ApiError(status, { code, message: 'x' }));
+    const onOutcome = vi.fn();
+    render(
+      <MutationDialog
+        preview={preview({ requires: { strongConfirmation: null, approval: false } })}
+        sql="x"
+        onClose={() => {}}
+        onOutcome={onOutcome}
+      />,
+    );
+    fireEvent.click(execButton());
+    await waitFor(() => expect(onOutcome).toHaveBeenCalledTimes(1));
+    fireEvent.click(execButton());
+    await waitFor(() => expect(onOutcome).toHaveBeenCalledTimes(2));
+    expect(onOutcome).toHaveBeenLastCalledWith({
+      sent: true,
+      unknown: true,
+      errorCode: 'NETWORK_ERROR',
+    });
+    expect(screen.getByTestId('outcome-unknown').textContent).toContain('NÃO repita');
+  });
+
+  it('clears the unknown outcome when a 5xx is followed by a replayed report', async () => {
+    vi.mocked(executePlan)
+      .mockRejectedValueOnce(new ApiError(502, { code: 'HTTP_ERROR', message: 'x' }))
+      .mockResolvedValueOnce(report());
+    const onOutcome = vi.fn();
+    render(
+      <MutationDialog
+        preview={preview({ requires: { strongConfirmation: null, approval: false } })}
+        sql="x"
+        onClose={() => {}}
+        onOutcome={onOutcome}
+      />,
+    );
+    fireEvent.click(execButton());
+    await screen.findByTestId('outcome-unknown');
+    fireEvent.click(execButton());
+    await screen.findByTestId('execution-report');
+    expect(onOutcome).toHaveBeenLastCalledWith({ sent: true, unknown: false, report: report() });
+    expect(screen.queryByTestId('outcome-unknown')).toBeNull();
+  });
+
+  it('keeps the same-key resend available after the countdown once the outcome is unknown', async () => {
+    vi.mocked(executePlan).mockRejectedValueOnce(
+      new ApiError(0, { code: 'NETWORK_ERROR', message: 'x' }),
+    );
+    render(
+      <MutationDialog
+        preview={preview({
+          expiresAt: new Date(NOW + 2_000).toISOString(),
+          requires: { strongConfirmation: null, approval: false },
+        })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    fireEvent.click(execButton());
+    await screen.findByTestId('outcome-unknown');
+    act(() => {
+      vi.advanceTimersByTime(3_000);
+    });
+    expect(screen.getByTestId('plan-countdown').textContent).toContain('expirado');
+    expect(execButton().textContent).toBe('Consultar resultado');
+    expect(execButton().disabled).toBe(false);
+    expect(screen.getByTestId('outcome-unknown').textContent).toContain('uma única vez');
+  });
 });

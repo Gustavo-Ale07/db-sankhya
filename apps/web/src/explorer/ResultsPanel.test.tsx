@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { cleanup, render, screen } from '@testing-library/react';
+import { ApiError } from '../api/client';
+import { mergeOutcome, outcomeOf } from './runState';
 import { MutationStatus } from './ResultsPanel';
 
 afterEach(cleanup);
@@ -56,5 +58,24 @@ describe('MutationStatus', () => {
     );
     expect(document.body.textContent).toContain('Execução recusada pelo servidor [READ_ONLY_MODE]');
     expect(document.body.textContent).toContain('Nada foi gravado');
+  });
+
+  it.each([
+    [429, 'RATE_LIMITED'],
+    [400, 'CONFIRMATION_INVALID'],
+    [403, 'FORBIDDEN'],
+  ])('keeps the banner when NETWORK_ERROR is followed by %s %s', (status, code) => {
+    const lost = outcomeOf({ error: new ApiError(0, { code: 'NETWORK_ERROR', message: 'x' }) });
+    const later = outcomeOf({ error: new ApiError(status, { code, message: 'x' }) });
+    render(<MutationStatus outcome={mergeOutcome(lost, later)} />);
+    expect(screen.getByTestId('mutation-outcome-unknown').textContent).toContain('NÃO repita');
+    expect(document.body.textContent).not.toContain('Nada foi gravado');
+  });
+
+  it('clears the banner when a 5xx is followed by a replayed report', () => {
+    const lost = outcomeOf({ error: new ApiError(502, { code: 'HTTP_ERROR', message: 'x' }) });
+    render(<MutationStatus outcome={mergeOutcome(lost, outcomeOf({ report }))} />);
+    expect(screen.queryByTestId('mutation-outcome-unknown')).toBeNull();
+    expect(document.body.textContent).toContain('Alteração executada (concluída)');
   });
 });
