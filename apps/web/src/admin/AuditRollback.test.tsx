@@ -65,7 +65,18 @@ const PLAN = {
     "UPDATE TGFPAR SET NOMEPARC = 'Outro' WHERE (CODPARC = 2)",
   statements: 2,
   conflict: { detected: false, columns: [], message: null },
-  plan: { planId: 'p1' },
+  // The server-prepared plan: the preview shape plus its token (no `type`, no `execution`).
+  plan: {
+    planId: '00000000-0000-4000-8000-0000000000aa',
+    token: 'rollback-plan-token',
+    expiresAt: '2026-10-20T10:05:00.000Z',
+    capability: { class: 'SUPPORTED', route: 'SANKHYA_SAVE', reason: 'Native entity' },
+    previewKind: 'IMPACT_ANALYSIS',
+    previewLabels: ['IMPACT_ANALYSIS', 'SIMULATED_PREVIEW'],
+    preview: { affected: 1, targets: [] },
+    impact: { entities: ['TGFPAR'], rows: 1, environment: 'PRODUCTION' },
+    requires: { strongConfirmation: 'PRODUCTION UPDATE 1 TGFPAR', approval: false },
+  },
 };
 
 function wrap(ui: React.ReactElement) {
@@ -125,7 +136,7 @@ describe('RollbackPlanAction', () => {
     expect(screen.queryByText('Gerar plano de rollback')).toBeNull();
   });
 
-  it('requests the plan, shows label and SQL, and opens the first statement', async () => {
+  it('requests the plan, shows label and SQL, and opens the server-prepared plan', async () => {
     vi.mocked(api.post).mockResolvedValue(PLAN);
     const onOpen = vi.fn();
     wrap(<RollbackPlanAction event={event()} onOpen={onOpen} connections={CONNECTIONS} />);
@@ -138,8 +149,25 @@ describe('RollbackPlanAction', () => {
     expect(screen.getByTestId('rollback-connection').textContent).toBe(
       'Conexão de destino: Principal · PRODUÇÃO',
     );
-    fireEvent.click(screen.getByText('Abrir no editor'));
-    expect(onOpen).toHaveBeenCalledWith({ sql: PLAN.sql, title: expect.any(String) }, 'env');
+    fireEvent.click(screen.getByText('Abrir prévia'));
+    // The plan the server prepared (and linked to the source event) is the one handed over:
+    // no second preview is requested.
+    expect(onOpen).toHaveBeenCalledWith(
+      { plan: PLAN.plan, sql: PLAN.sql, title: expect.any(String) },
+      'env',
+    );
+    expect(api.post).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a plan without a usable token instead of opening it', async () => {
+    const { token: _token, ...noToken } = PLAN.plan;
+    vi.mocked(api.post).mockResolvedValue({ ...PLAN, plan: noToken });
+    const onOpen = vi.fn();
+    wrap(<RollbackPlanAction event={event()} onOpen={onOpen} connections={CONNECTIONS} />);
+    fireEvent.click(screen.getByText('Gerar plano de rollback'));
+    expect((await screen.findByTestId('rollback-plan-invalid')).getAttribute('role')).toBe('alert');
+    expect(screen.queryByText('Abrir prévia')).toBeNull();
+    expect(onOpen).not.toHaveBeenCalled();
   });
 
   it('shows a conflict with the changed columns', async () => {
@@ -175,7 +203,7 @@ describe('RollbackPlanAction', () => {
     fireEvent.click(screen.getByText('Gerar plano de rollback'));
     const alert = await screen.findByTestId('rollback-connection-unavailable');
     expect(alert.textContent).toContain('A conexão deste evento (gone) não está disponível');
-    expect(screen.queryByText('Abrir no editor')).toBeNull();
+    expect(screen.queryByText('Abrir prévia')).toBeNull();
     expect(screen.queryByTestId('rollback-connection')).toBeNull();
     expect(onOpen).not.toHaveBeenCalled();
   });
@@ -185,7 +213,7 @@ describe('RollbackPlanAction', () => {
     wrap(<RollbackPlanAction event={event()} onOpen={vi.fn()} />);
     fireEvent.click(screen.getByText('Gerar plano de rollback'));
     await screen.findByTestId('rollback-connection-unavailable');
-    expect(screen.queryByText('Abrir no editor')).toBeNull();
+    expect(screen.queryByText('Abrir prévia')).toBeNull();
   });
 
   it('shows the server refusal', async () => {

@@ -1,5 +1,7 @@
 import { useMutation } from '@tanstack/react-query';
 import { api } from '../api/client';
+import { isPreparedPlan } from '../api/mutations';
+import type { PreparedPlan } from '../api/mutations';
 import type { AuditEvent, ConnectionOption } from '../api/types';
 import { ENVIRONMENT_LABEL } from '../components/EnvironmentBanner';
 import { ErrorBox } from '../components/ErrorBox';
@@ -18,7 +20,11 @@ export interface RollbackConflict {
   message: string | null;
 }
 
-/** POST /api/audit/:id/rollback-plan. `sql` is the first statement, prepared as a new plan. */
+/**
+ * POST /api/audit/:id/rollback-plan. `sql` is the first statement and `plan` the plan the server
+ * prepared for it (linked to the source event by its `rollback.planned` audit row). The plan's
+ * token lives only in memory.
+ */
 export interface RollbackPlan {
   type: 'rollback-plan';
   label: string;
@@ -27,10 +33,14 @@ export interface RollbackPlan {
   displaySql: string;
   statements: number;
   conflict: RollbackConflict;
-  plan: Record<string, unknown>;
+  plan: PreparedPlan;
 }
 
-export type OpenRollback = (req: { sql: string; title: string }, connectionId: string) => void;
+/** Opens the server-prepared plan in the mutation dialog, on `connectionId` exactly. */
+export type OpenRollback = (
+  req: { plan: PreparedPlan; sql: string; title: string },
+  connectionId: string,
+) => void;
 
 const isRecord = (v: unknown): v is Record<string, unknown> =>
   typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -54,9 +64,10 @@ const show = (v: unknown) =>
   v === null || v === undefined ? 'NULL' : typeof v === 'string' ? v : JSON.stringify(v);
 
 /**
- * "Gerar plano de rollback": asks the server for a new plan and hands its SQL to the editor, on
+ * "Gerar plano de rollback": asks the server for a new plan and opens that very plan in the
+ * mutation dialog (no second preview, so execute consumes the plan the audit trail links to), on
  * the event's own connection only. `connections` is the caller's connection list: when the
- * event's connection is not in it, the SQL is never handed over (no fallback to another one).
+ * event's connection is not in it, the plan is never handed over (no fallback to another one).
  */
 export function RollbackPlanAction({
   event,
@@ -117,14 +128,24 @@ export function RollbackPlanAction({
               referência.
             </div>
           )}
-          {target ? (
+          {!isPreparedPlan(data.plan) ? (
+            <div
+              role="alert"
+              className="rounded border border-danger/40 bg-danger/10 px-3 py-2 text-danger"
+              data-testid="rollback-plan-invalid"
+            >
+              O servidor não devolveu um plano utilizável; gere o plano de rollback de novo.
+            </div>
+          ) : target ? (
             <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
                 className="btn btn-primary"
-                onClick={() => onOpen({ sql: data.sql, title: 'Rollback assistido' }, target.id)}
+                onClick={() =>
+                  onOpen({ plan: data.plan, sql: data.sql, title: 'Rollback assistido' }, target.id)
+                }
               >
-                Abrir no editor
+                Abrir prévia
               </button>
               <span data-testid="rollback-connection">
                 {`Conexão de destino: ${target.name} · ${ENVIRONMENT_LABEL[target.environment]}`}

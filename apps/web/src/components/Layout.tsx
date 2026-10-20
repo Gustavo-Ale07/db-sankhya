@@ -12,7 +12,8 @@ import type { ConnectionOption, Permission } from '../api/types';
 import { ConnectionPicker } from '../explorer/ConnectionPicker';
 import { EnvironmentBanner } from './EnvironmentBanner';
 import { ExplorerPage } from '../explorer/ExplorerPage';
-import type { OpenRequest } from '../explorer/ExplorerPage';
+import type { OpenPlanRequest, OpenRequest } from '../explorer/ExplorerPage';
+import type { PreparedPlan } from '../api/mutations';
 import { HistoryPage } from '../pages/HistoryPage';
 import { SavedQueriesPage } from '../pages/SavedQueriesPage';
 import { ChangePasswordPage } from '../pages/ChangePasswordPage';
@@ -64,6 +65,8 @@ export function Layout({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: 
   const { user, meta, logout, refresh } = useSession();
   const [view, setView] = useState<View>('explorer');
   const [openRequest, setOpenRequest] = useState<OpenRequest | null>(null);
+  // The server-prepared rollback plan; its token stays in memory only.
+  const [planRequest, setPlanRequest] = useState<OpenPlanRequest | null>(null);
   const canQuery = can(user, 'QUERY.SELECT');
   const [wantedConnection, setWantedConnection] = useState(loadSelectedConnection);
   const connectionList = useQuery({
@@ -87,12 +90,13 @@ export function Layout({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: 
   // without changing the remembered default (the selection is not persisted).
   const connectionItems = connectionList.data?.items;
   const openRollback = useCallback(
-    (req: { sql: string; title: string }, connectionId: string) => {
+    (req: { plan: PreparedPlan; sql: string; title: string }, connectionId: string) => {
       if (!connectionItems?.some((c) => c.id === connectionId)) return;
       setWantedConnection(connectionId);
-      openInEditor(req);
+      setPlanRequest({ ...req, connectionId, nonce: Date.now() + Math.random() });
+      setView('explorer');
     },
-    [connectionItems, openInEditor],
+    [connectionItems],
   );
 
   const allowed = (v: View) => {
@@ -177,6 +181,7 @@ export function Layout({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: 
           <ExplorerPage
             theme={theme}
             openRequest={openRequest}
+            planRequest={planRequest}
             active={view === 'explorer'}
             connectionId={connection?.id}
             connectionReady={!canQuery || !connectionList.isPending}
