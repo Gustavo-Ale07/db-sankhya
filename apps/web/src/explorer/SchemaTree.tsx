@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import type { CatalogTable } from '../api/types';
+import { Icon } from '../components/Icon';
 import { groupByPrefix } from './schemaGroups';
 
 interface Props {
@@ -38,24 +39,26 @@ export function SchemaTree({ tables, loading, onSelectQuery, onInsertText }: Pro
     const refs = new Map(t.foreignKeys.map((fk) => [fk.column, fk]));
     return (
       <div key={t.name} role="treeitem" aria-expanded={isOpen} aria-selected={false}>
-        <div className="group flex items-center gap-1 pr-1 pl-5 hover:bg-hover">
+        <div className="group flex items-center gap-1 pr-1 pl-1 hover:bg-hover">
           <button
             type="button"
-            className="flex min-w-0 flex-1 items-center gap-1 py-0.5 text-left"
+            className="flex min-w-0 flex-1 items-center gap-1 py-px text-left"
             onClick={() => setOpen((o) => ({ ...o, [t.name]: !isOpen }))}
             onDoubleClick={() => onSelectQuery(selectTemplate(t), t.name)}
             title={t.description ?? t.name}
             data-testid={`schema-table-${t.name}`}
           >
-            <span aria-hidden className="text-muted">
-              {isOpen ? '▾' : '▸'}
-            </span>
-            <span aria-hidden>▦</span>
+            <Icon
+              name={isOpen ? 'chevron-down' : 'chevron-right'}
+              size={12}
+              className="text-muted"
+            />
+            <Icon name="table" size={13} className="text-accent" />
             <span className="truncate font-mono">{t.name}</span>
           </button>
           <button
             type="button"
-            className="rounded px-1 text-[11px] text-accent opacity-70 group-hover:opacity-100 hover:underline"
+            className="rounded px-1 text-[10px] text-accent opacity-60 group-hover:opacity-100 hover:underline"
             onClick={() => onSelectQuery(selectTemplate(t), t.name)}
             title={`SELECT * FROM ${t.name}`}
             aria-label={`Consultar ${t.name} (SELECT *)`}
@@ -64,21 +67,31 @@ export function SchemaTree({ tables, loading, onSelectQuery, onInsertText }: Pro
           </button>
         </div>
         {isOpen && (
-          <div className="mb-1 ml-9 border-l border-line pl-2">
-            {t.description && <p className="py-0.5 text-[11px] text-muted">{t.description}</p>}
-            <ul className="py-0.5">
+          <div className="ml-[0.6rem] border-l border-line pl-1.5">
+            {t.description && (
+              <p className="truncate py-px text-[11px] text-muted" title={t.description}>
+                {t.description}
+              </p>
+            )}
+            <ul data-testid={`schema-columns-${t.name}`}>
               {t.columns.map((c) => {
                 const ref = refs.get(c.name);
                 return (
                   <li key={c.name}>
                     <button
                       type="button"
-                      className="flex w-full items-center gap-1 rounded px-1 text-left hover:bg-hover"
-                      title={`${c.description ?? ''}${ref ? ` → ${ref.refTable}.${ref.refColumn}` : ''}\nClique para inserir no editor`}
+                      className="flex w-full items-center gap-1 rounded px-1 py-px text-left hover:bg-hover"
+                      title={`${c.description ?? ''}${ref ? ` → ${ref.refTable}.${ref.refColumn}` : ''}
+Clique para inserir no editor`}
                       onClick={() => onInsertText(c.name)}
                     >
-                      <span className="w-3 text-[10px] text-warn" aria-hidden>
-                        {c.pk ? '🔑' : ref ? '↗' : ''}
+                      <Icon
+                        name={c.pk ? 'key' : ref ? 'link' : 'column'}
+                        size={12}
+                        className={c.pk || ref ? 'text-warn' : 'text-muted'}
+                      />
+                      <span className="sr-only">
+                        {c.pk ? 'Chave primária: ' : ref ? 'Chave estrangeira: ' : ''}
                       </span>
                       <span className="truncate font-mono">{c.name}</span>
                       <span className="ml-auto pl-2 font-mono text-[10px] text-muted">
@@ -95,21 +108,41 @@ export function SchemaTree({ tables, loading, onSelectQuery, onInsertText }: Pro
     );
   }
 
+  const visible = groups.reduce((n, g) => n + g.tables.length, 0);
+
   return (
     <div className="flex h-full flex-col">
-      <div className="border-b border-line p-2">
+      <div className="flex items-center gap-1.5 border-b border-line bg-panel2 px-2 py-1 text-[11px] font-semibold tracking-wide text-muted uppercase">
+        <Icon name="table" size={13} />
+        <span>Tabelas</span>
+        {tables && (
+          <span
+            className="ml-auto rounded-full border border-line px-1.5 font-normal tracking-normal normal-case"
+            data-testid="schema-count"
+            title={filtering ? `${visible} de ${tables.length} tabelas` : `${visible} tabelas`}
+          >
+            {filtering ? `${visible}/${tables.length}` : visible}
+          </span>
+        )}
+      </div>
+      <div className="relative border-b border-line p-1.5">
         <label className="sr-only" htmlFor="schema-filter">
           Filtrar tabelas
         </label>
+        <Icon
+          name="search"
+          size={12}
+          className="pointer-events-none absolute top-1/2 left-3 -translate-y-1/2 text-muted"
+        />
         <input
           id="schema-filter"
-          className="input w-full text-xs"
+          className="input w-full py-0.5 pl-6 text-xs"
           placeholder="Filtrar tabelas e colunas…"
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
         />
       </div>
-      <div className="min-h-0 flex-1 overflow-auto py-1 text-xs" role="tree" aria-label="Tabelas">
+      <div className="min-h-0 flex-1 overflow-auto py-0.5 text-xs" role="tree" aria-label="Tabelas">
         {loading && <div className="p-2 text-muted">Carregando schema…</div>}
         {groups.map((g) => {
           // A filter opens every group so matches are never hidden behind a collapsed prefix.
@@ -118,20 +151,25 @@ export function SchemaTree({ tables, loading, onSelectQuery, onInsertText }: Pro
             <div key={g.prefix} role="group" aria-label={`Prefixo ${g.prefix}`}>
               <button
                 type="button"
-                className="flex w-full items-center gap-1 px-2 py-0.5 text-left font-semibold hover:bg-hover"
+                className="flex w-full items-center gap-1 px-1 py-px text-left font-semibold hover:bg-hover"
                 aria-expanded={groupOpen}
                 onClick={() => setOpenGroups((o) => ({ ...o, [g.prefix]: !groupOpen }))}
                 data-testid={`schema-group-${g.prefix}`}
               >
-                <span aria-hidden className="text-muted">
-                  {groupOpen ? '▾' : '▸'}
-                </span>
+                <Icon
+                  name={groupOpen ? 'chevron-down' : 'chevron-right'}
+                  size={12}
+                  className="text-muted"
+                />
+                <Icon name="folder" size={13} className="text-warn" />
                 <span className="font-mono">{g.prefix}</span>
                 <span className="ml-auto text-[10px] font-normal text-muted">
                   {g.tables.length}
                 </span>
               </button>
-              {groupOpen && g.tables.map(renderTable)}
+              {groupOpen && (
+                <div className="ml-[0.6rem] border-l border-line">{g.tables.map(renderTable)}</div>
+              )}
             </div>
           );
         })}

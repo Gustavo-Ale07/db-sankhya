@@ -119,6 +119,43 @@ body {
   filter: brightness(1.1);
 }
 
+/* Dense, flat toolbar button: borderless until hovered, icon + short label. */
+.tbtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--dbx-fg);
+  border-radius: 3px;
+  padding: 0.15rem 0.45rem;
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.tbtn:hover:not(:disabled) {
+  background: var(--dbx-hover);
+  border-color: var(--dbx-line);
+}
+.tbtn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.tbtn[aria-pressed='true'] {
+  background: var(--dbx-selected);
+}
+.tbtn-primary {
+  background: var(--dbx-accent);
+  border-color: var(--dbx-accent);
+  color: var(--dbx-accent-fg);
+}
+.tbtn-primary:hover:not(:disabled) {
+  background: var(--dbx-accent);
+  border-color: var(--dbx-accent);
+  filter: brightness(1.1);
+}
+
 .input {
   border: 1px solid var(--dbx-line);
   background: var(--dbx-panel);
