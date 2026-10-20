@@ -136,7 +136,7 @@ Clique para inserir no editor`}
         />
         <input
           id="schema-filter"
-          className="input w-full py-0.5 pl-6 text-xs"
+          className="input input-search w-full"
           placeholder="Filtrar tabelas e colunas…"
           value={filter}
           onChange={(e) => setFilter(e.target.value)}

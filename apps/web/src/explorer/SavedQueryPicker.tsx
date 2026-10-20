@@ -50,7 +50,7 @@ function PickerBody({ onPick }: { onPick: (query: SavedQuery) => void }) {
         />
         <input
           id="saved-picker-filter"
-          className="input w-full py-1 pl-6 text-xs"
+          className="input input-search w-full"
           placeholder="Filtrar por nome, descrição ou SQL…"
           value={filter}
           autoFocus

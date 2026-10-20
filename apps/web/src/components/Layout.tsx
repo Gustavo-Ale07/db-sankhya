@@ -115,17 +115,17 @@ export function Layout({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: 
         </div>
       )}
       <EnvironmentBanner environment={connection?.environment} connectionName={connection?.name} />
-      <header className="flex items-center gap-1 border-b border-line bg-panel px-2 py-1">
-        <span className="mr-3 flex items-center gap-1.5 font-semibold">
-          <img src="/favicon.svg" alt="" width={18} height={18} />
+      <header className="flex flex-wrap items-center gap-x-1 gap-y-0.5 border-b border-line bg-panel px-2 py-0.5">
+        <span className="mr-2 flex shrink-0 items-center gap-1.5 font-semibold">
+          <img src="/favicon.svg" alt="" width={16} height={16} />
           DB-Sankhya
         </span>
-        <nav aria-label="Navegação principal" className="flex flex-wrap gap-0.5">
+        <nav aria-label="Navegação principal" className="flex min-w-0 flex-wrap gap-px">
           {NAV.filter((n) => allowed(n.view)).map((n) => (
             <button
               key={n.view}
               type="button"
-              className={`rounded px-2.5 py-1 text-xs ${
+              className={`rounded px-2 py-0.5 text-xs ${
                 view === n.view ? 'bg-selected font-semibold' : 'hover:bg-hover'
               }`}
               aria-current={view === n.view ? 'page' : undefined}
@@ -135,7 +135,7 @@ export function Layout({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: 
             </button>
           ))}
         </nav>
-        <div className="ml-auto flex items-center gap-2 text-xs">
+        <div className="ml-auto flex min-w-0 items-center gap-1.5 text-xs">
           {canQuery && (
             <ConnectionPicker
               connections={connectionList.data?.items ?? []}
@@ -154,22 +154,22 @@ export function Layout({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: 
               LIVE
             </span>
           )}
-          <span className="text-muted" data-testid="current-user">
+          <span className="max-w-64 truncate text-muted" data-testid="current-user">
             {user.name} · {rolesLabel(user.roles)}
           </span>
           <button
             type="button"
-            className="btn"
+            className="btn btn-sm"
             onClick={onToggleTheme}
             aria-label={theme === 'dark' ? 'Usar tema claro' : 'Usar tema escuro'}
             title={theme === 'dark' ? 'Tema claro' : 'Tema escuro'}
           >
             {theme === 'dark' ? '☀' : '☾'}
           </button>
-          <button type="button" className="btn" onClick={() => setView('password')}>
+          <button type="button" className="btn btn-sm" onClick={() => setView('password')}>
             Senha
           </button>
-          <button type="button" className="btn" onClick={() => void logout()}>
+          <button type="button" className="btn btn-sm" onClick={() => void logout()}>
             Sair
           </button>
         </div>
