@@ -83,6 +83,18 @@ export function Layout({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: 
     setView('explorer');
   }, []);
 
+  // A rollback opens on the audit event's own connection, exactly: never on a fallback, and
+  // without changing the remembered default (the selection is not persisted).
+  const connectionItems = connectionList.data?.items;
+  const openRollback = useCallback(
+    (req: { sql: string; title: string }, connectionId: string) => {
+      if (!connectionItems?.some((c) => c.id === connectionId)) return;
+      setWantedConnection(connectionId);
+      openInEditor(req);
+    },
+    [connectionItems, openInEditor],
+  );
+
   const allowed = (v: View) => {
     const permission = NAV.find((n) => n.view === v)?.permission;
     return !permission || can(user, permission);
@@ -185,12 +197,7 @@ export function Layout({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: 
             {view === 'security' && allowed('security') && <SecurityPage />}
             {view === 'approvals' && allowed('approvals') && <ApprovalsPage />}
             {view === 'audit' && allowed('audit') && (
-              <AuditPage
-                onOpen={(req, connectionId) => {
-                  selectConnection(connectionId);
-                  openInEditor(req);
-                }}
-              />
+              <AuditPage onOpen={openRollback} connections={connectionItems} />
             )}
             {view === 'status' && <StatusPage />}
             {view === 'password' && <ChangePasswordPage onDone={refresh} />}

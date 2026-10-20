@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ApiError, api } from '../api/client';
+import type { ConnectionOption } from '../api/types';
 import { AuditPage } from './AuditPage';
 import { RollbackPlanAction, isRollbackEligible, type RollbackEvent } from './AuditRollback';
 
@@ -18,6 +19,10 @@ HTMLDialogElement.prototype.close = function close(this: HTMLDialogElement) {
 };
 
 const ID = '00000000-0000-4000-8000-000000000001';
+const CONNECTIONS: ConnectionOption[] = [
+  { id: 'other', name: 'Outra', environment: 'SANDBOX' },
+  { id: 'env', name: 'Principal', environment: 'PRODUCTION' },
+];
 
 function event(over: Partial<RollbackEvent> = {}): RollbackEvent {
   return {
@@ -110,20 +115,29 @@ describe('isRollbackEligible', () => {
 
 describe('RollbackPlanAction', () => {
   it('renders nothing for an ineligible event', () => {
-    wrap(<RollbackPlanAction event={event({ snapshot: null })} onOpen={vi.fn()} />);
+    wrap(
+      <RollbackPlanAction
+        event={event({ snapshot: null })}
+        onOpen={vi.fn()}
+        connections={CONNECTIONS}
+      />,
+    );
     expect(screen.queryByText('Gerar plano de rollback')).toBeNull();
   });
 
   it('requests the plan, shows label and SQL, and opens the first statement', async () => {
     vi.mocked(api.post).mockResolvedValue(PLAN);
     const onOpen = vi.fn();
-    wrap(<RollbackPlanAction event={event()} onOpen={onOpen} />);
+    wrap(<RollbackPlanAction event={event()} onOpen={onOpen} connections={CONNECTIONS} />);
     fireEvent.click(screen.getByText('Gerar plano de rollback'));
     await waitFor(() => expect(api.post).toHaveBeenCalledWith(`/api/audit/${ID}/rollback-plan`));
     expect((await screen.findByTestId('rollback-label')).textContent).toContain(PLAN.label);
     expect(screen.getByTestId('rollback-sql').textContent).toBe(PLAN.displaySql);
     expect(screen.getByTestId('rollback-statements').textContent).toMatch(/1 de 2/);
     expect(screen.queryByTestId('rollback-conflict')).toBeNull();
+    expect(screen.getByTestId('rollback-connection').textContent).toBe(
+      'Conexão de destino: Principal · PRODUÇÃO',
+    );
     fireEvent.click(screen.getByText('Abrir no editor'));
     expect(onOpen).toHaveBeenCalledWith({ sql: PLAN.sql, title: expect.any(String) }, 'env');
   });
@@ -139,7 +153,7 @@ describe('RollbackPlanAction', () => {
         message: 'The row changed after the original write.',
       },
     });
-    wrap(<RollbackPlanAction event={event()} onOpen={vi.fn()} />);
+    wrap(<RollbackPlanAction event={event()} onOpen={vi.fn()} connections={CONNECTIONS} />);
     fireEvent.click(screen.getByText('Gerar plano de rollback'));
     const conflict = await screen.findByTestId('rollback-conflict');
     expect(conflict.textContent).toContain('The row changed after the original write.');
@@ -148,11 +162,37 @@ describe('RollbackPlanAction', () => {
     expect(screen.queryByTestId('rollback-statements')).toBeNull();
   });
 
+  it('an event connection that is not available: an error, and the SQL stays out of the editor', async () => {
+    vi.mocked(api.post).mockResolvedValue(PLAN);
+    const onOpen = vi.fn();
+    wrap(
+      <RollbackPlanAction
+        event={event({ connectionId: 'gone' })}
+        onOpen={onOpen}
+        connections={CONNECTIONS}
+      />,
+    );
+    fireEvent.click(screen.getByText('Gerar plano de rollback'));
+    const alert = await screen.findByTestId('rollback-connection-unavailable');
+    expect(alert.textContent).toContain('A conexão deste evento (gone) não está disponível');
+    expect(screen.queryByText('Abrir no editor')).toBeNull();
+    expect(screen.queryByTestId('rollback-connection')).toBeNull();
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it('no connection list (not loaded or no access) counts as unavailable', async () => {
+    vi.mocked(api.post).mockResolvedValue(PLAN);
+    wrap(<RollbackPlanAction event={event()} onOpen={vi.fn()} />);
+    fireEvent.click(screen.getByText('Gerar plano de rollback'));
+    await screen.findByTestId('rollback-connection-unavailable');
+    expect(screen.queryByText('Abrir no editor')).toBeNull();
+  });
+
   it('shows the server refusal', async () => {
     vi.mocked(api.post).mockRejectedValue(
       new ApiError(409, { code: 'CONFLICT', message: 'No rollback plan for this event' }),
     );
-    wrap(<RollbackPlanAction event={event()} onOpen={vi.fn()} />);
+    wrap(<RollbackPlanAction event={event()} onOpen={vi.fn()} connections={CONNECTIONS} />);
     fireEvent.click(screen.getByText('Gerar plano de rollback'));
     expect(await screen.findByText(/No rollback plan for this event/)).toBeTruthy();
   });
@@ -164,7 +204,7 @@ describe('AuditPage rollback action', () => {
       items: [event(), event({ id: 'other', snapshot: null })],
       total: 2,
     });
-    wrap(<AuditPage onOpen={vi.fn()} />);
+    wrap(<AuditPage onOpen={vi.fn()} connections={CONNECTIONS} />);
     const rows = await screen.findAllByTestId('audit-row');
     fireEvent.click(rows[0]!);
     expect(screen.getByText('Gerar plano de rollback')).toBeTruthy();

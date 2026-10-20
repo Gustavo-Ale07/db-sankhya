@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '../api/client';
-import type { AuditEvent } from '../api/types';
+import type { AuditEvent, ConnectionOption } from '../api/types';
 import { ErrorBox } from '../components/ErrorBox';
 import { JsonView } from '../components/JsonView';
 import { Modal } from '../components/Modal';
@@ -70,8 +70,14 @@ interface Filters {
 }
 const EMPTY: Filters = { action: '', userEmail: '', resource: '', status: '', from: '', to: '' };
 
-/** `onOpen` hands a rollback statement to the SQL editor; without it the action is hidden. */
-export function AuditPage({ onOpen }: { onOpen?: OpenRollback } = {}) {
+/**
+ * `onOpen` hands a rollback statement to the SQL editor (without it the action is hidden);
+ * `connections` are the caller's usable connections, so the target connection is named exactly.
+ */
+export function AuditPage({
+  onOpen,
+  connections,
+}: { onOpen?: OpenRollback; connections?: readonly ConnectionOption[] } = {}) {
   const [form, setForm] = useState<Filters>(EMPTY);
   const [filters, setFilters] = useState<Filters>(EMPTY);
   const [offset, setOffset] = useState(0);
@@ -243,7 +249,14 @@ export function AuditPage({ onOpen }: { onOpen?: OpenRollback } = {}) {
       >
         {detail && (
           <div className="space-y-3">
-            {onOpen && <RollbackPlanAction key={detail.id} event={detail} onOpen={onOpen} />}
+            {onOpen && (
+              <RollbackPlanAction
+                key={detail.id}
+                event={detail}
+                onOpen={onOpen}
+                connections={connections}
+              />
+            )}
             <div className="h-[60vh]">
               <JsonView value={detail} />
             </div>

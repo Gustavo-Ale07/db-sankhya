@@ -7,12 +7,31 @@ import { SessionContext } from '../app/session';
 import { Layout } from './Layout';
 
 // The pages are not under test; stubbing them keeps Monaco and data fetching out of jsdom.
-vi.mock('../explorer/ExplorerPage', () => ({ ExplorerPage: () => null }));
+vi.mock('../explorer/ExplorerPage', () => ({
+  ExplorerPage: (p: { openRequest: { sql: string } | null; connectionId?: string }) => (
+    <div data-testid="explorer-stub">{`${p.openRequest?.sql ?? ''}|${p.connectionId ?? ''}`}</div>
+  ),
+}));
 vi.mock('../pages/HistoryPage', () => ({ HistoryPage: () => null }));
 vi.mock('../pages/SavedQueriesPage', () => ({ SavedQueriesPage: () => null }));
 vi.mock('../pages/ChangePasswordPage', () => ({ ChangePasswordPage: () => null }));
 vi.mock('../admin/UsersPage', () => ({ UsersPage: () => null }));
-vi.mock('../admin/AuditPage', () => ({ AuditPage: () => null }));
+vi.mock('../admin/AuditPage', () => ({
+  AuditPage: (p: {
+    onOpen?: (r: { sql: string; title: string }, connectionId: string) => void;
+    connections?: unknown[];
+  }) => (
+    <div>
+      <span data-testid="audit-connections">{p.connections?.length ?? 0}</span>
+      <button onClick={() => p.onOpen?.({ sql: 'UPDATE PROD', title: 'Rollback' }, 'prod')}>
+        open-prod
+      </button>
+      <button onClick={() => p.onOpen?.({ sql: 'UPDATE GONE', title: 'Rollback' }, 'gone')}>
+        open-gone
+      </button>
+    </div>
+  ),
+}));
 vi.mock('../admin/ApprovalsPage', () => ({ ApprovalsPage: () => null }));
 vi.mock('../admin/GroupsPage', () => ({ GroupsPage: () => null }));
 vi.mock('../admin/RolesPage', () => ({ RolesPage: () => null }));
@@ -180,5 +199,35 @@ describe('Layout navigation gating', () => {
       expect(navLabels()).toContain(label);
       for (const [other] of pairs) if (other !== label) expect(navLabels()).not.toContain(other);
     }
+  });
+});
+
+describe('Layout rollback hand-off from the audit page', () => {
+  const auditor: User = { ...USER, permissions: [...USER.permissions, 'AUDIT.READ'] };
+  const openAudit = async () => {
+    renderLayout(META, auditor);
+    await waitFor(() =>
+      expect(screen.getByTestId('environment-label').textContent).toBe('SANDBOX'),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Auditoria' }));
+    await waitFor(() => expect(screen.getByTestId('audit-connections').textContent).toBe('2'));
+  };
+
+  it('opens the SQL on the event connection without making it the saved default', async () => {
+    await openAudit();
+    fireEvent.click(screen.getByText('open-prod'));
+    await waitFor(() =>
+      expect(screen.getByTestId('explorer-stub').textContent).toBe('UPDATE PROD|prod'),
+    );
+    expect(screen.getByTestId('environment-label').textContent).toBe('PRODUÇÃO');
+    expect(window.localStorage.getItem('dbx.connection')).toBeNull();
+  });
+
+  it('never falls back to another connection: an unlisted one opens nothing', async () => {
+    await openAudit();
+    fireEvent.click(screen.getByText('open-gone'));
+    expect(screen.getByTestId('explorer-stub').textContent).toBe('|env-default');
+    expect(screen.getByTestId('environment-label').textContent).toBe('SANDBOX');
+    expect(window.localStorage.getItem('dbx.connection')).toBeNull();
   });
 });

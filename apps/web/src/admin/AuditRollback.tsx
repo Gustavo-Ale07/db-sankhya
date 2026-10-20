@@ -1,6 +1,7 @@
 import { useMutation } from '@tanstack/react-query';
 import { api } from '../api/client';
-import type { AuditEvent } from '../api/types';
+import type { AuditEvent, ConnectionOption } from '../api/types';
+import { ENVIRONMENT_LABEL } from '../components/EnvironmentBanner';
 import { ErrorBox } from '../components/ErrorBox';
 
 /** The audit row as the server sends it: the lifecycle columns the base type leaves out. */
@@ -52,19 +53,26 @@ export function isRollbackEligible(e: RollbackEvent): boolean {
 const show = (v: unknown) =>
   v === null || v === undefined ? 'NULL' : typeof v === 'string' ? v : JSON.stringify(v);
 
-/** "Gerar plano de rollback": asks the server for a new plan and hands its SQL to the editor. */
+/**
+ * "Gerar plano de rollback": asks the server for a new plan and hands its SQL to the editor, on
+ * the event's own connection only. `connections` is the caller's connection list: when the
+ * event's connection is not in it, the SQL is never handed over (no fallback to another one).
+ */
 export function RollbackPlanAction({
   event,
   onOpen,
+  connections,
 }: {
   event: RollbackEvent;
   onOpen: OpenRollback;
+  connections?: readonly ConnectionOption[];
 }) {
   const plan = useMutation({
     mutationFn: () => api.post<RollbackPlan>(`/api/audit/${event.id}/rollback-plan`),
   });
   if (!isRollbackEligible(event)) return null;
   const data = plan.data;
+  const target = connections?.find((c) => c.id === event.connectionId);
   return (
     <section className="space-y-2 rounded border border-line p-3 text-xs" data-testid="rollback">
       <button type="button" className="btn" disabled={plan.isPending} onClick={() => plan.mutate()}>
@@ -109,15 +117,29 @@ export function RollbackPlanAction({
               referência.
             </div>
           )}
-          <button
-            type="button"
-            className="btn btn-primary"
-            onClick={() =>
-              onOpen({ sql: data.sql, title: 'Rollback assistido' }, event.connectionId ?? '')
-            }
-          >
-            Abrir no editor
-          </button>
+          {target ? (
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={() => onOpen({ sql: data.sql, title: 'Rollback assistido' }, target.id)}
+              >
+                Abrir no editor
+              </button>
+              <span data-testid="rollback-connection">
+                {`Conexão de destino: ${target.name} · ${ENVIRONMENT_LABEL[target.environment]}`}
+              </span>
+            </div>
+          ) : (
+            <div
+              role="alert"
+              className="rounded border border-danger/40 bg-danger/10 px-3 py-2 text-danger"
+              data-testid="rollback-connection-unavailable"
+            >
+              {`A conexão deste evento (${event.connectionId ?? '—'}) não está disponível para ` +
+                'você agora; o plano não foi aberto no editor para não rodar em outra conexão.'}
+            </div>
+          )}
         </div>
       )}
     </section>
