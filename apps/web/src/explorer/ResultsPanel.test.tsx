@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, it } from 'vitest';
-import { cleanup, render, screen } from '@testing-library/react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { ApiError } from '../api/client';
 import { mergeOutcome, outcomeOf } from './runState';
 import { MutationStatus } from './ResultsPanel';
@@ -77,5 +77,30 @@ describe('MutationStatus', () => {
     render(<MutationStatus outcome={mergeOutcome(lost, outcomeOf({ report }))} />);
     expect(screen.queryByTestId('mutation-outcome-unknown')).toBeNull();
     expect(document.body.textContent).toContain('Alteração executada (concluída)');
+  });
+
+  it('offers to reopen a plan still held in memory', () => {
+    const onReopen = vi.fn();
+    render(
+      <MutationStatus
+        outcome={{ sent: true, unknown: true, errorCode: 'NETWORK_ERROR' }}
+        reopen={{ onReopen }}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Reabrir prévia' }));
+    expect(onReopen).toHaveBeenCalledTimes(1);
+  });
+
+  it('blocks the reopen while another connection is selected, and says why', () => {
+    const onReopen = vi.fn();
+    render(<MutationStatus reopen={{ onReopen, blockedReason: 'outra conexão' }} />);
+    const button = screen.getByRole('button', { name: 'Reabrir prévia' }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    expect(screen.getByTestId('mutation-reopen-blocked').textContent).toContain('outra conexão');
+  });
+
+  it('has no reopen button without a plan in memory', () => {
+    render(<MutationStatus outcome={{ sent: true, unknown: false, report }} />);
+    expect(screen.queryByRole('button', { name: 'Reabrir prévia' })).toBeNull();
   });
 });

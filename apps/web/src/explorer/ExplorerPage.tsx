@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, ApiError, newExecutionId } from '../api/client';
 import { previewMutation } from '../api/mutations';
-import type { MutationPreview } from '../api/mutations';
+import type { PreparedPlan } from '../api/mutations';
 import type { QueryResult, SavedQuery, SchemaResponse } from '../api/types';
 import type { Theme } from '../app/theme';
 import { useSession } from '../app/session';
@@ -10,6 +10,8 @@ import { setCompletionSchema } from '../editor/monaco';
 import { ErrorBox } from '../components/ErrorBox';
 import { Modal } from '../components/Modal';
 import { MutationDialog } from './MutationDialog';
+import { dropPlan, getPendingPlan, rememberPlan, updatePlan, usePendingPlan } from './pendingPlans';
+import type { PendingPlan } from './pendingPlans';
 import { ResultsPanel } from './ResultsPanel';
 import type { ResultTab } from './ResultsPanel';
 import { SchemaTree } from './SchemaTree';
@@ -28,9 +30,23 @@ export interface OpenRequest {
   nonce: number;
 }
 
+/**
+ * A plan the server already prepared (the assisted rollback), to open in the dialog as is: no
+ * second preview, so execute consumes exactly that plan. It opens only while `connectionId` is
+ * the selected connection.
+ */
+export interface OpenPlanRequest {
+  plan: PreparedPlan;
+  sql: string;
+  title?: string;
+  connectionId: string;
+  nonce: number;
+}
+
 interface Props {
   theme: Theme;
   openRequest: OpenRequest | null;
+  planRequest?: OpenPlanRequest | null;
   active: boolean;
   /** Selected connection. Undefined (loading, error, empty list) blocks running queries. */
   connectionId?: string | undefined;
@@ -41,6 +57,7 @@ interface Props {
 export function ExplorerPage({
   theme,
   openRequest,
+  planRequest = null,
   active,
   connectionId,
   connectionReady = true,
@@ -56,12 +73,9 @@ export function ExplorerPage({
   const [saveError, setSaveError] = useState<unknown>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [editorHeight, setEditorHeight] = useState(45);
-  // The open mutation plan. Its token lives only here, in memory: never in tabs, storage or logs.
-  const [mutation, setMutation] = useState<{
-    tabId: string;
-    sql: string;
-    preview: MutationPreview;
-  } | null>(null);
+  // The open mutation plan. Its token lives only in memory (here and in the pending-plan store,
+  // which lets a closed dialog be reopened): never in tabs, storage or logs.
+  const [mutation, setMutation] = useState<PendingPlan | null>(null);
   const editorApi = useRef<EditorApi | null>(null);
   const aborts = useRef<Record<string, AbortController>>({});
   // Tabs whose mutation preview is being prepared: a second run (Ctrl+Enter, F5) is ignored
@@ -92,6 +106,25 @@ export function ExplorerPage({
   }, []);
 
   const setRun = (id: string, r: RunState) => setRuns((all) => ({ ...all, [id]: r }));
+
+  /** Opens the dialog on a plan and keeps it in memory, with one idempotency key, until it settles. */
+  const openPlan = useCallback(
+    (tabId: string, sql: string, preview: PreparedPlan, planConnection: string) => {
+      const entry: PendingPlan = {
+        planId: preview.planId,
+        preview,
+        idempotencyKey: crypto.randomUUID(),
+        connectionId: planConnection,
+        sql,
+        tabId,
+        approvalRequested: false,
+      };
+      rememberPlan(entry);
+      setRun(tabId, { status: 'mutation', sql, planId: preview.planId });
+      setMutation(entry);
+    },
+    [],
+  );
   const updateTab = (id: string, patch: Partial<EditorTab>) =>
     setTabs((ts) => ts.map((t) => (t.id === id ? { ...t, ...patch } : t)));
 
@@ -133,8 +166,7 @@ export function ExplorerPage({
             const preview = await previewMutation(sql, connectionId, controller.signal);
             // A late answer (tab closed, run superseded) never opens a dialog.
             if (aborts.current[tabId] === controller && !controller.signal.aborted) {
-              setRun(tabId, { status: 'mutation', sql, planId: preview.planId });
-              setMutation({ tabId, sql, preview });
+              openPlan(tabId, sql, preview, connectionId);
             }
           } catch (previewErr) {
             if (aborts.current[tabId] === controller) {
@@ -152,7 +184,7 @@ export function ExplorerPage({
         void qc.invalidateQueries({ queryKey: ['history'] });
       }
     },
-    [qc, connectionId],
+    [qc, connectionId, openPlan],
   );
 
   const runCurrent = useCallback(() => {
@@ -248,6 +280,43 @@ export function ExplorerPage({
     if (openRequest.run) void execute(openRequest.sql, target.id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openRequest]);
+
+  // A plan the server prepared (assisted rollback): opened only on its own connection, once.
+  const lastPlanNonce = useRef<number | null>(null);
+  useEffect(() => {
+    if (!planRequest || planRequest.nonce === lastPlanNonce.current) return;
+    if (planRequest.connectionId !== connectionId) return;
+    lastPlanNonce.current = planRequest.nonce;
+    // Opened again while still in memory: the same entry (same idempotency key), never a new one.
+    const known = getPendingPlan(planRequest.plan.planId);
+    if (known) {
+      if (tabs.some((x) => x.id === known.tabId)) setActiveId(known.tabId);
+      setMutation(known);
+      return;
+    }
+    const t = addTab({
+      sql: planRequest.sql,
+      ...(planRequest.title ? { title: planRequest.title } : {}),
+    });
+    openPlan(t.id, planRequest.sql, planRequest.plan, planRequest.connectionId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [planRequest, connectionId]);
+
+  // The plan of this tab still in memory (dropped on a final outcome, its TTL or logout).
+  const pending = usePendingPlan(
+    run.status === 'mutation' && mutation === null ? run.planId : undefined,
+  );
+  const reopen = pending
+    ? {
+        onReopen: () => {
+          const p = getPendingPlan(pending.planId);
+          if (p && p.connectionId === connectionId) setMutation(p);
+        },
+        ...(pending.connectionId !== connectionId
+          ? { blockedReason: 'Selecione a conexão em que a prévia foi gerada para reabri-la.' }
+          : {}),
+      }
+    : undefined;
 
   function openTableQuery(sql: string) {
     if (tab.sql.trim() === '' || !tab.dirty) {
@@ -426,6 +495,7 @@ export function ExplorerPage({
                 run={run}
                 tab={resultTab[tab.id] ?? 'results'}
                 onTab={(t) => setResultTab((m) => ({ ...m, [tab.id]: t }))}
+                {...(reopen ? { reopen } : {})}
               />
             </div>
           </div>
@@ -434,18 +504,24 @@ export function ExplorerPage({
 
       {mutation && (
         <MutationDialog
-          key={mutation.preview.planId}
+          key={mutation.planId}
           preview={mutation.preview}
           sql={mutation.sql}
+          idempotencyKey={mutation.idempotencyKey}
+          {...(mutation.outcome ? { initialOutcome: mutation.outcome } : {})}
+          approvalRequested={mutation.approvalRequested}
           onClose={() => setMutation(null)}
-          onOutcome={(outcome) =>
+          onOutcome={(outcome) => {
+            updatePlan(mutation.planId, { outcome });
             setRun(mutation.tabId, {
               status: 'mutation',
               sql: mutation.sql,
-              planId: mutation.preview.planId,
+              planId: mutation.planId,
               outcome,
-            })
-          }
+            });
+          }}
+          onApprovalRequested={() => updatePlan(mutation.planId, { approvalRequested: true })}
+          onSettled={() => dropPlan(mutation.planId)}
         />
       )}
 

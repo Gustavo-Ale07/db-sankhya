@@ -21,10 +21,39 @@ const TABS: { id: ResultTab; label: string }[] = [
   { id: 'messages', label: 'Messages' },
 ];
 
+/** A plan of this tab still held in memory, which the status area can reopen. */
+export interface ReopenPlan {
+  onReopen: () => void;
+  /** Why it cannot be reopened right now (another connection is selected). */
+  blockedReason?: string;
+}
+
 interface Props {
   run: RunState;
   tab: ResultTab;
   onTab: (t: ResultTab) => void;
+  reopen?: ReopenPlan;
+}
+
+function ReopenButton({ reopen }: { reopen: ReopenPlan }) {
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <button
+        type="button"
+        className="btn"
+        onClick={reopen.onReopen}
+        disabled={reopen.blockedReason !== undefined}
+        data-testid="mutation-reopen"
+      >
+        Reabrir prévia
+      </button>
+      {reopen.blockedReason !== undefined && (
+        <span className="text-muted" data-testid="mutation-reopen-blocked">
+          {reopen.blockedReason}
+        </span>
+      )}
+    </div>
+  );
 }
 
 function Elapsed({ since }: { since: number }) {
@@ -41,13 +70,22 @@ function Elapsed({ since }: { since: number }) {
  * was sent it never claims that nothing was written; an unknown outcome keeps a do-not-repeat
  * banner until the tab runs something else.
  */
-export function MutationStatus({ outcome }: { outcome?: MutationOutcome }) {
+export function MutationStatus({
+  outcome,
+  reopen,
+}: {
+  outcome?: MutationOutcome;
+  reopen?: ReopenPlan;
+}) {
   if (!outcome) {
     return (
-      <p>
-        Instrução de alteração: revise a prévia. Nada é gravado sem a confirmação explícita no
-        diálogo.
-      </p>
+      <div className="space-y-2">
+        <p>
+          Instrução de alteração: revise a prévia. Nada é gravado sem a confirmação explícita no
+          diálogo.
+        </p>
+        {reopen && <ReopenButton reopen={reopen} />}
+      </div>
     );
   }
   return (
@@ -75,11 +113,12 @@ export function MutationStatus({ outcome }: { outcome?: MutationOutcome }) {
           Nada foi gravado.
         </p>
       )}
+      {reopen && <ReopenButton reopen={reopen} />}
     </div>
   );
 }
 
-export function ResultsPanel({ run, tab, onTab }: Props) {
+export function ResultsPanel({ run, tab, onTab, reopen }: Props) {
   const result = run.status === 'result' ? run.result : null;
   const columnNames = useMemo(() => result?.columns.map((c) => c.name) ?? [], [result]);
   const records = useMemo(
@@ -175,7 +214,10 @@ export function ResultsPanel({ run, tab, onTab }: Props) {
             )}
             {run.status === 'mutation' && (
               <div className="p-3 text-xs" role="status" data-testid="mutation-status">
-                <MutationStatus {...(run.outcome ? { outcome: run.outcome } : {})} />
+                <MutationStatus
+                  {...(run.outcome ? { outcome: run.outcome } : {})}
+                  {...(reopen ? { reopen } : {})}
+                />
               </div>
             )}
             {result && (
