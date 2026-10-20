@@ -12,14 +12,27 @@ import { defineConfig, devices } from '@playwright/test';
 const PORT = Number(process.env.E2E_PORT ?? 3199);
 const root = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 // Same derivation as start-server.mjs (from PORT); keep the two in sync.
-const E2E_DIR = join(tmpdir(), `dbx-e2e-${PORT}`);
+export const E2E_DIR = join(tmpdir(), `dbx-e2e-${PORT}`);
 const PASSWORD_FILE = join(E2E_DIR, 'bootstrap-password.txt');
+export const BASE_URL = `http://localhost:${PORT}`;
 
 export const BOOTSTRAP = {
   email: 'admin@example.com',
   /** One-time password printed by the admin CLI when the e2e server started. */
   get password(): string {
     return readFileSync(PASSWORD_FILE, 'utf8').trim();
+  },
+};
+
+/**
+ * A second user created by start-server.mjs with a seeded test-only role (QUERY.SELECT, TEMP.*,
+ * DATA.DELETE, DDL.CUSTOM.GENERATE), which no administrator can grant through the API.
+ */
+export const SPECIALIST = {
+  email: 'especialista@example.com',
+  name: 'Especialista Demo',
+  get password(): string {
+    return readFileSync(join(E2E_DIR, 'specialist-password.txt'), 'utf8').trim();
   },
 };
 
@@ -33,7 +46,7 @@ export default defineConfig({
   expect: { timeout: 10_000 },
   reporter: process.env.CI ? [['list'], ['html', { open: 'never' }]] : 'list',
   use: {
-    baseURL: `http://localhost:${PORT}`,
+    baseURL: BASE_URL,
     locale: 'pt-BR',
     timezoneId: 'America/Sao_Paulo',
     viewport: { width: 1440, height: 900 },
@@ -71,6 +84,13 @@ export default defineConfig({
       SANKHYA_X_TOKEN: 'mock-x-token',
       SANKHYA_DIALECT: 'oracle',
       LOG_LEVEL: 'warn',
+      // Every page shows the DEMO banner: the data is the mock gateway's fictitious dataset.
+      DEMO_MODE: 'true',
+      // The write switches are on so the lifecycle can reach a VERIFIED write on a SANDBOX
+      // connection (mock gateway only). SAFE_MODE keeps its default (true), so PRODUCTION
+      // writes are still refused, and the runtime kill switch can still turn every write off.
+      GLOBAL_WRITE_ENABLED: 'true',
+      WRITE_TO_SANKHYA: 'true',
     },
   },
 });

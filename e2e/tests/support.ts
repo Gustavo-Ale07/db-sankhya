@@ -1,0 +1,300 @@
+// Helpers shared by the lifecycle, four-eyes and scratch/DDL specs. Every file builds its own
+// sessions and fixtures through the API and removes what would change other files (policies,
+// connections, the kill switch); nothing here depends on explorer.spec.ts having run.
+import { existsSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { expect } from '@playwright/test';
+import type {
+  APIRequestContext,
+  APIResponse,
+  Browser,
+  BrowserContext,
+  Page,
+} from '@playwright/test';
+import { BASE_URL, BOOTSTRAP, E2E_DIR, SPECIALIST } from '../playwright.config';
+
+/** Same value explorer.spec.ts and mutation.spec.ts use for the changed bootstrap password. */
+export const CHANGED_PASSWORD = 'E2E-Changed#Pass2026';
+export const SHOTS = process.env.UPDATE_SCREENSHOTS === '1';
+
+/** Fictitious mock connection secrets: the in-process mock gateway accepts exactly these. */
+const MOCK_SECRETS = {
+  clientId: 'mock-client-id',
+  clientSecret: 'mock-client-secret',
+  xToken: 'mock-x-token',
+};
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+type Method = 'GET' | 'POST' | 'PUT' | 'DELETE';
+
+/**
+ * One API call with the Origin header the CSRF check expects. Login, bootstrap and the global
+ * limit are rate limited per address and every spec shares localhost: a 429 waits for the
+ * window the server names and tries again, so a long run never fails on the limiter alone.
+ */
+export async function call(
+  req: APIRequestContext,
+  method: Method,
+  path: string,
+  data?: unknown,
+): Promise<APIResponse> {
+  for (let attempt = 0; ; attempt++) {
+    const res = await req.fetch(path, {
+      method,
+      headers: { origin: BASE_URL },
+      ...(data !== undefined ? { data } : {}),
+    });
+    if (res.status() !== 429 || attempt >= 3) return res;
+    const retry = Number(res.headers()['retry-after'] ?? '10');
+    await sleep((Number.isFinite(retry) ? Math.min(retry, 65) : 10) * 1000 + 500);
+  }
+}
+
+/** Calls and expects the status; returns the parsed body. */
+export async function ok<T = Record<string, unknown>>(
+  req: APIRequestContext,
+  method: Method,
+  path: string,
+  data?: unknown,
+  status = 200,
+): Promise<T> {
+  const res = await call(req, method, path, data);
+  expect(res.status(), `${method} ${path}: ${await res.text()}`).toBe(status);
+  return (await res.json()) as T;
+}
+
+/** The error code and details of a refused call. */
+export async function refusal(res: { json(): Promise<unknown> }) {
+  const body = (await res.json()) as {
+    error?: { code?: string; message?: string; details?: Record<string, unknown> };
+  };
+  return { code: body.error?.code, message: body.error?.message, details: body.error?.details };
+}
+
+interface LoginBody {
+  user: { email: string; name: string; mustChangePassword: boolean };
+}
+
+/**
+ * Logs `email` in on `ctx` (its cookie jar is shared with the context's pages), trying each
+ * password in turn. A user that must change the password gets `newPassword`.
+ */
+export async function apiLogin(
+  ctx: BrowserContext,
+  email: string,
+  passwords: readonly string[],
+  newPassword: string,
+): Promise<void> {
+  let current: string | undefined;
+  let user: LoginBody['user'] | undefined;
+  for (const password of passwords) {
+    const res = await call(ctx.request, 'POST', '/api/auth/login', { email, password });
+    if (res.ok()) {
+      current = password;
+      user = ((await res.json()) as LoginBody).user;
+      break;
+    }
+  }
+  if (!user || current === undefined) throw new Error(`could not log ${email} in`);
+  if (user.mustChangePassword) {
+    await ok(ctx.request, 'POST', '/api/auth/change-password', {
+      currentPassword: current,
+      newPassword,
+    });
+  }
+}
+
+export async function newContext(browser: Browser, storageState?: string): Promise<BrowserContext> {
+  return browser.newContext({
+    baseURL: BASE_URL,
+    locale: 'pt-BR',
+    ...(storageState ? { storageState } : {}),
+  });
+}
+
+/**
+ * Login is limited to 10 attempts a minute per address, shared with explorer.spec.ts and
+ * mutation.spec.ts, whose UI logins do not wait out a 429. So each user logs in once per run:
+ * the session is kept next to the run's data (<tmpdir>/dbx-e2e-<PORT>, wiped at every server
+ * start, never in the repository) and reused while the server still accepts it.
+ */
+async function sessionContext(
+  browser: Browser,
+  email: string,
+  login: (ctx: BrowserContext) => Promise<void>,
+): Promise<BrowserContext> {
+  const file = join(E2E_DIR, 'sessions', `${email}.json`);
+  if (existsSync(file)) {
+    const cached = await newContext(browser, file);
+    const me = await call(cached.request, 'GET', '/api/auth/me');
+    if (me.ok()) {
+      const body = (await me.json()) as { user?: { mustChangePassword?: boolean } };
+      if (body.user && !body.user.mustChangePassword) return cached;
+    }
+    await cached.close();
+  }
+  const ctx = await newContext(browser);
+  await login(ctx);
+  mkdirSync(join(E2E_DIR, 'sessions'), { recursive: true });
+  await ctx.storageState({ path: file });
+  return ctx;
+}
+
+/** The bootstrap administrator: changed password first (a full run), one-time one otherwise. */
+export function adminContext(browser: Browser): Promise<BrowserContext> {
+  return sessionContext(browser, BOOTSTRAP.email, (ctx) =>
+    apiLogin(ctx, BOOTSTRAP.email, [CHANGED_PASSWORD, BOOTSTRAP.password], CHANGED_PASSWORD),
+  );
+}
+
+/** Changed password of the specialist (seeded by start-server.mjs). */
+export const SPECIALIST_PASSWORD = 'Especialista#Demo2026';
+
+export function specialistContext(browser: Browser): Promise<BrowserContext> {
+  return sessionContext(browser, SPECIALIST.email, (ctx) =>
+    apiLogin(
+      ctx,
+      SPECIALIST.email,
+      [SPECIALIST.password, SPECIALIST_PASSWORD],
+      SPECIALIST_PASSWORD,
+    ),
+  );
+}
+
+/** A user created by the admin, logged in on a fresh context (the first password is replaced). */
+export function userContext(
+  browser: Browser,
+  email: string,
+  initial: string,
+  changed: string,
+): Promise<BrowserContext> {
+  return sessionContext(browser, email, (ctx) => apiLogin(ctx, email, [initial], changed));
+}
+
+/** Records the fixtures a file creates and removes them in reverse order. */
+export class Fixtures {
+  private readonly undo: { label: string; run: () => Promise<APIResponse> }[] = [];
+
+  constructor(private readonly admin: APIRequestContext) {}
+
+  async policy(body: Record<string, unknown>): Promise<string> {
+    const { item } = await ok<{ item: { id: string } }>(
+      this.admin,
+      'POST',
+      '/api/admin/policies',
+      {
+        subjectType: 'everyone',
+        subjectId: null,
+        environments: [],
+        connectionIds: [],
+        columns: [],
+        limits: {},
+        overrideWhereRequired: false,
+        enabled: true,
+        effect: 'ALLOW',
+        ...body,
+      },
+      201,
+    );
+    this.undo.push({
+      label: `policy ${item.id}`,
+      run: () => call(this.admin, 'DELETE', `/api/admin/policies/${item.id}`),
+    });
+    return item.id;
+  }
+
+  /** A mock connection (fictitious secrets) in the given environment. */
+  async connection(name: string, environment: 'SANDBOX' | 'PRODUCTION'): Promise<string> {
+    const { item } = await ok<{ item: { id: string } }>(
+      this.admin,
+      'POST',
+      '/api/admin/connections',
+      {
+        name,
+        environment,
+        mode: 'mock',
+        baseUrl: 'mock://local',
+        dialect: 'oracle',
+        secrets: MOCK_SECRETS,
+      },
+      201,
+    );
+    this.undo.push({
+      label: `connection ${item.id}`,
+      run: () => call(this.admin, 'DELETE', `/api/admin/connections/${item.id}`),
+    });
+    return item.id;
+  }
+
+  async role(key: string, permissions: string[]): Promise<void> {
+    await ok(this.admin, 'POST', '/api/admin/roles', { key, name: `E2E ${key}`, permissions }, 201);
+  }
+
+  /** Users are not deleted: the e2e database is discarded with the run. */
+  async user(email: string, name: string, password: string, roles: string[]): Promise<void> {
+    await ok(this.admin, 'POST', '/api/admin/users', { email, name, password, roles }, 201);
+  }
+
+  /** A failed removal is reported, never thrown: it must not hide the test's own result. */
+  async cleanup(): Promise<void> {
+    for (const step of this.undo.reverse()) {
+      try {
+        const res = await step.run();
+        if (!res.ok()) console.warn(`E2E ${step.label} not removed: HTTP ${res.status()}`);
+      } catch (err) {
+        console.warn(`E2E ${step.label} not removed:`, err);
+      }
+    }
+    this.undo.length = 0;
+  }
+}
+
+/** Rows of a read through the API (arrays in column order). */
+export async function select(
+  req: APIRequestContext,
+  sql: string,
+  connectionId?: string,
+): Promise<unknown[][]> {
+  const body = await ok<{ rows: unknown[][] }>(req, 'POST', '/api/query', {
+    sql,
+    ...(connectionId ? { connectionId } : {}),
+  });
+  return body.rows;
+}
+
+export async function setSql(page: Page, sql: string) {
+  const editor = page.getByTestId('sql-editor').locator('.monaco-editor').first();
+  await editor.click();
+  await page.keyboard.press('ControlOrMeta+A');
+  await page.keyboard.press('Delete');
+  await page.keyboard.insertText(sql);
+}
+
+export function nav(page: Page, label: string) {
+  return page.getByRole('navigation', { name: 'Navegação principal' }).getByRole('button', {
+    name: label,
+    exact: true,
+  });
+}
+
+/** Opens the app on an already logged-in context and waits for the shell. */
+export async function openApp(ctx: BrowserContext, name: string): Promise<Page> {
+  const page = await ctx.newPage();
+  await page.goto('/');
+  await expect(page.getByTestId('current-user')).toContainText(name);
+  return page;
+}
+
+/**
+ * `UPDATE_SCREENSHOTS=1` refreshes docs/screenshots/<name>.png. Only DEMO pages are captured:
+ * the banner must be on screen, and every value comes from the mock's fictitious dataset.
+ */
+export async function shot(page: Page, name: string) {
+  if (!SHOTS) return;
+  await expect(page.getByTestId('demo-banner')).toBeVisible();
+  await page.screenshot({
+    path: fileURLToPath(new URL(`../../docs/screenshots/${name}.png`, import.meta.url)),
+  });
+}

@@ -39,8 +39,8 @@ async function setSql(page: Page, sql: string) {
 
 /**
  * Writes are default-deny by policy: without an ALLOW rule the preview itself is FORBIDDEN. The
- * rule only lets the plan be previewed; the write switches (SAFE_MODE, GLOBAL_WRITE_ENABLED)
- * still refuse the execute. It is created once for this file on its own session and removed
+ * rule only lets the plan be previewed; the write switches (SAFE_MODE on a PRODUCTION
+ * connection) still refuse the execute. It is created once for this file on its own session and removed
  * afterwards; a failed removal is reported but never hides the test's own result.
  */
 let admin: BrowserContext | undefined;
@@ -137,7 +137,7 @@ async function previewAndRefuse(page: Page) {
   await dialog.getByTestId('confirmation-input').fill(phrase);
   await expect(execute).toBeEnabled();
 
-  // e2e defaults (SAFE_MODE=true, GLOBAL_WRITE_ENABLED=false): the server refuses the write.
+  // SAFE_MODE stays on in e2e: the server refuses the PRODUCTION write.
   await execute.click();
   const refusal = dialog.getByTestId('mutation-error');
   await expect(refusal).toContainText('READ_ONLY_MODE');
