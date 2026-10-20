@@ -133,9 +133,10 @@ describe('approval routes', () => {
     ).toBe('FORBIDDEN');
     const pending = await call(decider.cookie, { method: 'GET', url: '/api/approvals/pending' });
     expect(pending.statusCode).toBe(200);
-    expect((pending.json() as { items: { id: string }[] }).items.map((a) => a.id)).toEqual([
-      approval.id,
-    ]);
+    const pendingItems = (pending.json() as { items: { id: string; requestedByName: string }[] })
+      .items;
+    expect(pendingItems.map((a) => a.id)).toEqual([approval.id]);
+    expect(pendingItems[0]!.requestedByName).toBe('ana@example.com');
 
     const self = await call(requester.cookie, {
       method: 'POST',

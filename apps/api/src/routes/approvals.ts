@@ -27,7 +27,11 @@ const toApproval = (a: ApprovalRow) => ({
   expiresAt: a.expiresAt.toISOString(),
 });
 
-const toPending = (a: PendingApproval) => ({ ...toApproval(a), plan: a.plan });
+const toPending = (a: PendingApproval) => ({
+  ...toApproval(a),
+  requestedByName: a.requestedByName,
+  plan: a.plan,
+});
 
 /** Four-eyes approvals of plans that require one (Task 14.1). */
 export async function approvalRoutes(app: FastifyInstance): Promise<void> {

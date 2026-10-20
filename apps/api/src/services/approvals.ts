@@ -38,6 +38,8 @@ export interface ApprovalAuditContext {
  * policy that does not deny the read); otherwise only the summary is returned.
  */
 export interface PendingApproval extends ApprovalRow {
+  /** Display name of the requester (null when the account no longer exists). */
+  requestedByName: string | null;
   plan: {
     environment: string;
     connectionId: string;
@@ -362,9 +364,10 @@ export class ApprovalsService {
     if (!subject?.active || !subject.permissions.has('APPROVAL.DECIDE')) return [];
     const snapshot = await this.freshPolicies();
     const rows = await this.db
-      .select({ approval: approvals, plan: plans })
+      .select({ approval: approvals, plan: plans, requesterName: users.name })
       .from(approvals)
       .innerJoin(plans, eq(plans.id, approvals.planId))
+      .leftJoin(users, eq(users.id, approvals.requestedBy))
       .where(
         and(
           isNull(approvals.decision),
@@ -378,7 +381,7 @@ export class ApprovalsService {
       .orderBy(asc(approvals.createdAt), asc(approvals.id));
     // Filter first, then limit: approvals the user cannot decide never take a slot.
     const out: PendingApproval[] = [];
-    for (const { approval, plan } of rows) {
+    for (const { approval, plan, requesterName } of rows) {
       if (out.length >= PENDING_LIMIT) break;
       if (approval.planHash !== plan.planHash) continue;
       let scope: PlanScope;
@@ -390,6 +393,7 @@ export class ApprovalsService {
       const readable = this.mayRead(subject, plan, scope, snapshot);
       out.push({
         ...approval,
+        requestedByName: requesterName ?? null,
         plan: {
           environment: plan.environment,
           connectionId: plan.connectionId,
