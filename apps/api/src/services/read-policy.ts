@@ -159,29 +159,56 @@ export const POLICY_FILTER_FAILED = 'POLICY:failed';
 /** Longest run of filtering, in milliseconds, before yielding to the event loop. */
 const SLICE_MS = 10;
 
-/** Filtered catalogs remembered per policy service (most recently used last). */
-const MEMO_SIZE = 64;
+/** Filtered results remembered per catalog (most recently used last). */
+const MEMO_RESULTS = 64;
+/** Connections whose catalog has results remembered, per policy service. */
+const MEMO_CONNECTIONS = 32;
 
 const yieldToLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
 
-interface Memo {
-  source: Catalog;
-  result: Catalog;
+/** The filtered results of one catalog object, by caller and policy version. */
+interface CatalogMemo {
+  catalog: Catalog;
+  results: Map<string, Catalog>;
 }
 
 /**
- * Bounded LRU of filtered catalogs, one per `PolicyService` (so separate apps never share one).
- * An entry is only reused for the very same catalog object, so a refreshed catalog misses.
+ * Memo of filtered catalogs, one per `PolicyService` (so separate apps never share one): per
+ * connection, only the results of the last catalog object seen for it. A refreshed catalog (a
+ * new object) replaces the slot, so the stale catalog and its results are released with it
+ * rather than pinned until evicted. Both levels are bounded LRUs.
  */
-const memos = new WeakMap<PolicyService, Map<string, Memo>>();
+const memos = new WeakMap<PolicyService, Map<string, CatalogMemo>>();
 
-function memoOf(policies: PolicyService): Map<string, Memo> {
-  let memo = memos.get(policies);
-  if (!memo) {
-    memo = new Map();
-    memos.set(policies, memo);
+/** The results remembered for `catalog` on `connectionId`, made current (and most recent). */
+function memoFor(policies: PolicyService, connectionId: string, catalog: Catalog) {
+  let byConnection = memos.get(policies);
+  if (!byConnection) {
+    byConnection = new Map();
+    memos.set(policies, byConnection);
   }
-  return memo;
+  let slot = byConnection.get(connectionId);
+  if (!slot || slot.catalog !== catalog) slot = { catalog, results: new Map() };
+  byConnection.delete(connectionId);
+  byConnection.set(connectionId, slot);
+  while (byConnection.size > MEMO_CONNECTIONS) {
+    byConnection.delete(byConnection.keys().next().value as string);
+  }
+  return slot.results;
+}
+
+/**
+ * For tests: the catalog objects the memo of `policies` keeps, with how many results each, by
+ * connection. Anything not listed is not reachable from the memo.
+ */
+export function memoizedCatalogs(
+  policies: PolicyService,
+): Array<{ connectionId: string; catalog: Catalog; results: number }> {
+  return [...(memos.get(policies) ?? new Map<string, CatalogMemo>())].map(([id, slot]) => ({
+    connectionId: id,
+    catalog: slot.catalog,
+    results: slot.results.size,
+  }));
 }
 
 /**
@@ -201,7 +228,8 @@ function memoOf(policies: PolicyService): Map<string, Memo> {
  *   few globs against only those patterns. Linear in tables and columns, whatever is denied.
  * - The loop yields to the event loop after every `SLICE_MS` of work.
  * - The result is memoized per user, groups, connection, environment, policy version and catalog
- *   object, so repeated calls cost a lookup; any policy change alters the version and misses.
+ *   object, so repeated calls cost a lookup; any policy change alters the version and misses. Only
+ *   the latest catalog object of each connection is kept, so a refresh releases the stale one.
  *
  * Fails closed: if the rules cannot be compiled, or anything throws, no table is returned and
  * `degraded` gains `POLICY:failed`. `onError` is only told; it cannot turn this into a throw.
@@ -243,21 +271,21 @@ export async function visibleCatalog(
       checker.policyVersion,
       check.auth.user.id,
       [...check.groupIds].sort(),
-      check.connectionId,
       check.environment,
-      catalog.fetchedAt,
     ]);
-    const memo = memoOf(check.policies);
+    const memo = memoFor(check.policies, check.connectionId, catalog);
     const hit = memo.get(key);
-    if (hit && hit.source === catalog) {
+    if (hit) {
       memo.delete(key);
       memo.set(key, hit);
-      return hit.result;
+      return hit;
     }
     const result = await filterCatalog(checker, catalog);
+    // Into this catalog's own map: if a refresh replaced it meanwhile, the map is already
+    // unreachable and the result goes with it, never reinstating the stale catalog.
     memo.delete(key);
-    memo.set(key, { source: catalog, result });
-    while (memo.size > MEMO_SIZE) memo.delete(memo.keys().next().value as string);
+    memo.set(key, result);
+    while (memo.size > MEMO_RESULTS) memo.delete(memo.keys().next().value as string);
     return result;
   } catch (err) {
     return failed(err);

@@ -1426,6 +1426,8 @@ describe('compileDenyChecker', () => {
               { ...context, entities: [table], columns, hasWhere: false },
               rules,
               perms,
+              // A fixed version: hashing the rules on every call would only slow the reference.
+              { policyVersion: 'v' },
             ).effect === 'DENY';
           expect(checker ? checker.denied([table], columns) : true).toBe(expected);
           compared++;

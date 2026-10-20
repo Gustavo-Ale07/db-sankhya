@@ -5,7 +5,7 @@ import type { DenyChecker, Environment, Permission, PolicyRule } from '@dbx/shar
 import type { AuthState } from '../context';
 import type { Catalog, CatalogTable } from './metadata';
 import type { PolicyService } from './policy';
-import { POLICY_FILTER_FAILED, readTargets, visibleCatalog } from './read-policy';
+import { POLICY_FILTER_FAILED, memoizedCatalogs, readTargets, visibleCatalog } from './read-policy';
 
 const table = (name: string, columns: string[]) => ({
   name,
@@ -454,6 +454,97 @@ describe('visibleCatalog', () => {
       await call({ groupIds: ['g2', 'g1'] });
       await call({ groupIds: ['g1', 'g2'] });
       expect(stats.tables).toBe(at + withFks.tables.length);
+    });
+
+    it('releases a refreshed catalog and its results, keeping only the latest per connection', async () => {
+      const { policies, stats } = fake([DENY_EMAIL], 'v1');
+      const call = (catalog: Catalog, userId = 'u1', connectionId = 'c1') =>
+        visibleCatalog(
+          {
+            policies,
+            auth: { ...auth, user: { id: userId } } as AuthState,
+            ...CONTEXT,
+            connectionId,
+          },
+          catalog,
+        );
+      await call(withFks);
+      await call(withFks, 'u2');
+      expect(memoizedCatalogs(policies)).toEqual([
+        { connectionId: 'c1', catalog: withFks, results: 2 },
+      ]);
+
+      // A refresh hands over a new object (same fetchedAt or not): it never hits the old entry,
+      // and the old catalog with its results is no longer reachable from the memo.
+      const sameTime = { ...withFks };
+      const before = stats.tables;
+      await call(sameTime);
+      expect(stats.tables).toBe(before + withFks.tables.length);
+      const refreshed = { ...withFks, fetchedAt: '2026-01-01T01:00:00.000Z' };
+      await call(refreshed);
+      expect(stats.tables).toBe(before + 2 * withFks.tables.length);
+      const held = memoizedCatalogs(policies);
+      expect(held).toEqual([{ connectionId: 'c1', catalog: refreshed, results: 1 }]);
+      expect(held.some((m) => m.catalog === withFks || m.catalog === sameTime)).toBe(false);
+
+      // Other connections keep their own latest catalog.
+      await call(withFks, 'u1', 'c2');
+      expect(memoizedCatalogs(policies).map((m) => [m.connectionId, m.catalog])).toEqual([
+        ['c1', refreshed],
+        ['c2', withFks],
+      ]);
+    });
+
+    it('does not reinstate a catalog refreshed while it was being filtered', async () => {
+      const { policies, stats } = fake([DENY_EMAIL], 'v1');
+      const call = (catalog: Catalog) => visibleCatalog({ policies, auth, ...CONTEXT }, catalog);
+      const refreshed = { ...withFks, fetchedAt: '2026-01-01T01:00:00.000Z' };
+      // The first table decision takes longer than a slice, so the stale filter yields mid-way
+      // and the refreshed call completes in between.
+      const slow = policies.denyChecker.bind(policies);
+      policies.denyChecker = async (...args: Parameters<PolicyService['denyChecker']>) => {
+        const checker = await slow(...args);
+        return (
+          checker && {
+            ...checker,
+            forTable: (t: string) => {
+              if (stats.tables === 0)
+                for (const end = performance.now() + 15; performance.now() < end;);
+              return checker.forTable(t);
+            },
+          }
+        );
+      };
+      let refreshedDone = false;
+      const stale = call(withFks);
+      const fresh = call(refreshed).then(() => (refreshedDone = true));
+      await stale;
+      await fresh;
+      expect(refreshedDone).toBe(true);
+      expect(memoizedCatalogs(policies)).toEqual([
+        { connectionId: 'c1', catalog: refreshed, results: 1 },
+      ]);
+    });
+
+    it('bounds the results per catalog and the connections, dropping the least recently used', async () => {
+      const { policies } = fake([DENY_EMAIL], 'v1');
+      const call = (userId: string, connectionId = 'c1') =>
+        visibleCatalog(
+          {
+            policies,
+            auth: { ...auth, user: { id: userId } } as AuthState,
+            ...CONTEXT,
+            connectionId,
+          },
+          withFks,
+        );
+      for (let i = 0; i < 70; i++) await call(`u${i}`);
+      expect(memoizedCatalogs(policies)[0]?.results).toBe(64);
+      for (let i = 0; i < 40; i++) await call('u1', `k${i}`);
+      const held = memoizedCatalogs(policies).map((m) => m.connectionId);
+      expect(held).toHaveLength(32);
+      expect(held).not.toContain('c1');
+      expect(held).toEqual(Array.from({ length: 32 }, (_, i) => `k${i + 8}`));
     });
 
     it('never remembers a failure', async () => {

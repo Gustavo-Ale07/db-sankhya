@@ -440,6 +440,28 @@ describe('catalog filtering by read policy', () => {
     expect(tableOf((await catalogOf(h, outsider.cookie)).tables, 'TSICID')).toBeDefined();
   });
 
+  it('follows a group membership change at once, despite the memoized catalog', async () => {
+    const h = await setup();
+    const first = await h.viewer();
+    const second = await h.viewer();
+    const adminId = (await h.app.services.users.findByEmail(ADMIN.email))!.id;
+    const group = await h.app.services.authz.createGroup({ name: 'No cities' });
+    await h.app.services.authz.setGroupMembers(group.id, [first.id], adminId);
+    await h.policy({ subjectType: 'group', subjectId: group.id, entities: ['TSICID'] });
+    const sees = async (cookie: string) =>
+      tableOf((await catalogOf(h, cookie)).tables, 'TSICID') !== undefined;
+
+    // Twice each, so the second answer comes from the memo.
+    expect(await sees(first.cookie)).toBe(false);
+    expect(await sees(first.cookie)).toBe(false);
+    expect(await sees(second.cookie)).toBe(true);
+    expect(await sees(second.cookie)).toBe(true);
+
+    await h.app.services.authz.setGroupMembers(group.id, [second.id], adminId);
+    expect(await sees(first.cookie)).toBe(true);
+    expect(await sees(second.cookie)).toBe(false);
+  });
+
   it('applies an environment-scoped DENY in that environment only', async () => {
     const h = await setup({ SANKHYA_ENVIRONMENT: 'HOMOLOGATION' });
     const sandbox = await h.app.services.connections.create({
