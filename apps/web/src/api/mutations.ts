@@ -80,6 +80,12 @@ export interface ExecutionStep {
   outcome: StepOutcome;
   errorCode?: string;
   verified?: boolean;
+  /** The row before the change, restricted to the written fields; null for an INSERT. */
+  before?: Record<string, unknown> | null;
+  /** What the plan meant to write. */
+  expected?: Record<string, unknown>;
+  /** The written fields as the server read them back; absent when they could not be read. */
+  observed?: Record<string, unknown>;
 }
 
 /** Answer of POST /api/query/execute. */
