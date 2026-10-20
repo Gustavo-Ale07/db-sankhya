@@ -197,6 +197,14 @@ describe('ApprovalsService.request', () => {
     expect(await auditRows('approval.request')).toHaveLength(1);
   });
 
+  it('refuses an owner without the plan permission (a DATA.PREVIEW-only preview)', async () => {
+    const previewer = await addUser('gil@example.com', 'ADMIN');
+    const plan = await plansService.create(newPlan({ userId: previewer }));
+    await expectCode(service.request(plan.id, previewer), 'FORBIDDEN');
+    expect(await database.db.select().from(approvals)).toHaveLength(0);
+    expect(await auditRows('approval.request')).toHaveLength(0);
+  });
+
   it('keeps PLAN_TTL_SECONDS for plans that do not require approval', async () => {
     const plan = await plansService.create(newPlan({ decision: decision(false) }));
     expect(plan.expiresAt.getTime()).toBeLessThanOrEqual(Date.now() + TTL * 1000);
@@ -486,7 +494,12 @@ describe('ApprovalsService: business action plans', () => {
   it('scopes the plan to the action permission and entity', async () => {
     await addRole('ACTION_APPROVER', ['APPROVAL.DECIDE', 'SANKHYA.BUSINESS_ACTION.EXECUTE']);
     const approver = await addUser('iris@example.com', 'ACTION_APPROVER');
+    // Only an owner holding the action permission may ask for approval of an action plan.
     const plan = await actionPlan(STATEMENT);
+    await expectCode(service.request(plan.id, requester), 'FORBIDDEN');
+    await addRole('ACTION_REQUESTER', ['SANKHYA.BUSINESS_ACTION.EXECUTE']);
+    const [extra] = await database.db.select().from(roles).where(eq(roles.key, 'ACTION_REQUESTER'));
+    await database.db.insert(userRoles).values({ userId: requester, roleId: extra!.id });
     const approval = await service.request(plan.id, requester);
     // OPERATOR holds no SANKHYA.BUSINESS_ACTION.EXECUTE: a DATA.UPDATE decider cannot approve.
     await expectCode(service.decide(approval.id, decider, 'APPROVE', null), 'FORBIDDEN');

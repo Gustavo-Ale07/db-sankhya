@@ -216,9 +216,9 @@ export function gatesHold(fresh: EffectiveLimits, plan: PlanRow): boolean {
 /**
  * Four-eyes approvals bound to the plan hash (Task 14.1).
  *
- * - `request`: the plan owner asks for approval of a live plan that requires one and whose SQL
- *   classifies as a write matching its capability. The approval copies `plan_hash` and the plan's
- *   `expires_at`, so it expires together with the plan.
+ * - `request`: the plan owner, holding every capability action, asks for approval of a live
+ *   plan that requires one and whose SQL classifies as a write matching its capability. The
+ *   approval copies `plan_hash` and the plan's `expires_at`, so it expires together with it.
  * - `decide`: inside one transaction (approval row locked), the decider must not be the
  *   requester, must be active, hold APPROVAL.DECIDE and every capability action in their own
  *   grants, and get a policy ALLOW for each action on each entity from a freshly loaded rule set.
@@ -256,8 +256,14 @@ export class ApprovalsService {
     const { plan } = current;
     if (!plan.requiresApproval)
       throw new AppError('VALIDATION_ERROR', 'This plan does not require approval.');
-    if (!scopeOf(plan))
+    const scope = scopeOf(plan);
+    if (!scope)
       throw new AppError('VALIDATION_ERROR', 'This plan cannot be submitted for approval.');
+    // Only an owner who could run the plan may queue it for a second person: a plan previewed
+    // through DATA.PREVIEW alone is refused at execution, so it never reaches an approver.
+    const grants = await this.deps.authz.grants(userId);
+    if (!scope.actions.every((a) => grants.permissions.has(a)))
+      throw new AppError('FORBIDDEN', 'You do not have permission for this action');
     if (plan.status === 'EXPIRED' || (plan.status === 'PENDING' && current.expired))
       throw expired();
     if (plan.status !== 'PENDING') throw invalid();
