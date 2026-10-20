@@ -15,6 +15,7 @@ vi.mock('../admin/UsersPage', () => ({ UsersPage: () => null }));
 vi.mock('../admin/AuditPage', () => ({ AuditPage: () => null }));
 vi.mock('../admin/ApprovalsPage', () => ({ ApprovalsPage: () => null }));
 vi.mock('../admin/StatusPage', () => ({ StatusPage: () => null }));
+vi.mock('../scratch/ScratchPage', () => ({ ScratchPage: () => null }));
 
 vi.mock('../api/client', () => ({ api: { get: vi.fn() } }));
 

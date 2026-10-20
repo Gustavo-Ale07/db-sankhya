@@ -20,15 +20,25 @@ import { UsersPage } from '../admin/UsersPage';
 import { AuditPage } from '../admin/AuditPage';
 import { ApprovalsPage } from '../admin/ApprovalsPage';
 import { StatusPage } from '../admin/StatusPage';
+import { ScratchPage } from '../scratch/ScratchPage';
 import { Footer } from './Footer';
 
 export type View =
-  'explorer' | 'history' | 'saved' | 'users' | 'approvals' | 'audit' | 'status' | 'password';
+  | 'explorer'
+  | 'history'
+  | 'saved'
+  | 'scratch'
+  | 'users'
+  | 'approvals'
+  | 'audit'
+  | 'status'
+  | 'password';
 
 const NAV: { view: View; label: string; permission?: Permission }[] = [
   { view: 'explorer', label: 'Editor SQL' },
   { view: 'history', label: 'Histórico' },
   { view: 'saved', label: 'Consultas salvas' },
+  { view: 'scratch', label: 'Scratch', permission: 'QUERY.SELECT' },
   { view: 'users', label: 'Usuários', permission: 'ADMIN.USERS' },
   { view: 'approvals', label: 'Aprovações', permission: 'APPROVAL.DECIDE' },
   { view: 'audit', label: 'Auditoria', permission: 'AUDIT.READ' },
@@ -149,6 +159,9 @@ export function Layout({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: 
           <div className="h-full overflow-auto">
             {view === 'history' && <HistoryPage onOpen={openInEditor} />}
             {view === 'saved' && <SavedQueriesPage onOpen={openInEditor} />}
+            {view === 'scratch' && allowed('scratch') && (
+              <ScratchPage connectionId={connection?.id} connectionName={connection?.name} />
+            )}
             {view === 'users' && allowed('users') && <UsersPage />}
             {view === 'approvals' && allowed('approvals') && <ApprovalsPage />}
             {view === 'audit' && allowed('audit') && <AuditPage />}

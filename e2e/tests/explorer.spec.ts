@@ -122,6 +122,34 @@ test('refuses a mutation: writes are not available yet', async () => {
   await expect(alert).toContainText('Mutations are not available yet.');
 });
 
+test('materializes a Sankhya read into a scratch table and queries it', async () => {
+  await nav('Scratch').click();
+  await page.getByTestId('materialize-source').fill('SELECT CODPROD, DESCRPROD FROM TGFPRO');
+  await page.getByTestId('materialize-into').fill('tmp_e2e_produtos');
+  await page.getByTestId('materialize-run').click();
+  await expect(page.getByTestId('materialize-result')).toContainText('tmp_e2e_produtos');
+  await expect(page.getByTestId('materialize-result')).toContainText(/\d+ linhas?/);
+  await expect(page.getByTestId('scratch-tables')).toContainText('tmp_e2e_produtos');
+
+  // The same name again is refused unless replace is set; the refusal is shown, not hidden.
+  await page.getByTestId('materialize-run').click();
+  await expect(page.getByRole('region', { name: 'Materializar' }).getByRole('alert')).toContainText(
+    'CONFLICT',
+  );
+  await page.getByTestId('materialize-replace').check();
+  await page.getByTestId('materialize-run').click();
+  await expect(page.getByTestId('materialize-result')).toContainText('tmp_e2e_produtos');
+
+  await page.getByTestId('scratch-sql').fill('SELECT count(*) AS n FROM tmp_e2e_produtos');
+  await page.getByTestId('scratch-run').click();
+  await expect(page.getByTestId('scratch-result')).toContainText('SELECT');
+
+  // A non-scratch name is blocked in the form before any request.
+  await page.getByTestId('materialize-into').fill('produtos');
+  await expect(page.getByTestId('materialize-run')).toBeDisabled();
+  await nav('Editor SQL').click();
+});
+
 test('audit log lists the failed login and the denied write', async () => {
   await nav('Auditoria').click();
   const table = page.getByTestId('audit-table');
