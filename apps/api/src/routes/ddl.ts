@@ -120,6 +120,23 @@ function existingTable(catalog: Catalog, name: string): CatalogTable | undefined
   return found;
 }
 
+/**
+ * The dictionary cannot verify the size, nullability, default or fine-grained type of an existing
+ * column, so for every column the desired table keeps, those are unknown and the change is
+ * treated as destructive (typed confirmation required), never assumed unchanged.
+ */
+function unverifiable(current: TableModel, desired: TableModel): DdlChange[] {
+  const kept = new Set(current.fields.map((f) => f.name));
+  return desired.fields
+    .filter((f) => kept.has(f.name))
+    .map((f) => ({
+      kind: 'CHANGE_TYPE' as const,
+      field: f.name,
+      severity: 'DESTRUCTIVE' as const,
+      note: `Cannot verify the current type, size, nullability or default of ${f.name}; the data dictionary does not expose them.`,
+    }));
+}
+
 export async function ddlRoutes(app: FastifyInstance): Promise<void> {
   const { audit, connections, metadata, policies, authz, config } = app.services;
 
@@ -128,7 +145,7 @@ export async function ddlRoutes(app: FastifyInstance): Promise<void> {
     auth: AuthState,
     d: {
       resource: string | null;
-      statement: string;
+      statement: string | null;
       err: AppError;
       details?: Record<string, unknown>;
     },
@@ -160,12 +177,14 @@ export async function ddlRoutes(app: FastifyInstance): Promise<void> {
     async (request, reply) => {
       noStore(reply);
       const auth = requireAuth(request);
-      const input = parseBody(body, request.body);
       let resource: string | null = null;
+      // The permission is checked before the body is parsed, so the statement may be unknown.
+      const rawSql = (request.body as { sql?: unknown } | null | undefined)?.sql;
+      const statement = typeof rawSql === 'string' ? rawSql.slice(0, MAX_SQL_LENGTH) : null;
       const denied = async (err: AppError, details?: Record<string, unknown>) => {
         await recordDenial(request, auth, {
           resource,
-          statement: input.sql,
+          statement,
           err,
           ...(details ? { details } : {}),
         });
@@ -180,6 +199,7 @@ export async function ddlRoutes(app: FastifyInstance): Promise<void> {
         );
       }
 
+      const input = parseBody(body, request.body);
       const prefixes = config.customTablePrefixes;
       try {
         // Unparseable, multi-statement, non-CREATE and native-table input all fail here.
@@ -224,7 +244,10 @@ export async function ddlRoutes(app: FastifyInstance): Promise<void> {
         const current = table
           ? validateTableModel(currentModel(table, desired), { customPrefixes: prefixes })
           : null;
-        const { changes, severity } = diffTable(current, desired);
+        const diff = diffTable(current, desired);
+        const changes = [...diff.changes, ...(current ? unverifiable(current, desired) : [])];
+        const severity: DdlSeverity =
+          changes.length > diff.changes.length ? 'DESTRUCTIVE' : diff.severity;
 
         if (severity === 'DESTRUCTIVE') {
           const expected = `DESTRUCTIVE ${desired.name}`;
@@ -297,7 +320,7 @@ export async function ddlRoutes(app: FastifyInstance): Promise<void> {
           artifacts: Artifact[];
         };
       } catch (err) {
-        if (isAppError(err) && err.code !== 'CONFIRMATION_REQUIRED') {
+        if (isAppError(err) && true) {
           const { reasons, matchedRuleIds, policyVersion } = (err.details ?? {}) as Record<
             string,
             unknown

@@ -326,15 +326,38 @@ describe('POST /api/ddl/artifact', () => {
     expect(ok.json().warnings.length).toBeGreaterThan(0);
   });
 
-  it('does not ask for confirmation on a non-destructive change', async () => {
+  it('treats unverifiable properties of an existing field as destructive', async () => {
     const h = await setup();
     const cookie = await h.generator();
     existing(h);
-    const sql =
-      'CREATE TABLE AD_EXEMPLO (ID INT PRIMARY KEY, NOME VARCHAR(40), OBS VARCHAR(10), EXTRA VARCHAR(5))';
+    const same =
+      'CREATE TABLE AD_EXEMPLO (ID INT PRIMARY KEY, NOME VARCHAR(5), OBS VARCHAR(10), EXTRA VARCHAR(5))';
+    const res = await h.ddl(cookie, { sql: same });
+    expect(res.statusCode, res.body).toBe(428);
+    expect(res.body).toContain('Cannot verify');
+    expect((await auditOf(h, 'ddl.denied')).items[0]).toMatchObject({
+      errorCode: 'CONFIRMATION_REQUIRED',
+    });
+    const ok = await h.ddl(cookie, { sql: same, confirm: 'DESTRUCTIVE AD_EXEMPLO' });
+    expect(ok.statusCode, ok.body).toBe(200);
+    expect(ok.json().severity).toBe('DESTRUCTIVE');
+  });
+
+  it('requires confirmation when an existing text field becomes a CLOB', async () => {
+    const h = await setup();
+    const cookie = await h.generator();
+    existing(h);
+    const sql = 'CREATE TABLE AD_EXEMPLO (ID INT PRIMARY KEY, NOME TEXT, OBS VARCHAR(10))';
     const res = await h.ddl(cookie, { sql });
-    expect(res.statusCode, res.body).toBe(200);
-    expect(res.json().severity).toBe('SAFE');
+    expect(res.statusCode, res.body).toBe(428);
+  });
+
+  it('checks the permission before parsing the body', async () => {
+    const h = await setup();
+    const { cookie } = await h.userWith(['QUERY.SELECT']);
+    const res = await h.ddl(cookie, { nope: 1 });
+    expect(res.statusCode).toBe(403);
+    expect((await auditOf(h, 'ddl.denied')).total).toBe(1);
   });
 
   it('refuses to diff against a degraded catalog', async () => {
