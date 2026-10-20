@@ -154,15 +154,20 @@ export function ResultsPanel({ run, tab, onTab, reopen }: Props) {
 
   return (
     <section className="flex h-full min-h-0 flex-col bg-panel" aria-label="Resultados">
-      <div className="flex items-center gap-0.5 border-b border-line bg-panel2 px-1" role="tablist">
+      <div
+        className="flex items-end gap-px border-b border-line bg-panel2 px-1 pt-0.5"
+        role="tablist"
+      >
         {TABS.map((t) => (
           <button
             key={t.id}
             type="button"
             role="tab"
             aria-selected={tab === t.id}
-            className={`px-3 py-1.5 text-xs ${
-              tab === t.id ? 'border-b-2 border-accent font-semibold' : 'text-muted hover:text-fg'
+            className={`rounded-t-sm border border-b-0 px-2.5 py-0.5 text-xs ${
+              tab === t.id
+                ? 'border-line bg-panel font-semibold text-fg shadow-[inset_0_2px_0_var(--dbx-accent)]'
+                : 'border-transparent text-muted hover:bg-hover hover:text-fg'
             }`}
             onClick={() => onTab(t.id)}
           >
@@ -170,21 +175,21 @@ export function ResultsPanel({ run, tab, onTab, reopen }: Props) {
             {t.id === 'messages' && messages.length > 0 ? ` (${messages.length})` : ''}
           </button>
         ))}
-        <div className="ml-auto flex items-center gap-1 pr-1">
+        <div className="ml-auto flex items-center gap-0.5 self-center pr-1">
           {result && result.columns.length > 0 && (
             <>
               <button
                 type="button"
-                className="btn"
+                className="tbtn py-0 text-[11px]"
                 onClick={() => void navigator.clipboard.writeText(toTsv(columnNames, result.rows))}
                 title="Copiar tudo (TSV, cola em planilhas)"
               >
                 Copiar
               </button>
-              <button type="button" className="btn" onClick={exportCsv}>
+              <button type="button" className="tbtn py-0 text-[11px]" onClick={exportCsv}>
                 CSV
               </button>
-              <button type="button" className="btn" onClick={exportJson}>
+              <button type="button" className="tbtn py-0 text-[11px]" onClick={exportJson}>
                 JSON
               </button>
             </>
@@ -196,24 +201,24 @@ export function ResultsPanel({ run, tab, onTab, reopen }: Props) {
         {tab === 'results' && (
           <>
             {run.status === 'idle' && (
-              <div className="p-3 text-xs text-muted">
+              <div className="p-2 text-xs text-muted">
                 Execute uma consulta com Ctrl+Enter ou F5. Experimente:{' '}
                 <code>SELECT CODPARC, NOMEPARC FROM TGFPAR</code>
               </div>
             )}
             {run.status === 'running' && (
-              <div className="p-3 text-xs text-muted" role="status">
+              <div className="p-2 text-xs text-muted" role="status">
                 Executando… <Elapsed since={run.startedAt} />
               </div>
             )}
-            {run.status === 'error' && <ErrorBox error={run.error} className="m-3" />}
+            {run.status === 'error' && <ErrorBox error={run.error} className="m-2" />}
             {run.status === 'previewing' && (
-              <div className="p-3 text-xs text-muted" role="status">
+              <div className="p-2 text-xs text-muted" role="status">
                 Instrução de alteração: preparando a prévia. Nada foi executado.
               </div>
             )}
             {run.status === 'mutation' && (
-              <div className="p-3 text-xs" role="status" data-testid="mutation-status">
+              <div className="p-2 text-xs" role="status" data-testid="mutation-status">
                 <MutationStatus
                   {...(run.outcome ? { outcome: run.outcome } : {})}
                   {...(reopen ? { reopen } : {})}
@@ -233,7 +238,7 @@ export function ResultsPanel({ run, tab, onTab, reopen }: Props) {
           <JsonView value={records} emptyText="Sem resultado." testId="result-json" />
         )}
         {tab === 'messages' && (
-          <div className="space-y-1 p-3 text-xs" data-testid="messages">
+          <div className="space-y-1 p-2 text-xs" data-testid="messages">
             {messages.length === 0 && run.status !== 'error' && (
               <p className="text-muted">Nenhuma mensagem.</p>
             )}
@@ -246,7 +251,7 @@ export function ResultsPanel({ run, tab, onTab, reopen }: Props) {
       </div>
 
       <div
-        className="flex flex-wrap items-center gap-x-4 border-t border-line bg-panel2 px-2 py-0.5 text-[11px] text-muted"
+        className="flex min-h-5 flex-wrap items-center gap-x-4 border-t border-line bg-panel2 px-2 text-[11px] text-muted"
         data-testid="result-status"
       >
         {result && (
