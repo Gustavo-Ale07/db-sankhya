@@ -440,6 +440,8 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
       auth,
       sql: body.sql,
       connectionId: body.connectionId ?? defaultConnection(),
+      // The only caller that lets DATA.PREVIEW stand in for the statement permission.
+      allowPreviewOnly: true,
       meta: { ip: clientIp(request), requestId: request.id },
     });
     // Whether execute would pass the write switches right now (it checks them again itself).

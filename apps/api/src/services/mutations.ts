@@ -107,6 +107,12 @@ export interface PrepareContext {
   auth: AuthState;
   connectionId: string;
   sql: string;
+  /**
+   * Accept DATA.PREVIEW in place of the statement permission (Sankhya writes only). Set only by
+   * POST /api/query/preview; every other caller (rollback plans included) keeps needing the
+   * statement permission. Default false.
+   */
+  allowPreviewOnly?: boolean;
   /** Request metadata for the audit trail. */
   meta?: { ip?: string | null; requestId?: string | null };
 }
@@ -262,9 +268,15 @@ export class MutationService {
         });
       }
 
-      const r = await this.resolveSankhya(auth, ctx.connectionId, write, 'prepare', (e) => {
-        environment = e;
-      });
+      const r = await this.resolveSankhya(
+        auth,
+        ctx.connectionId,
+        write,
+        ctx.allowPreviewOnly === true ? 'preview' : 'prepare',
+        (e) => {
+          environment = e;
+        },
+      );
       return await this.finishPlan(ctx, {
         operation: write.kind,
         kind: write.kind,
@@ -294,26 +306,27 @@ export class MutationService {
    * phrase and four-eyes approval; anything else is WHERE_REQUIRED. That check runs before the
    * catalog is read, so a refused statement makes no gateway call.
    *
-   * RBAC: `execute` needs the statement's own permission. `prepare` also accepts DATA.PREVIEW,
-   * which only shows the plan: the policy is still evaluated on the statement's write action
-   * (an explicit ALLOW is needed, exactly as for a writer), and `execute` refuses the plan.
+   * RBAC: `prepare` and `execute` need the statement's own permission. `preview` (a `prepare`
+   * opted into with `allowPreviewOnly`, by POST /api/query/preview only) also accepts
+   * DATA.PREVIEW, which only shows the plan: the policy is still evaluated on the statement's
+   * write action (an explicit ALLOW is needed, exactly as for a writer), and `execute` refuses it.
    */
   private async resolveSankhya(
     auth: AuthState,
     connectionId: string,
     write: WriteClassified,
-    mode: 'prepare' | 'execute',
+    mode: 'preview' | 'prepare' | 'execute',
     onEnvironment?: (environment: Environment) => void,
   ): Promise<SankhyaResolution> {
     const permission = PERMISSION[write.kind];
     // DELETE without WHERE never gets here (VALIDATE); INSERT has no WHERE at all.
     const noWhere = write.kind === 'UPDATE' && !write.hasWhere;
     const holds = auth.grants.permissions.has(permission);
-    const previewOnly = !holds && mode === 'prepare' && auth.grants.permissions.has('DATA.PREVIEW');
+    const previewOnly = !holds && mode === 'preview' && auth.grants.permissions.has('DATA.PREVIEW');
     if (!holds && !previewOnly) {
       throw refuse(
         'AUTHORIZE',
-        noWhere && mode === 'prepare'
+        noWhere && mode !== 'execute'
           ? whereRequired(write.kind)
           : new AppError('FORBIDDEN', 'You do not have permission for this action', { permission }),
       );
@@ -550,6 +563,8 @@ export class MutationService {
           affected,
           previewKind,
           previewLabels,
+          // Created through DATA.PREVIEW: the owner may look at it but not execute it.
+          ...(prepared.permitted ? {} : { previewOnly: true }),
           // Without snapshots the audit keeps only the count and the keys.
           ...(decision.limits.auditSnapshots
             ? {}

@@ -323,6 +323,36 @@ describe('POST /api/audit/:id/rollback-plan', () => {
     expect(r3.statusCode).toBe(403);
     expect(r3.json().error.code).toBe('FORBIDDEN');
   });
+
+  it('DATA.PREVIEW does not open rollback plans: a seeded ADMIN gets 403 and nothing is planned', async () => {
+    const h = await setup();
+    const writer = await h.userWith(WRITER);
+    await run(h, writer, "UPDATE TGFPAR SET NOMEPARC = 'Prévia não' WHERE CODPARC = 6");
+    const event = await lastExecuted(h, writer);
+
+    const login = await h.call(null, {
+      method: 'POST',
+      url: '/api/auth/login',
+      payload: { email: ADMIN.email, password: ADMIN.password },
+    });
+    expect(login.statusCode, login.body).toBe(200);
+    const admin = login.cookies.find((c) => c.name === loadConfig(ENV).session.cookieName)!.value;
+    const me = (await h.call(admin, { method: 'GET', url: '/api/auth/me' })).json();
+    expect(me.user.permissions).toContain('DATA.PREVIEW');
+    expect(me.user.permissions).toContain('AUDIT.READ');
+    expect(me.user.permissions).not.toContain('DATA.UPDATE');
+
+    const res = await rollbackPlan(h, admin, event.id);
+    expect(res.statusCode, res.body).toBe(403);
+    expect(res.json().error).toMatchObject({
+      code: 'FORBIDDEN',
+      details: { permission: 'DATA.UPDATE' },
+    });
+    expect(res.body).not.toContain('token');
+    expect((await eventsOf(h, writer, 'rollback.planned')).total).toBe(0);
+    // Only the original preview created a plan.
+    expect((await eventsOf(h, writer, 'PLAN_CREATED')).total).toBe(1);
+  });
 });
 
 const BS = String.fromCharCode(92);

@@ -1737,6 +1737,9 @@ describe('DATA.PREVIEW: preview without execution', () => {
       url: '/api/query/execute',
       payload: { planId: plan.planId, token: plan.token, idempotencyKey: randomUUID() },
     });
+  /** A prepare made the way POST /api/query/preview makes it (DATA.PREVIEW accepted). */
+  const previewOnly = (h: Harness, auth: AuthState, sql: string) =>
+    h.service.prepare({ auth, sql, connectionId: ENV_CONNECTION_ID, allowPreviewOnly: true });
   /** Only an explicit ALLOW of `action` on TGFPAR, instead of the bench-wide DATA.* rule. */
   const allowOnPartners = async (h: Harness, action: Permission) => {
     await h.clearPolicies();
@@ -1775,7 +1778,8 @@ describe('DATA.PREVIEW: preview without execution', () => {
     expect(body.permitted).toBeUndefined();
     expect(saves(h.mock)).toEqual([]);
     expect(writeCalls(h.mock)).toEqual([]);
-    expect(await h.audit('PLAN_CREATED')).toHaveLength(1);
+    const [created] = await h.audit('PLAN_CREATED');
+    expect(created!.details).toMatchObject({ previewOnly: true });
 
     const exec = await executeHttp(h, cookie, body);
     expect(exec.statusCode, exec.body).toBe(403);
@@ -1793,7 +1797,7 @@ describe('DATA.PREVIEW: preview without execution', () => {
     const h = await setup(WRITES);
     await allowOnPartners(h, 'DATA.UPDATE');
     const { auth } = await h.userWithRoles(['ADMIN']);
-    const p = await prepare(h, auth, SQL);
+    const p = await previewOnly(h, auth, SQL);
     expect(p.operation).toBe('UPDATE');
     expect(p.permitted).toBe(false);
     await expect(execute(h, auth, p)).rejects.toMatchObject({
@@ -1873,6 +1877,8 @@ describe('DATA.PREVIEW: preview without execution', () => {
       operation: 'UPDATE',
       execution: { available: false, permitted: true },
     });
+    const [created] = await h.audit('PLAN_CREATED');
+    expect(created!.details).not.toHaveProperty('previewOnly');
     const exec = await executeHttp(h, cookie, res.json());
     expect(exec.json().error.code).toBe('READ_ONLY_MODE');
     expect(saves(h.mock)).toEqual([]);
@@ -1936,5 +1942,76 @@ describe('DATA.PREVIEW: preview without execution', () => {
     expect(requested.statusCode, requested.body).toBe(403);
     expect(requested.json().error.code).toBe('FORBIDDEN');
     expect(await h.audit('approval.request')).toHaveLength(0);
+  });
+
+  it('DATA.PREVIEW counts only where the caller opts in: a plain prepare stays FORBIDDEN', async () => {
+    const h = await setup();
+    await allowOnPartners(h, 'DATA.UPDATE');
+    const { auth } = await h.userWithRoles(['ADMIN']);
+    // Rollback plans and any other prepare caller keep needing the statement permission.
+    await expect(prepare(h, auth, SQL)).rejects.toMatchObject({
+      code: 'FORBIDDEN',
+      details: { permission: 'DATA.UPDATE' },
+    });
+    expect(await h.audit('PLAN_CREATED')).toHaveLength(0);
+    expect(writeCalls(h.mock)).toEqual([]);
+  });
+
+  it.each([
+    ['a SET column', "UPDATE TGFPAR SET NOMEPARC = 'X' WHERE CODPARC = 3"],
+    ['a WHERE column', "UPDATE TGFPAR SET ATIVO = 'S' WHERE CODPARC = 3 AND NOMEPARC IS NOT NULL"],
+  ])('a QUERY.SELECT DENY on %s refuses the preview-only caller', async (_, sql) => {
+    const h = await setup();
+    await allowOnPartners(h, 'DATA.UPDATE');
+    const { cookie } = await h.userWithRoles(['ADMIN']);
+    // Without the column rule the same preview is shown.
+    expect((await previewHttp(h, cookie, sql)).statusCode).toBe(200);
+    await h.policy({
+      name: 'names are secret',
+      actions: ['QUERY.SELECT'],
+      columns: ['TGFPAR.NOMEPARC'],
+    });
+    const res = await previewHttp(h, cookie, sql);
+    expect(res.statusCode, res.body).toBe(403);
+    expect(res.json().error.code).toBe('FORBIDDEN');
+    expect(res.body).not.toContain('"preview"');
+    expect(writeCalls(h.mock)).toEqual([]);
+    expect(await h.audit('PLAN_CREATED')).toHaveLength(1);
+  });
+
+  it('UPDATE without WHERE: the override must be an ALLOW on the statement action', async () => {
+    const h = await setup();
+    await h.clearPolicies();
+    const { cookie } = await h.userWithRoles(['ADMIN']);
+    const sql = "UPDATE TSICID SET UF = 'XX'";
+    // An override on another action does not stand in for DATA.UPDATE.
+    await h.policy({
+      name: 'insert override',
+      effect: 'ALLOW',
+      actions: ['DATA.INSERT'],
+      entities: ['TSICID'],
+      overrideWhereRequired: true,
+    });
+    const refused = await previewHttp(h, cookie, sql);
+    expect(refused.statusCode, refused.body).toBe(400);
+    expect(refused.json().error.code).toBe('WHERE_REQUIRED');
+    expect(await h.audit('PLAN_CREATED')).toHaveLength(0);
+
+    await h.policy({
+      name: 'cities bulk update',
+      effect: 'ALLOW',
+      actions: ['DATA.UPDATE'],
+      entities: ['TSICID'],
+      overrideWhereRequired: true,
+    });
+    const res = await previewHttp(h, cookie, sql);
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json()).toMatchObject({
+      operation: 'UPDATE',
+      requires: { approval: true },
+      execution: { permitted: false },
+    });
+    expect(saves(h.mock)).toEqual([]);
+    expect(writeCalls(h.mock)).toEqual([]);
   });
 });
