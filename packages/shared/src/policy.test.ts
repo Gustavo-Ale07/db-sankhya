@@ -5,12 +5,17 @@ import {
   POLICY_ACTION_CLASS,
   POLICY_HARD_MAX_LIMITS,
   canonicalJSON,
+  compileDenyChecker,
   evaluatePolicy,
+  isPlainPolicyName,
   isPolicyWriteAction,
   policyVersion,
   sha256HexUtf8,
   validatePolicyRule,
   type EffectiveLimits,
+  type Environment,
+  type PolicyColumn,
+  type PolicyContext,
   type PolicyRequest,
   type PolicyRule,
 } from './policy';
@@ -1330,5 +1335,114 @@ describe('rowLimitsFromRules', () => {
 
     const failed = evaluatePolicy(req({ action: 'NOPE' as Permission }), [], ALL);
     expect(failed.rowLimitsFromRules).toEqual({ maxReadRows: false, maxWriteRows: false });
+  });
+});
+
+describe('compileDenyChecker', () => {
+  const ctx: PolicyContext = {
+    userId: 'u1',
+    groupIds: ['g1'],
+    action: 'QUERY.SELECT',
+    environment: 'HOMOLOGATION',
+    connectionId: 'c1',
+  };
+  const deny = rule({ id: 'd', effect: 'DENY', actions: ['QUERY.SELECT'], entities: ['TSICID'] });
+
+  it('is null whenever evaluatePolicy would deny every request of the context', () => {
+    const perms = new Set<Permission>(['QUERY.SELECT', 'DATA.UPDATE']);
+    expect(compileDenyChecker({ ...ctx, action: 'DATA.UPDATE' }, [], perms)).toBeNull();
+    expect(compileDenyChecker(ctx, [], new Set<Permission>())).toBeNull();
+    expect(compileDenyChecker(ctx, [rule({ id: 'bad', actions: [] })], perms)).toBeNull();
+    expect(
+      compileDenyChecker({ ...ctx, environment: 'MOON' as Environment }, [], perms),
+    ).toBeNull();
+    expect(compileDenyChecker({ ...ctx, userId: '' }, [], perms)).toBeNull();
+    // A disabled invalid rule is ignored, as in evaluatePolicy.
+    const off = rule({ id: 'off', actions: [], enabled: false });
+    expect(compileDenyChecker(ctx, [off, deny], perms)?.denyRules).toBe(1);
+  });
+
+  it('keeps only the DENY rules whose context matches', () => {
+    const rules = [
+      deny,
+      rule({ id: 'other-user', effect: 'DENY', subjectType: 'user', subjectId: 'u2' }),
+      rule({ id: 'other-env', effect: 'DENY', environments: ['PRODUCTION'] }),
+      rule({ id: 'other-conn', effect: 'DENY', connectionIds: ['c2'] }),
+      rule({ id: 'other-action', effect: 'DENY', actions: ['DATA.*'] }),
+      rule({ id: 'allow', entities: ['TSICID'] }),
+    ];
+    const checker = compileDenyChecker(ctx, rules, ALL)!;
+    expect(checker.denyRules).toBe(1);
+    expect(checker.denied(['TSICID'], [])).toBe(true);
+    expect(checker.denied(['TGFPAR'], [])).toBe(false);
+    expect(checker.denied(['BAD NAME'], [])).toBe(true);
+  });
+
+  it('decides like evaluatePolicy (randomized)', () => {
+    let seed = 0x5eed;
+    const rnd = () => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed / 0x7fffffff;
+    };
+    const pick = <T>(xs: readonly T[]): T => xs[Math.floor(rnd() * xs.length)]!;
+    const some = <T>(xs: readonly T[]): T[] => xs.filter(() => rnd() < 0.3);
+    const ENTITY_PATTERNS = ['TGFPAR', 'TGF*', 'TSICID', 'DBO.TGFPAR', 'X.TGFPAR', '*', 'SYS.*'];
+    const COLUMN_PATTERNS = ['TGFPAR.EMAIL', 'EMAIL', 'CODCID', 'TSICID.*', '*', 'T*.NOME*'];
+    const randomRule = (i: number): PolicyRule =>
+      rule({
+        id: `r${i}`,
+        effect: rnd() < 0.7 ? 'DENY' : 'ALLOW',
+        subjectType: pick(['everyone', 'user', 'group'] as const),
+        subjectId: pick(['u1', 'u2', 'g1', 'g2']),
+        environments: some(['PRODUCTION', 'HOMOLOGATION', 'SANDBOX'] as const),
+        connectionIds: some(['c1', 'c2']),
+        actions: [pick(['QUERY.SELECT', 'QUERY.*', '*', 'DATA.*', 'TEMP.*'])],
+        entities: rnd() < 0.5 ? [] : some(ENTITY_PATTERNS),
+        columns: rnd() < 0.5 ? [] : some(COLUMN_PATTERNS),
+        enabled: rnd() < 0.9,
+        ...(rnd() < 0.05 ? { actions: [] } : {}),
+      });
+    const TABLES = ['TGFPAR', 'TSICID', 'TGFPRO', 'dbo.TGFPAR', 'BAD NAME'];
+    const COLUMNS = ['EMAIL', 'CODCID', 'NOMEPARC', 'NOMECID', 'X"Y'];
+    let compared = 0;
+    let deniedCount = 0;
+    for (let round = 0; round < 300; round++) {
+      const rules = Array.from({ length: 1 + Math.floor(rnd() * 6) }, (_, i) => randomRule(i));
+      const context = {
+        ...ctx,
+        userId: pick(['u1', 'u2']),
+        groupIds: some(['g1', 'g2']),
+        environment: pick(['PRODUCTION', 'HOMOLOGATION', 'SANDBOX'] as const),
+        connectionId: pick(['c1', 'c2']),
+      };
+      const perms = rnd() < 0.05 ? new Set<Permission>() : ALL;
+      const checker = compileDenyChecker(context, rules, perms);
+      for (const table of TABLES) {
+        const sets: PolicyColumn[][] = [[], ...COLUMNS.map((name) => [{ table, name }])];
+        sets.push(COLUMNS.map((name) => ({ table, name })));
+        for (const columns of sets) {
+          const expected =
+            evaluatePolicy(
+              { ...context, entities: [table], columns, hasWhere: false },
+              rules,
+              perms,
+            ).effect === 'DENY';
+          expect(checker ? checker.denied([table], columns) : true).toBe(expected);
+          compared++;
+          if (expected) deniedCount++;
+        }
+      }
+    }
+    expect(compared).toBeGreaterThan(1000);
+    // Both outcomes are well represented.
+    expect(deniedCount).toBeGreaterThan(compared * 0.2);
+    expect(deniedCount).toBeLessThan(compared * 0.9);
+  });
+
+  it('isPlainPolicyName accepts plain identifiers only', () => {
+    expect(isPlainPolicyName('TGFPAR')).toBe(true);
+    expect(isPlainPolicyName('AD_X$1')).toBe(true);
+    for (const bad of ['', 'A B', 'DBO.T', '"T"', 'X"Y', '*'])
+      expect(isPlainPolicyName(bad)).toBe(false);
   });
 });

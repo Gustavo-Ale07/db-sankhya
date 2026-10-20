@@ -396,15 +396,74 @@ describe('catalog filtering by read policy', () => {
     const { cookie } = await h.viewer();
     await catalogOf(h, cookie); // connection authorized and catalog cached
     const policies = h.app.services.policies;
-    const real = policies.evaluate.bind(policies);
-    let calls = 0;
-    policies.evaluate = async (...args) => {
-      // The connection check passes; the per-table evaluation then breaks.
-      if (++calls === 1) return real(...args);
-      throw new Error('boom');
-    };
-    const { tables } = await catalogOf(h, cookie);
+    // The connection check passes; compiling the rules for the filter then breaks.
+    policies.denyChecker = () => Promise.reject(new Error('boom'));
+    const { body, tables } = await catalogOf(h, cookie);
     expect(tables).toEqual([]);
+    expect(body.catalog).toMatchObject({ degraded: ['POLICY:failed'] });
+    expect(h.logs.join('\n')).toContain('Catalog policy filter failed');
+  });
+
+  it('applies a group-scoped DENY to members only', async () => {
+    const h = await setup();
+    const member = await h.viewer();
+    const outsider = await h.viewer();
+    const adminId = (await h.app.services.users.findByEmail(ADMIN.email))!.id;
+    const group = await h.app.services.authz.createGroup({ name: 'No cities' });
+    await h.app.services.authz.setGroupMembers(group.id, [member.id], adminId);
+    await h.policy({ subjectType: 'group', subjectId: group.id, entities: ['TSICID'] });
+
+    expect(tableOf((await catalogOf(h, member.cookie)).tables, 'TSICID')).toBeUndefined();
+    expect(tableOf((await catalogOf(h, outsider.cookie)).tables, 'TSICID')).toBeDefined();
+  });
+
+  it('applies an environment-scoped DENY in that environment only', async () => {
+    const h = await setup({ SANKHYA_ENVIRONMENT: 'HOMOLOGATION' });
+    const sandbox = await h.app.services.connections.create({
+      name: 'Sandbox',
+      environment: 'SANDBOX',
+      mode: 'mock',
+      baseUrl: 'mock://local',
+      dialect: 'oracle',
+      secrets: { ...MOCK_CREDENTIALS },
+    });
+    await h.policy({ environments: ['HOMOLOGATION'], entities: ['TSICID'] });
+    await h.policy({ environments: ['SANDBOX'], entities: ['TGFPRO'] });
+    const { cookie } = await h.viewer();
+
+    const homolog = (await catalogOf(h, cookie)).tables;
+    expect(tableOf(homolog, 'TSICID')).toBeUndefined();
+    expect(tableOf(homolog, 'TGFPRO')).toBeDefined();
+
+    const res = await h.call(cookie, {
+      method: 'GET',
+      url: `/api/schema?connectionId=${sandbox.id}`,
+    });
+    expect(res.statusCode, res.body).toBe(200);
+    const sand = (res.json() as { catalog: { tables: SchemaTable[] } }).catalog.tables;
+    expect(tableOf(sand, 'TGFPRO')).toBeUndefined();
+    expect(tableOf(sand, 'TSICID')).toBeDefined();
+  });
+
+  it('applies a connection-scoped DENY on that connection only', async () => {
+    const h = await setup();
+    const conn = await h.app.services.connections.create({
+      name: 'Demo',
+      environment: 'SANDBOX',
+      mode: 'mock',
+      baseUrl: 'mock://local',
+      dialect: 'oracle',
+      secrets: { ...MOCK_CREDENTIALS },
+    });
+    await h.policy({ connectionIds: [conn.id], entities: ['TSICID'] });
+    const { cookie } = await h.viewer();
+
+    const res = await h.call(cookie, { method: 'GET', url: `/api/schema?connectionId=${conn.id}` });
+    expect(res.statusCode, res.body).toBe(200);
+    const scoped = (res.json() as { catalog: { tables: SchemaTable[] } }).catalog.tables;
+    expect(tableOf(scoped, 'TSICID')).toBeUndefined();
+    expect(tableOf(scoped, 'TGFPAR')).toBeDefined();
+    expect(tableOf((await catalogOf(h, cookie)).tables, 'TSICID')).toBeDefined();
   });
 });
 

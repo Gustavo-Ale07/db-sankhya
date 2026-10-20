@@ -8,6 +8,7 @@ import { Layout } from '../components/Layout';
 import { SessionContext } from './session';
 import { useTheme } from './theme';
 import { clearSavedTabs } from '../explorer/tabs';
+import { resetSessionCache } from './session-cache';
 
 export function App() {
   const qc = useQueryClient();
@@ -37,7 +38,8 @@ export function App() {
       onAuthError((err) => {
         if (err.code === 'PASSWORD_CHANGE_REQUIRED')
           void qc.invalidateQueries({ queryKey: ['me'] });
-        else qc.setQueryData(['me'], null);
+        // Expired or revoked: nothing cached for this user may outlive the session.
+        else resetSessionCache(qc);
       }),
     [qc],
   );
@@ -53,8 +55,7 @@ export function App() {
       // The session is dropped locally either way.
     } finally {
       clearSavedTabs();
-      qc.clear();
-      qc.setQueryData(['me'], null);
+      resetSessionCache(qc);
     }
   }, [qc]);
 

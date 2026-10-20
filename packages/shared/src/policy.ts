@@ -288,6 +288,89 @@ export function evaluatePolicy(
   }
 }
 
+/** The request context of a `DenyChecker`: everything but what is read. */
+export type PolicyContext = Pick<
+  PolicyRequest,
+  'userId' | 'groupIds' | 'action' | 'environment' | 'connectionId'
+>;
+
+/**
+ * The rule set compiled once for one permission-only action in one context, for callers that
+ * evaluate many entity/column requests in a row (the schema catalog filter).
+ */
+export interface DenyChecker {
+  /** How many enabled DENY rules match the context; 0 means only a malformed name is denied. */
+  readonly denyRules: number;
+  /**
+   * Whether `evaluatePolicy` would DENY `{ ...context, entities, columns, hasWhere: false }`.
+   * Never throws (an error counts as denied).
+   */
+  denied(entities: string[], columns: PolicyColumn[]): boolean;
+}
+
+/**
+ * Compiles `policies` once for a permission-only action (see `POLICY_ACTION_CLASS`), where only
+ * DENY rules decide the effect: a request is denied exactly when it is malformed or a DENY rule
+ * that matches the context overlaps it, which is what `evaluatePolicy` decides. Returns null,
+ * meaning deny everything, when `evaluatePolicy` would deny every request of the context: the
+ * action is unknown, a write or not held, the environment or context is malformed, or any enabled
+ * rule is invalid. Never throws.
+ */
+export function compileDenyChecker(
+  context: PolicyContext,
+  policies: PolicyRule[],
+  permissions: Set<Permission>,
+): DenyChecker | null {
+  try {
+    const action = readOwn(context, 'action');
+    const environment = readOwn(context, 'environment');
+    if (typeof action !== 'string' || !PERMISSION_SET.has(action)) return null;
+    if (isPolicyWriteAction(action)) return null;
+    if (typeof environment !== 'string' || !ENVIRONMENT_SET.has(environment)) return null;
+    const base = {
+      userId: readOwn(context, 'userId'),
+      groupIds: readOwn(context, 'groupIds'),
+      action,
+      environment,
+      connectionId: readOwn(context, 'connectionId'),
+    } as PolicyContext;
+    const ctx = normalizeRequest({ ...base, entities: [], columns: [], hasWhere: false });
+    if (typeof ctx === 'string') return null;
+    if (typeof permissions?.has !== 'function' || permissions.has(ctx.action) !== true) return null;
+    if (!Array.isArray(policies)) return null;
+    const denies: CompiledRule[] = [];
+    for (const raw of policies) {
+      if (typeof raw !== 'object' || raw === null) return null;
+      if (readOwn(raw, 'enabled') !== true) continue;
+      const { rule } = compileRule(raw);
+      if (!rule) return null;
+      if (rule.effect === 'DENY' && matchesContext(rule, ctx)) denies.push(rule);
+    }
+    return {
+      denyRules: denies.length,
+      denied(entities, columns) {
+        try {
+          const req = normalizeRequest({ ...base, entities, columns, hasWhere: false });
+          if (typeof req === 'string') return true;
+          return denies.some((r) => overlaps(r, req));
+        } catch {
+          return true;
+        }
+      },
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether `name` is a plain identifier (`[A-Za-z0-9_$#@]+`). A request whose table and column
+ * names are all plain is never malformed, so with no DENY rule it is allowed.
+ */
+export function isPlainPolicyName(name: string): boolean {
+  return typeof name === 'string' && IDENTIFIER.test(name);
+}
+
 /**
  * The problems that make a rule invalid; empty when it is valid. `evaluatePolicy` denies every
  * request while any ENABLED rule is invalid, so callers should run this when a rule is saved

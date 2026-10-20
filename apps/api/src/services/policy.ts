@@ -4,15 +4,18 @@ import type { Database, PolicyRow } from '@dbx/database';
 import {
   AppError,
   DEFAULT_LIMITS,
+  compileDenyChecker,
   evaluatePolicy,
   policyVersion,
   validatePolicyRule,
 } from '@dbx/shared';
 import type {
+  DenyChecker,
   Environment,
   EvaluateOptions,
   Permission,
   PolicyDecision,
+  PolicyContext,
   PolicyRequest,
   PolicyRule,
 } from '@dbx/shared';
@@ -298,6 +301,25 @@ export class PolicyService {
     } catch (err) {
       this.logSafe('error', { err }, 'Policy evaluation failed');
       return denyAll(['policy evaluation failed'], snapshot.version);
+    }
+  }
+
+  /**
+   * The current rule set compiled once for many requests of one permission-only action and
+   * context (`compileDenyChecker`). Null means deny everything: the rules cannot be loaded, an
+   * enabled stored rule is invalid, or the context is denied as a whole. Never throws.
+   */
+  async denyChecker(
+    context: PolicyContext,
+    permissions: Set<Permission>,
+  ): Promise<DenyChecker | null> {
+    try {
+      const snapshot = await this.current();
+      if (snapshot.invalid.length > 0) return null;
+      return compileDenyChecker(context, snapshot.rules, permissions);
+    } catch (err) {
+      this.logSafe('error', { err }, 'Policies unavailable: denying every policy-evaluated action');
+      return null;
     }
   }
 
