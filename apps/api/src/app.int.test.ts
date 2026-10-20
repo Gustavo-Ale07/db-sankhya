@@ -643,10 +643,16 @@ describe('writes (fail closed)', () => {
       for (const payload of [{ sql }, { sql, connectionId: 'env-default' }]) {
         const res = await h.call(cookie, { method: 'POST', url: '/api/query', payload });
         expect(res.statusCode, sql).toBe(400);
-        expect(res.json().error, sql).toMatchObject({
-          code: 'SQL_UNSUPPORTED',
-          message: 'Mutations are not available yet.',
-        });
+        // INSERT / UPDATE / DELETE get a pointer to the preview; DDL is simply refused.
+        expect(res.json().error, sql).toMatchObject(
+          /^(INSERT|UPDATE|DELETE)/.test(sql)
+            ? {
+                code: 'SQL_UNSUPPORTED',
+                message: 'Mutations are never executed here. Preview them with /api/query/preview.',
+                details: { preview: '/api/query/preview' },
+              }
+            : { code: 'SQL_UNSUPPORTED', message: 'Mutations are not available yet.' },
+        );
       }
     }
     // Nothing reached the gateway.

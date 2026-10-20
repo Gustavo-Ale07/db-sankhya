@@ -7,6 +7,8 @@ import type { Classified, ReadAnalysis } from '@dbx/sql-engine';
 import type { AuthState } from '../context';
 import type { Catalog } from '../services/metadata';
 import { ENV_CONNECTION_ID } from '../services/connections';
+import { MutationService } from '../services/mutations';
+import { PlansService } from '../services/plans';
 import { executeRead } from '../services/read-executor';
 import type { PolicyDecision as ReadDecision } from '../services/read-executor';
 import {
@@ -28,6 +30,9 @@ import {
 
 /** Until the Sankhya write path (plans, Stage 11) exists, every mutation fails closed. */
 const MUTATIONS_UNAVAILABLE = 'Mutations are not available yet.';
+/** /api/query never runs a mutation: INSERT / UPDATE / DELETE are only previewed (Task 11.2a). */
+const USE_PREVIEW = 'Mutations are never executed here. Preview them with /api/query/preview.';
+const PREVIEW_URL = '/api/query/preview';
 
 const EXECUTION_ID = /^[A-Za-z0-9_-]{8,64}$/;
 
@@ -47,6 +52,14 @@ const confirmBody = z
   })
   .strict();
 
+const previewBody = z
+  .object({
+    sql: z.string().min(1).max(MAX_SQL_LENGTH),
+    /** Sankhya connection; the SANKHYA_* connection when omitted and configured. */
+    connectionId: connectionIdSchema.optional(),
+  })
+  .strict();
+
 const cancelBody = z.object({ executionId: z.string().regex(EXECUTION_ID) }).strict();
 
 /** Statement kinds that would change data or schema. */
@@ -61,6 +74,19 @@ function mutationTable(c: Classified): string | null {
 export async function queryRoutes(app: FastifyInstance): Promise<void> {
   const { history, audit, executions, connections, metadata, config, redact, policies, authz } =
     app.services;
+  const mutations = new MutationService({
+    policies,
+    authz,
+    connections,
+    metadata,
+    audit,
+    plans: new PlansService(app.services.database.db, {
+      secret: config.session.secret,
+      ttlSeconds: config.planTtlSeconds,
+      approvalTtlSeconds: config.approvalTtlMinutes * 60,
+    }),
+    maxReadRows: config.sankhya.maxRows,
+  });
 
   const safeHistory = async (
     request: FastifyRequest,
@@ -90,8 +116,11 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
     sql: string,
     classified: Classified,
     connectionId: string | null,
+    previewable = false,
   ): Promise<AppError> => {
-    const err = new AppError('SQL_UNSUPPORTED', MUTATIONS_UNAVAILABLE);
+    const err = previewable
+      ? new AppError('SQL_UNSUPPORTED', USE_PREVIEW, { preview: PREVIEW_URL })
+      : new AppError('SQL_UNSUPPORTED', MUTATIONS_UNAVAILABLE);
     await audit.record({
       ...auditBase(request, auth),
       action: 'write.denied',
@@ -119,7 +148,18 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
     if (mutation === null) {
       return sankhyaRead(request, reply, auth, body.sql, executionId, body.connectionId);
     }
-    const err = await denyMutation(request, auth, body.sql, classified, body.connectionId ?? null);
+    // INSERT / UPDATE / DELETE get a pointer to the preview; nothing is planned or sent here, so
+    // the first Ctrl+Enter can never write.
+    const previewable =
+      classified.kind === 'INSERT' || classified.kind === 'UPDATE' || classified.kind === 'DELETE';
+    const err = await denyMutation(
+      request,
+      auth,
+      body.sql,
+      classified,
+      body.connectionId ?? null,
+      previewable,
+    );
     await safeHistory(request, {
       userId: auth.user.id,
       executionId,
@@ -274,6 +314,20 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
         resultRows: out.rows.length,
         apiCalls: 1,
       });
+      // Who read what, where: the statement (redacted by the audit service) and the row count,
+      // never the rows.
+      await audit.record({
+        ...auditBase(request, auth),
+        action: 'read.executed',
+        status: 'success',
+        operation: 'SELECT',
+        resource: resourceOf(),
+        statement: sql,
+        connectionId,
+        environment: access.environment,
+        durationMs: out.durationMs,
+        details: { connectionId, rowCount: out.rows.length, truncated: out.truncated },
+      });
       return redact({
         type: 'result',
         executionId,
@@ -342,6 +396,32 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
       'connectionId is required: no default Sankhya connection is configured',
     );
   }
+
+  // ------------------------------------------------------------ POST /api/query/preview
+  // Plans an INSERT / UPDATE / DELETE and returns its preview. Never writes: execution does not
+  // exist yet and the write switches (SAFE_MODE, GLOBAL_WRITE_ENABLED, WRITE_TO_SANKHYA) are only
+  // reported. MutationService audits every preview, allowed or denied.
+  app.post('/api/query/preview', async (request, reply) => {
+    noStore(reply);
+    const auth = requireAuth(request);
+    const body = parseBody(previewBody, request.body);
+    const prepared = await mutations.prepare({
+      auth,
+      sql: body.sql,
+      connectionId: body.connectionId ?? defaultConnection(),
+      meta: { ip: clientIp(request), requestId: request.id },
+    });
+    return redact({
+      type: 'preview',
+      ...prepared,
+      execution: {
+        available: false,
+        safeMode: config.safeMode,
+        globalWriteEnabled: config.globalWriteEnabled,
+        writeToSankhya: config.writeToSankhya,
+      },
+    });
+  });
 
   // ------------------------------------------------------------ POST /api/query/confirm
   // Kept so old clients get a clear answer; there is nothing to confirm while mutations are off.
