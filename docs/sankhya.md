@@ -55,8 +55,8 @@ have been applied. The server does not repeat it. Check the row in the ERP befor
 else (see [operations.md](operations.md#operator-notes)).
 
 `DatasetSP.save` has no transaction spanning several calls. A plan that changes several rows can
-stop part way; the run's verification label is then `PARTIALLY_VERIFIED` or `UNVERIFIED`.
-Per-step outcomes show which rows were saved.
+stop part way; the run's verification label is then `PARTIALLY_VERIFIED` or `UNVERIFIED` (`FAILED`
+if an earlier row's read-back did not match). Per-step outcomes show which rows were saved.
 
 ## executeQuery
 

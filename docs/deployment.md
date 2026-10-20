@@ -123,8 +123,9 @@ read-only guarantee for `executeQuery` (see [sankhya.md](sankhya.md#executequery
 
 With the defaults (`GLOBAL_WRITE_ENABLED=false`, `WRITE_TO_SANKHYA=false`, `SAFE_MODE=true`,
 `BUSINESS_ACTIONS_ENABLED` empty) every planned write and business action is refused with
-`READ_ONLY_MODE`, and previews still work. Statements in the local scratch database are not
-affected; they never reach the ERP. When writes are needed:
+`READ_ONLY_MODE`, and previews still work. Statements run directly in the scratch editor
+(`/api/scratch/exec`) and materialization are not covered; they never reach the ERP. When writes
+are needed:
 
 1. Grant `DATA.INSERT` / `DATA.UPDATE` through a role (`OPERATOR` or a custom role).
 2. Create policy rules in **Políticas** that `ALLOW` those actions on the tables and environments

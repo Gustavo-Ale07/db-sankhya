@@ -28,16 +28,16 @@ data through the Sankhya gateway.
   policy rules by environment, connection, table and column. `DENY` wins, writes are
   default-deny, and a rule can require a second person's approval. No administrator bypass.
 - **Kill switches**: `GLOBAL_WRITE_ENABLED`, `WRITE_TO_SANKHYA` and `SAFE_MODE`, plus a runtime
-  switch that stops every planned write and business action without a restart (statements in the
-  local scratch database are not covered).
+  switch that stops every planned write and business action without a restart (statements run
+  directly in the scratch editor (`/api/scratch/exec`) and materialization are not covered).
 - **Scratch workspace**: private `tmp_` tables per user in an in-memory PGlite, filled from Sankhya
   reads by materialization. Nothing in scratch reaches the ERP.
 - **Custom DDL as artifacts**: `CREATE` / `ALTER` / `DROP` of custom-prefix tables (`AD_`) become
   Add-on Studio files; native DDL is never executed.
 - **Business actions**: a typed registry of gateway services (today, cancelling a note), behind
   the same plan lifecycle and an explicit allowlist.
-- **Audit**: every Sankhya read, plan, approval, verification and administrative change, with an assisted
-  rollback plan for verified updates.
+- **Audit**: every Sankhya read, plan, approval, verification and administrative change, with an
+  assisted rollback plan for verified updates.
 - **Mock mode**: a bundled fake gateway with fictitious data, for development, tests and demos.
 
 Each statement maps to a capability: `SUPPORTED`, `SUPPORTED_VIA_GENERATED_ARTIFACT`,

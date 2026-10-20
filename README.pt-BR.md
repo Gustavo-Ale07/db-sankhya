@@ -30,16 +30,17 @@ cuidado dados do Sankhya ERP através do gateway do Sankhya.
   por padrão, e uma regra pode exigir a aprovação de uma segunda pessoa. Administrador não tem
   atalho.
 - **Chaves de emergência**: `GLOBAL_WRITE_ENABLED`, `WRITE_TO_SANKHYA` e `SAFE_MODE`, mais uma
-  chave em tempo de execução que para todas as escritas planejadas e ações de negócio sem
-  reiniciar (instruções no banco local de scratch não são cobertas).
+  chave em tempo de execução que para todas as escritas planejadas e ações de negócio sem reiniciar
+  (instruções executadas diretamente no editor de scratch (`/api/scratch/exec`) e a materialização
+  não são cobertas).
 - **Área de rascunho (scratch)**: tabelas `tmp_` privadas por usuário num PGlite em memória,
   preenchidas a partir de leituras do Sankhya por materialização. Nada do scratch chega ao ERP.
 - **DDL customizado como artefato**: `CREATE` / `ALTER` / `DROP` de tabelas com prefixo
   customizado (`AD_`) viram arquivos do Add-on Studio; DDL nativo nunca é executado.
 - **Ações de negócio**: um registro tipado de serviços do gateway (hoje, cancelar uma nota), com o
   mesmo ciclo de plano e uma lista explícita de liberação.
-- **Auditoria**: toda leitura no Sankhya, plano, aprovação, verificação e mudança administrativa, com um plano
-  de rollback assistido para atualizações verificadas.
+- **Auditoria**: toda leitura no Sankhya, plano, aprovação, verificação e mudança administrativa,
+  com um plano de rollback assistido para atualizações verificadas.
 - **Modo mock**: um gateway falso embutido, com dados fictícios, para desenvolvimento, testes e
   demonstração.
 

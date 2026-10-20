@@ -73,8 +73,8 @@ gateway read path.
 ## Writes
 
 `POST /api/query` never executes a mutation. An `INSERT`, `UPDATE` or `DELETE` sent there is
-refused with `SQL_UNSUPPORTED` and a pointer to `POST /api/query/preview`; other mutations (DDL and the
-like) are refused outright. Both are audited as `write.denied`. The legacy
+refused with `SQL_UNSUPPORTED` and a pointer to `POST /api/query/preview`; other mutations (DDL and
+the like) are refused outright. Both are audited as `write.denied`. The legacy
 `POST /api/query/confirm` route is always refused.
 
 A write goes through two calls and eleven steps (`apps/api/src/services/mutations.ts`):
@@ -148,12 +148,12 @@ The result label is one of:
 | `FAILED`             | a row read back does not hold the intended values                            |
 
 An `INSERT` is read back by the key the gateway returned in the save result; only the inserted
-columns are compared. Without a complete key the step stays `UNVERIFIED`. The label applies to
-the whole run, not to each row; per-step outcomes show which rows were saved. A gateway error
-stops the run, which is then labelled by what could be read back (`UNVERIFIED` or
-`PARTIALLY_VERIFIED`); the error itself is in the step outcome. When the gateway's answer is
-lost, the row is still read back: a match is labelled `PARTIALLY_VERIFIED`, not `VERIFIED`,
-because the save was never confirmed.
+columns are compared. Without a complete key the step stays `UNVERIFIED`. The label applies to the
+whole run, not to each row; per-step outcomes show which rows were saved. A gateway error stops the
+run, which is then labelled by what could be read back (`UNVERIFIED` or `PARTIALLY_VERIFIED`, or
+`FAILED` if an earlier row's read-back did not match); the error itself is in the step outcome.
+When the gateway's answer is lost, the row is still read back: a match is labelled
+`PARTIALLY_VERIFIED`, not `VERIFIED`, because the save was never confirmed.
 
 ### Kill switches
 
@@ -192,12 +192,12 @@ instead of executing. A second person with `APPROVAL.DECIDE` decides in **Aprova
 On **Auditoria**, a user with `AUDIT.READ` can ask for a rollback plan of an executed write
 (`POST /api/audit/:id/rollback-plan`). It is offered only for a fully `VERIFIED` `UPDATE` of a
 Sankhya table whose snapshots are complete. It is refused when snapshots were disabled
-(`auditSnapshots` false), redacted or clipped, or when a value cannot be written back exactly.
-The server builds `UPDATE` statements that restore the previous values and prepares the first statement as a normal plan under the caller's own permissions and
-policy (`rollback.planned` audit event). Conflicts (rows that changed or no longer exist) are
-checked only for that prepared first statement. It is labelled "assisted rollback — requires new preview
-and confirmation": nothing is reverted until that plan is confirmed and executed like any other
-write.
+(`auditSnapshots` false), redacted or clipped, or when a value cannot be written back exactly. The
+server builds `UPDATE` statements that restore the previous values and prepares the first statement
+as a normal plan under the caller's own permissions and policy (`rollback.planned` audit event).
+Conflicts (rows that changed or no longer exist) are checked only for that prepared first
+statement. It is labelled "assisted rollback — requires new preview and confirmation": nothing is
+reverted until that plan is confirmed and executed like any other write.
 
 ### Business actions
 

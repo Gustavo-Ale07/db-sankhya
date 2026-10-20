@@ -76,8 +76,8 @@ With the defaults no write reaches the ERP. To allow writes on a homologation co
 
 ### Emergency stop
 
-An administrator with `ADMIN.SECURITY` can stop every planned write and business action at once without a restart: **Segurança**
-→ turn writes off, or
+An administrator with `ADMIN.SECURITY` can stop every planned write and business action at once
+without a restart: **Segurança** → turn writes off, or
 
 ```bash
 curl -X PUT https://app.example.com/api/admin/security \
@@ -105,10 +105,10 @@ running, and is audited as `security.update`. The runtime switch can only turn w
 }
 ```
 
-`effective` is `env` AND `runtime`. If the stored runtime value cannot be read, writes are
-refused ("The write switches could not be read."). `scratchAvailable` refers only to planned scratch writes;
-statements run directly in the scratch editor (`/api/scratch/exec`) and materialization do not
-check the switches, since they never reach the ERP.
+`effective` is `env` AND `runtime`. If the stored runtime value cannot be read, writes are refused
+("The write switches could not be read."). `scratchAvailable` refers only to planned scratch
+writes; statements run directly in the scratch editor (`/api/scratch/exec`) and materialization do
+not check the switches, since they never reach the ERP.
 
 ## Operator notes
 
