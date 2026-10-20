@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { labelOf, verifyByKey } from './verification';
-import type { ExecutionStep } from './verification';
+import { SNAPSHOT_MAX_BYTES, SNAPSHOT_MAX_ROWS, SNAPSHOT_MAX_STRING_CHARS } from '@dbx/shared';
+import { labelOf, reportForAudit, verifyByKey } from './verification';
+import type { ExecutionReport, ExecutionStep } from './verification';
 
 type LoadRecords = Parameters<typeof verifyByKey>[0]['loadRecords'];
 
@@ -104,5 +105,78 @@ describe('labelOf', () => {
     expect(labelOf([step({ verified: true }), step({ verified: false })])).toBe('FAILED');
     expect(labelOf([step({ verified: true }), step({})])).toBe('PARTIALLY_VERIFIED');
     expect(labelOf([step({})])).toBe('UNVERIFIED');
+  });
+});
+
+describe('reportForAudit', () => {
+  const report = (steps: ExecutionStep[]): ExecutionReport => ({
+    status: 'success',
+    verification: 'VERIFIED',
+    steps,
+  });
+  const valued = (i: number, text: string): ExecutionStep => ({
+    key: { CODPARC: i },
+    outcome: 'ok',
+    verified: true,
+    before: { NOMEPARC: `old ${text}` },
+    expected: { NOMEPARC: text },
+    observed: { NOMEPARC: text },
+  });
+
+  it('a small report is stored as is', () => {
+    const live = report([valued(1, 'Novo nome')]);
+    expect(reportForAudit(live, { snapshots: true })).toEqual(live);
+  });
+
+  it('auditSnapshots=false: no row value is stored, keys and labels are', () => {
+    const stored = reportForAudit(report([valued(1, 'Novo nome')]), { snapshots: false });
+    expect(stored.steps).toEqual([{ key: { CODPARC: 1 }, outcome: 'ok', verified: true }]);
+    expect(stored.verification).toBe('VERIFIED');
+  });
+
+  it('clips long strings in the stored copy only, and marks the values truncated', () => {
+    const long = 'x'.repeat(SNAPSHOT_MAX_STRING_CHARS + 10);
+    const live = report([valued(1, long)]);
+    const stored = reportForAudit(live, { snapshots: true });
+    expect(stored.valuesTruncated).toBe(true);
+    const observed = stored.steps[0]!.observed!.NOMEPARC as string;
+    expect(observed.length).toBe(SNAPSHOT_MAX_STRING_CHARS + 1);
+    expect(observed.endsWith('…')).toBe(true);
+    // The live report is never touched.
+    expect(live.steps[0]!.observed!.NOMEPARC).toBe(long);
+    expect(live).not.toHaveProperty('valuesTruncated');
+  });
+
+  it(`keeps values for at most ${SNAPSHOT_MAX_ROWS} steps; later steps keep only key and outcome`, () => {
+    const steps = Array.from({ length: SNAPSHOT_MAX_ROWS + 5 }, (_, i) => valued(i + 1, 'v'));
+    const stored = reportForAudit(report(steps), { snapshots: true });
+    expect(stored.valuesTruncated).toBe(true);
+    expect(stored.steps).toHaveLength(SNAPSHOT_MAX_ROWS + 5);
+    expect(stored.steps[SNAPSHOT_MAX_ROWS - 1]).toHaveProperty('observed');
+    expect(stored.steps[SNAPSHOT_MAX_ROWS]).toEqual({
+      key: { CODPARC: SNAPSHOT_MAX_ROWS + 1 },
+      outcome: 'ok',
+      verified: true,
+    });
+    expect(steps[SNAPSHOT_MAX_ROWS]).toHaveProperty('observed');
+  });
+
+  it(`keeps the stored values within ${SNAPSHOT_MAX_BYTES} bytes`, () => {
+    const wide = 'é'.repeat(SNAPSHOT_MAX_STRING_CHARS - 10);
+    const steps = Array.from({ length: SNAPSHOT_MAX_ROWS }, (_, i) => valued(i + 1, wide));
+    const stored = reportForAudit(report(steps), { snapshots: true });
+    expect(stored.valuesTruncated).toBe(true);
+    const kept = stored.steps.filter((s) => s.observed !== undefined);
+    expect(kept.length).toBeGreaterThan(0);
+    expect(kept.length).toBeLessThan(SNAPSHOT_MAX_ROWS);
+    const bytes = Buffer.byteLength(
+      JSON.stringify(
+        kept.map(({ before, expected, observed }) => ({ before, expected, observed })),
+      ),
+    );
+    expect(bytes).toBeLessThanOrEqual(SNAPSHOT_MAX_BYTES);
+    // Once the budget is spent, no later step keeps values (no gaps).
+    const firstDropped = stored.steps.findIndex((s) => s.observed === undefined);
+    expect(stored.steps.slice(firstDropped).every((s) => s.observed === undefined)).toBe(true);
   });
 });

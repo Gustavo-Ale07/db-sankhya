@@ -3,6 +3,13 @@
  * back by its primary key and compared field by field with the value the plan meant to write.
  * The labels are honest: VERIFIED only when every step ran and every target matched.
  */
+import {
+  SNAPSHOT_MAX_BYTES,
+  SNAPSHOT_MAX_ROWS,
+  SNAPSHOT_MAX_STRING_CHARS,
+  redactBroad,
+  utf8ByteLength,
+} from '@dbx/shared';
 import type { CriteriaParamType, SankhyaClient } from '@dbx/sankhya-client';
 
 export type VerificationLabel = 'VERIFIED' | 'PARTIALLY_VERIFIED' | 'UNVERIFIED' | 'FAILED';
@@ -29,6 +36,8 @@ export interface ExecutionReport {
   status: 'success' | 'partial' | 'failed';
   verification: VerificationLabel;
   steps: ExecutionStep[];
+  /** Stored copy only: some row values were clipped or left out (the audit size limits). */
+  valuesTruncated?: boolean;
 }
 
 /** Keys per loadRecords call: small enough for any gateway page and criteria length. */
@@ -167,4 +176,58 @@ export function statusOf(steps: ExecutionStep[]): ExecutionReport['status'] {
   const ok = steps.filter((s) => s.outcome === 'ok').length;
   if (steps.length > 0 && ok === steps.length) return 'success';
   return ok > 0 ? 'partial' : 'failed';
+}
+
+const VALUE_FIELDS = ['before', 'expected', 'observed'] as const;
+
+/** The step without its row values (before / expected / observed). */
+function keyOnly(step: ExecutionStep): ExecutionStep {
+  const { before: _b, expected: _e, observed: _o, ...rest } = step;
+  return rest;
+}
+
+/**
+ * The copy of a report kept in the audit (and answered by a replay). The live report is never
+ * changed. Without snapshots (auditSnapshots=false) no row value is kept. Otherwise the values
+ * get the snapshot limits: strings clipped to SNAPSHOT_MAX_STRING_CHARS, values kept for at most
+ * SNAPSHOT_MAX_ROWS steps and within SNAPSHOT_MAX_BYTES; the steps past a limit keep only their
+ * key and outcome, and `valuesTruncated` says so.
+ */
+export function reportForAudit(
+  report: ExecutionReport,
+  opts: { snapshots: boolean },
+): ExecutionReport {
+  if (!opts.snapshots) return { ...report, steps: report.steps.map(keyOnly) };
+  let truncated = false;
+  let used = 2;
+  let full = false;
+  const steps = report.steps.map((step, i) => {
+    if (!VALUE_FIELDS.some((f) => step[f] !== undefined)) return step;
+    if (full || i >= SNAPSHOT_MAX_ROWS) {
+      truncated = true;
+      return keyOnly(step);
+    }
+    const values: Partial<Pick<ExecutionStep, (typeof VALUE_FIELDS)[number]>> = {};
+    for (const f of VALUE_FIELDS) {
+      const v = step[f];
+      if (v === undefined) continue;
+      const clipped = redactBroad(v, { clipStrings: true }) as Record<string, unknown> | null;
+      if (
+        Object.values(v ?? {}).some(
+          (x) => typeof x === 'string' && x.length > SNAPSHOT_MAX_STRING_CHARS,
+        )
+      )
+        truncated = true;
+      (values as Record<string, unknown>)[f] = clipped;
+    }
+    const size = utf8ByteLength(JSON.stringify(values)) + 1;
+    if (used + size > SNAPSHOT_MAX_BYTES) {
+      full = true;
+      truncated = true;
+      return keyOnly(step);
+    }
+    used += size;
+    return { ...keyOnly(step), ...values };
+  });
+  return { ...report, steps, ...(truncated ? { valuesTruncated: true } : {}) };
 }
