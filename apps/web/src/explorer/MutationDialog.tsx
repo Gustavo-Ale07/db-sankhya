@@ -108,6 +108,14 @@ function isRemoval(t: PreviewTarget): boolean {
 }
 
 /**
+ * Whether this target's row goes away: the server's operation decides; only a plan without one
+ * (older plans, business actions) falls back to the shape of the target.
+ */
+function removesRow(t: PreviewTarget, operation: Operation | null): boolean {
+  return operation === 'DELETE' || (operation === null && isRemoval(t));
+}
+
+/**
  * The statement kind: the server's, or for an older plan derived from its targets. Null when
  * nothing tells (a business action without targets): the capability label stands in for it.
  */
@@ -202,16 +210,17 @@ function RecordCard({
   expanded,
   onToggle,
   showAll,
+  removed,
 }: {
   target: PreviewTarget;
   index: number;
   expanded: boolean;
   onToggle: () => void;
   showAll: boolean;
+  removed: boolean;
 }) {
   const bodyId = useId();
-  const removed = isRemoval(target);
-  const inserted = target.before === null;
+  const inserted = !removed && target.before === null;
   const key = keyText(target.key);
   let body: ReactNode;
   if (inserted) {
@@ -294,7 +303,7 @@ function RecordCard({
           removed ? 'text-danger' : ''
         }`}
         aria-expanded={expanded}
-        aria-controls={bodyId}
+        aria-controls={expanded ? bodyId : undefined}
         onClick={onToggle}
         data-testid="diff-card-toggle"
       >
@@ -317,7 +326,16 @@ function RecordCard({
 }
 
 /** The record cards of the preview, 20 per page; only the current page is in the DOM. */
-function Diff({ targets, affected }: { targets: PreviewTarget[]; affected: number }) {
+function Diff({
+  targets,
+  affected,
+  operation,
+}: {
+  targets: PreviewTarget[];
+  affected: number;
+  /** The server's statement kind; null for a plan that does not carry one. */
+  operation: Operation | null;
+}) {
   const [page, setPage] = useState(0);
   const [showAll, setShowAll] = useState(false);
   // Cards whose state differs from the default (expanded when few targets, else only the first).
@@ -326,7 +344,7 @@ function Diff({ targets, affected }: { targets: PreviewTarget[]; affected: numbe
   const pages = Math.ceil(targets.length / PAGE_SIZE);
   const start = page * PAGE_SIZE;
   const shown = targets.slice(start, start + PAGE_SIZE);
-  const hasUpdate = targets.some((t) => t.before !== null && !isRemoval(t));
+  const hasUpdate = targets.some((t) => t.before !== null && !removesRow(t, operation));
   const expandedByDefault = (i: number) => targets.length <= EXPAND_ALL_UP_TO || i === 0;
   const toggle = (i: number) =>
     setFlipped((prev) => {
@@ -366,6 +384,7 @@ function Diff({ targets, affected }: { targets: PreviewTarget[]; affected: numbe
             expanded={expandedByDefault(i) !== flipped.has(i)}
             onToggle={() => toggle(i)}
             showAll={showAll}
+            removed={removesRow(t, operation)}
           />
         );
       })}
@@ -402,7 +421,16 @@ const NOT_REREAD = 'não foi possível reler';
  * One step's values. AGORA is only what the server read back (`observed`); the plan's intent
  * (`expected`) is shown only next to it, as ESPERADO, when the read-back did not match.
  */
-function StepValues({ step, mismatch }: { step: ExecutionStep; mismatch: boolean }) {
+function StepValues({
+  step,
+  mismatch,
+  removal,
+}: {
+  step: ExecutionStep;
+  mismatch: boolean;
+  /** A DELETE step that went through: there is nothing left to read back. */
+  removal: boolean;
+}) {
   const observed = step.observed;
   const fields = [
     ...new Set([
@@ -461,6 +489,8 @@ function StepValues({ step, mismatch }: { step: ExecutionStep; mismatch: boolean
               ) : (
                 '—'
               )
+            ) : removal ? (
+              <span className="font-semibold text-danger">registro removido</span>
             ) : (
               <span className="text-warn italic">{NOT_REREAD}</span>
             )}
@@ -471,7 +501,7 @@ function StepValues({ step, mismatch }: { step: ExecutionStep; mismatch: boolean
   );
 }
 
-function Report({ report }: { report: ExecutionReport }) {
+function Report({ report, operation }: { report: ExecutionReport; operation: Operation | null }) {
   const [page, setPage] = useState(0);
   const unknown = report.steps.some((s) => s.outcome === 'unknown');
   const title = reportTitle(report);
@@ -538,7 +568,13 @@ function Report({ report }: { report: ExecutionReport }) {
                   {s.verified === true ? 'sim' : s.verified === false ? 'não confere' : '—'}
                 </span>
               </div>
-              {hasValues(s) && <StepValues step={s} mismatch={mismatch} />}
+              {hasValues(s) && (
+                <StepValues
+                  step={s}
+                  mismatch={mismatch}
+                  removal={operation === 'DELETE' && s.outcome === 'ok'}
+                />
+              )}
             </div>
           );
         })}
@@ -956,7 +992,11 @@ export function MutationDialog({
               >
                 {countSentence(operation, rows)}
               </p>
-              <Diff targets={preview.preview.targets} affected={preview.preview.affected} />
+              <Diff
+                targets={preview.preview.targets}
+                affected={preview.preview.affected}
+                operation={preview.operation ?? null}
+              />
             </>
           )}
 
@@ -1034,7 +1074,7 @@ export function MutationDialog({
           {planDead && !outcomeUnknown && (
             <p className="text-muted">Este plano não pode mais ser executado.</p>
           )}
-          {report && <Report report={report} />}
+          {report && <Report report={report} operation={operation} />}
         </div>
 
         <div className="flex justify-end gap-2 border-t border-line px-4 py-2">

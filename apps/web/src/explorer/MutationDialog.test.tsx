@@ -1195,3 +1195,111 @@ describe('MutationDialog unknown outcome', () => {
     ]);
   });
 });
+
+describe('MutationDialog review fixes', () => {
+  it('lets the server operation decide a removal, not the empty `after`', () => {
+    render(
+      <MutationDialog
+        preview={preview({
+          operation: 'UPDATE',
+          preview: {
+            affected: 1,
+            targets: [
+              { key: { CODPARC: 1 }, before: { CODPARC: 1, NOMEPARC: 'Antigo' }, after: {} },
+            ],
+          },
+        })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.getByTestId('mutation-diff').textContent).not.toContain('REGISTRO SERÁ REMOVIDO');
+  });
+
+  it('shows a DELETE target as removed even when `after` carries columns', () => {
+    render(
+      <MutationDialog
+        preview={preview({
+          operation: 'DELETE',
+          preview: {
+            affected: 1,
+            targets: [
+              {
+                key: { ID: 1 },
+                before: { ID: 1, NOME: 'Linha um' },
+                after: { ID: null, NOME: null },
+              },
+            ],
+          },
+        })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    const diff = screen.getByTestId('mutation-diff').textContent ?? '';
+    expect(diff).toContain('REGISTRO SERÁ REMOVIDO');
+    expect(diff).toContain('Linha um');
+    expect(diff).not.toContain('NULL');
+  });
+
+  it('points aria-controls only at a rendered card body', () => {
+    render(
+      <MutationDialog
+        preview={preview({ preview: { affected: 6, targets: rows(6) } })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    const [open, closed] = screen.getAllByTestId('diff-card-toggle');
+    const id = open!.getAttribute('aria-controls');
+    expect(id).toBeTruthy();
+    expect(document.getElementById(id!)).not.toBeNull();
+    expect(closed!.hasAttribute('aria-controls')).toBe(false);
+  });
+
+  it('shows AGORA "registro removido" for a DELETE step without read-back', async () => {
+    vi.mocked(executePlan).mockResolvedValue(
+      report({
+        steps: [{ key: { ID: 1 }, outcome: 'ok', verified: true, before: { NOME: 'Linha um' } }],
+      }),
+    );
+    render(
+      <MutationDialog
+        preview={preview({
+          operation: 'DELETE',
+          requires: noPhrase,
+          preview: {
+            affected: 1,
+            targets: [{ key: { ID: 1 }, before: { ID: 1, NOME: 'Linha um' }, after: {} }],
+          },
+        })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    fireEvent.click(execButton());
+    await screen.findByTestId('execution-report');
+    const now = screen.getByTestId('step-now').textContent;
+    expect(now).toContain('registro removido');
+    expect(now).not.toContain('não foi possível reler');
+  });
+
+  it('keeps "não foi possível reler" for an UPDATE step without read-back', async () => {
+    vi.mocked(executePlan).mockResolvedValue(
+      report({
+        verification: 'UNVERIFIED',
+        steps: [{ key: { CODPARC: 1 }, outcome: 'ok', before: { NOMEPARC: 'Antigo' } }],
+      }),
+    );
+    render(
+      <MutationDialog
+        preview={preview({ operation: 'UPDATE', requires: noPhrase })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    fireEvent.click(execButton());
+    await screen.findByTestId('execution-report');
+    expect(screen.getByTestId('step-now').textContent).toContain('não foi possível reler');
+  });
+});
