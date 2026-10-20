@@ -124,6 +124,26 @@ export function ResultsPanel({ run, tab, onTab }: Props) {
               </div>
             )}
             {run.status === 'error' && <ErrorBox error={run.error} className="m-3" />}
+            {run.status === 'previewing' && (
+              <div className="p-3 text-xs text-muted" role="status">
+                Instrução de alteração: preparando a prévia. Nada foi executado.
+              </div>
+            )}
+            {run.status === 'mutation' && (
+              <div className="p-3 text-xs" role="status" data-testid="mutation-status">
+                {run.report ? (
+                  <>
+                    Alteração executada ({run.report.status}). Verificação:{' '}
+                    <strong>{run.report.verification}</strong>.
+                  </>
+                ) : (
+                  <>
+                    Instrução de alteração: revise a prévia. Nada é gravado sem a confirmação
+                    explícita no diálogo.
+                  </>
+                )}
+              </div>
+            )}
             {result && (
               <ResultGrid
                 columns={result.columns}

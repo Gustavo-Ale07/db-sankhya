@@ -1,17 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, ApiError, newExecutionId } from '../api/client';
+import { previewMutation } from '../api/mutations';
+import type { MutationPreview } from '../api/mutations';
 import type { QueryResult, SavedQuery, SchemaResponse } from '../api/types';
 import type { Theme } from '../app/theme';
 import { useSession } from '../app/session';
 import { setCompletionSchema } from '../editor/monaco';
 import { ErrorBox } from '../components/ErrorBox';
 import { Modal } from '../components/Modal';
+import { MutationDialog } from './MutationDialog';
 import { ResultsPanel } from './ResultsPanel';
 import type { ResultTab } from './ResultsPanel';
 import { SchemaTree } from './SchemaTree';
 import { SqlEditor } from './SqlEditor';
 import type { EditorApi } from './SqlEditor';
+import { isPreviewPointer } from './runState';
 import type { RunState } from './runState';
 import { loadTabs, newTab, saveTabs } from './tabs';
 import type { EditorTab } from './tabs';
@@ -52,6 +56,12 @@ export function ExplorerPage({
   const [saveError, setSaveError] = useState<unknown>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [editorHeight, setEditorHeight] = useState(45);
+  // The open mutation plan. Its token lives only here, in memory: never in tabs, storage or logs.
+  const [mutation, setMutation] = useState<{
+    tabId: string;
+    sql: string;
+    preview: MutationPreview;
+  } | null>(null);
   const editorApi = useRef<EditorApi | null>(null);
   const aborts = useRef<Record<string, AbortController>>({});
   const splitRef = useRef<HTMLDivElement>(null);
@@ -108,6 +118,19 @@ export function ExplorerPage({
             sql,
             error: new ApiError(499, { code: 'QUERY_CANCELLED', message: 'Cancelled by the user' }),
           });
+        } else if (isPreviewPointer(err) && aborts.current[tabId] === controller) {
+          // The client never classifies SQL: the server said this is a previewable mutation.
+          // The preview plans it and writes nothing; only an explicit click in the dialog
+          // executes, so Ctrl+Enter can never write.
+          setRun(tabId, { status: 'previewing', sql });
+          setResultTab((m) => ({ ...m, [tabId]: 'results' }));
+          try {
+            const preview = await previewMutation(sql, connectionId);
+            setRun(tabId, { status: 'mutation', sql, planId: preview.planId });
+            setMutation({ tabId, sql, preview });
+          } catch (previewErr) {
+            setRun(tabId, { status: 'error', sql, error: previewErr });
+          }
         } else {
           setRun(tabId, { status: 'error', sql, error: err });
           setResultTab((m) => ({ ...m, [tabId]: 'results' }));
@@ -321,7 +344,7 @@ export function ExplorerPage({
             type="button"
             className="btn btn-primary"
             onClick={runCurrent}
-            disabled={run.status === 'running' || !connectionId}
+            disabled={run.status === 'running' || run.status === 'previewing' || !connectionId}
             title={
               connectionId
                 ? 'Executar (Ctrl+Enter / F5)'
@@ -343,7 +366,9 @@ export function ExplorerPage({
           <button type="button" className="btn" onClick={save} title="Salvar consulta (Ctrl+S)">
             Salvar
           </button>
-          <span className="ml-2 text-[11px] text-muted">Somente leitura (SELECT)</span>
+          <span className="ml-2 text-[11px] text-muted">
+            SELECT executa direto · alterações só após prévia e confirmação
+          </span>
           {notice && (
             <span role="status" className="ml-2 text-[11px] text-ok">
               {notice}
@@ -394,6 +419,23 @@ export function ExplorerPage({
           </div>
         </div>
       </div>
+
+      {mutation && (
+        <MutationDialog
+          key={mutation.preview.planId}
+          preview={mutation.preview}
+          sql={mutation.sql}
+          onClose={() => setMutation(null)}
+          onExecuted={(report) =>
+            setRun(mutation.tabId, {
+              status: 'mutation',
+              sql: mutation.sql,
+              planId: mutation.preview.planId,
+              report,
+            })
+          }
+        />
+      )}
 
       <Modal
         open={saveDialog !== null}
