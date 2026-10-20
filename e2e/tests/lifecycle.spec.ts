@@ -147,25 +147,32 @@ test('PRODUCTION UPDATE: strong confirmation, then SAFE_MODE blocks it and nothi
     `UPDATE TGFPAR SET NOMEPARC = '${target}' WHERE CODPARC = ${ROW.production}`,
   );
   expect(preview.status()).toBe(200);
+  const plan = (await preview.json()) as { planId: string; token: string };
   const dialog = page.getByRole('dialog', { name: 'Prévia da alteração' });
   await expect(dialog.getByTestId('impact-environment')).toHaveText('PRODUCTION');
+  await expect(dialog.getByTestId('production-band')).toBeVisible();
   await expect(dialog).toContainText('SAFE_MODE ativo');
   await expect(dialog).not.toContainText('GLOBAL_WRITE_ENABLED desligado');
 
+  // The preview already says the write is unavailable: the button stays disabled even with the
+  // exact phrase, so the UI sends nothing.
   const execute = dialog.getByTestId('mutation-execute');
   await expect(execute).toBeDisabled();
   const phrase = (await dialog.getByTestId('confirmation-phrase').textContent()) ?? '';
   expect(phrase).toBe('PRODUCTION UPDATE 1 TGFPAR');
   await dialog.getByTestId('confirmation-input').fill(phrase);
-  await expect(execute).toBeEnabled();
+  await expect(execute).toBeDisabled();
 
-  const response = executeResponse(page);
-  await execute.click();
-  const res = await response;
+  // The server refuses the plan on its own too, naming SAFE_MODE.
+  const res = await call(page.request, 'POST', '/api/query/execute', {
+    planId: plan.planId,
+    token: plan.token,
+    idempotencyKey: `e2e-safe-mode-${STAMP}`,
+    strongConfirmation: phrase,
+  });
   const err = await refusal(res);
   expect(err.code).toBe('READ_ONLY_MODE');
   expect(err.details?.switch).toBe('SAFE_MODE');
-  await expect(dialog.getByTestId('mutation-error')).toContainText('READ_ONLY_MODE');
   await shot(page, 'lifecycle-production-safe-mode');
   await page.keyboard.press('Escape');
   await expect(dialog).toBeHidden();

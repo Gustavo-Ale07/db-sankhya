@@ -95,8 +95,12 @@ async function previewAndRefuse(page: Page) {
       calls.push(new URL(r.url()).pathname);
   });
 
+  const previewRes = page.waitForResponse(
+    (r) => r.request().method() === 'POST' && new URL(r.url()).pathname === '/api/query/preview',
+  );
   await setSql(page, `UPDATE TGFPAR SET NOMEPARC = '${NEW_NAME}' WHERE CODPARC = 1`);
   await page.keyboard.press('ControlOrMeta+Enter');
+  const plan = (await (await previewRes).json()) as { planId: string; token: string };
 
   // The server classified it as a mutation; the client asked for the preview, nothing else.
   const dialog = page.getByRole('dialog', { name: 'Prévia da alteração' });
@@ -107,38 +111,40 @@ async function previewAndRefuse(page: Page) {
   await expect(dialog.getByTestId('impact-environment')).toHaveText('PRODUCTION');
   const diff = dialog.getByTestId('mutation-diff');
   await expect(diff).toContainText(NEW_NAME);
-  // Column order: Chave, Coluna, Antes, Depois.
-  const before = (
-    (await diff
-      .locator('tbody tr')
-      .filter({ hasText: 'NOMEPARC' })
-      .locator('td')
-      .nth(2)
-      .textContent()) ?? ''
-  ).trim();
+  await expect(dialog.getByTestId('impact-rows')).toHaveText('1 registro será alterado');
+  await expect(dialog.getByTestId('production-band')).toBeVisible();
+  // The record card lists the changed field with its ANTES and DEPOIS values.
+  const field = diff.getByTestId('diff-field').filter({ hasText: 'NOMEPARC' });
+  await expect(field.getByTestId('diff-after')).toContainText(NEW_NAME);
+  const before = ((await field.getByTestId('diff-before').textContent()) ?? '').trim();
   expect(before).not.toBe('');
   expect(before).not.toBe(NEW_NAME);
   expect(calls).toEqual(['/api/query', '/api/query/preview']);
 
-  // PRODUCTION needs the typed phrase; execute stays disabled until it matches exactly.
+  // PRODUCTION needs the typed phrase. SAFE_MODE stays on in e2e, so the preview already says the
+  // write is unavailable and "Confirmar alteração" stays disabled even with the exact phrase.
   const execute = dialog.getByTestId('mutation-execute');
+  await expect(execute).toHaveText('Confirmar alteração');
   await expect(execute).toBeDisabled();
+  await expect(dialog.getByRole('note')).toContainText('SAFE_MODE ativo');
   const phrase = (await dialog.getByTestId('confirmation-phrase').textContent()) ?? '';
   expect(phrase).toMatch(/^PRODUCTION UPDATE 1 TGFPAR$/);
-  await dialog.getByTestId('confirmation-input').fill(phrase.toLowerCase());
-  await expect(execute).toBeDisabled();
   await dialog.getByTestId('confirmation-input').fill(phrase);
-  await expect(execute).toBeEnabled();
-
-  // SAFE_MODE stays on in e2e while the other write switches are on: the server refuses the
-  // PRODUCTION write, and its own message names SAFE_MODE as the switch that refused it.
-  await execute.click();
-  const refusal = dialog.getByTestId('mutation-error');
-  await expect(refusal).toContainText('READ_ONLY_MODE');
-  await expect(refusal).toContainText('somente leitura');
-  await expect(refusal).toContainText('Writes are disabled (SAFE_MODE).');
+  // Enter in the confirmation input never executes.
+  await dialog.getByTestId('confirmation-input').press('Enter');
   await expect(execute).toBeDisabled();
-  expect(calls.filter((c) => c === '/api/query/execute')).toHaveLength(1);
+  expect(calls.filter((c) => c === '/api/query/execute')).toHaveLength(0);
+
+  // The server refuses the PRODUCTION write itself, naming SAFE_MODE as the switch.
+  const refused = await call(page.request, 'POST', '/api/query/execute', {
+    planId: plan.planId,
+    token: plan.token,
+    idempotencyKey: `e2e-safe-mode-${Date.now()}`,
+    strongConfirmation: phrase,
+  });
+  const body = (await refused.json()) as { error?: { code?: string; message?: string } };
+  expect(body.error?.code).toBe('READ_ONLY_MODE');
+  expect(body.error?.message).toContain('Writes are disabled (SAFE_MODE).');
 
   await page.keyboard.press('Escape');
   await expect(dialog).toBeHidden();
