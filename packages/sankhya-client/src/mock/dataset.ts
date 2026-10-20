@@ -200,8 +200,17 @@ const BASE_DATE = new Date(Date.UTC(2025, 0, 2));
 const iso = (d: Date) =>
   `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1, 2)}-${pad(d.getUTCDate(), 2)}`;
 
-/** Creates the dictionary and demo tables in `db` and fills them deterministically from `seed`. */
-export async function seedMockDataset(db: PGlite, seed: number): Promise<void> {
+/**
+ * Creates the dictionary and demo tables in `db` and fills them deterministically from `seed`.
+ * `dictionaryPadding` adds that many TDDCAM rows of fictitious tables (`ZZPAD…`, in no other
+ * dictionary table) ahead of the demo tables' rows, so the whole dictionary can outgrow the
+ * gateway row cap the way a real one does.
+ */
+export async function seedMockDataset(
+  db: PGlite,
+  seed: number,
+  opts: { dictionaryPadding?: number } = {},
+): Promise<void> {
   const rand = createRandom(seed);
   await db.exec(DICTIONARY_DDL + MOCK_TABLES.map(ddl).join('\n') + CATALOG_DDL);
 
@@ -209,6 +218,19 @@ export async function seedMockDataset(db: PGlite, seed: number): Promise<void> {
   const tddtab: unknown[][] = [];
   const tddcam: unknown[][] = [];
   const tddins: unknown[][] = [];
+  for (let i = 0; i < (opts.dictionaryPadding ?? 0); i++) {
+    const table = `ZZPAD${pad(Math.floor(i / 10) + 1, 4)}`;
+    const position = (i % 10) + 1;
+    tddcam.push([
+      nucampo++,
+      table,
+      `CAMPO${pad(position, 2)}`,
+      'Campo fictício',
+      'S',
+      10,
+      position,
+    ]);
+  }
   for (const t of MOCK_TABLES) {
     tddtab.push([t.table, t.description]);
     tddins.push([t.entity, t.table, t.description]);

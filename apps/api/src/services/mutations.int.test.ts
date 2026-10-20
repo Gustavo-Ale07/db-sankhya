@@ -6,7 +6,7 @@ import { and, eq } from 'drizzle-orm';
 import { createDatabase, rolePermissions, roles } from '@dbx/database';
 import type { DatabaseHandle } from '@dbx/database';
 import { MOCK_CREDENTIALS, createMockSankhya } from '@dbx/sankhya-client/mock';
-import type { MockSankhya } from '@dbx/sankhya-client/mock';
+import type { MockSankhya, MockSankhyaOptions } from '@dbx/sankhya-client/mock';
 import type { Permission } from '@dbx/shared';
 import { buildApp } from '../app';
 import { loadConfig, secretValues } from '../config';
@@ -66,12 +66,12 @@ const open: Harness[] = [];
 
 async function setup(
   env: Record<string, string> = {},
-  opts: { logs?: string[] } = {},
+  opts: { logs?: string[]; mock?: MockSankhyaOptions } = {},
 ): Promise<Harness> {
   const config = loadConfig({ ...BASE_ENV, ...env });
   const database = await createDatabase(config.databaseUrl);
   await database.migrate();
-  const mock = await createMockSankhya();
+  const mock = await createMockSankhya(opts.mock);
   const logs = opts.logs;
   const app = await buildApp({
     config,
@@ -1201,22 +1201,17 @@ describe('MutationService.execute', () => {
     await h.mock.db.query('UPDATE tgfpar SET email = NULL WHERE codparc = 1');
     // A dictionary that declares EMAIL part of the key: the read gives that key a null value.
     const md = h.app.services.metadata;
-    const get = md.get.bind(md);
-    md.get = async (...args: Parameters<typeof md.get>) => {
-      const c = await get(...args);
-      return {
-        ...c,
-        tables: c.tables.map((t) =>
-          t.name.toUpperCase() === 'TGFPAR'
-            ? {
-                ...t,
-                columns: t.columns.map((col) =>
-                  col.name.toUpperCase() === 'EMAIL' ? { ...col, pk: true } : col,
-                ),
-              }
-            : t,
-        ),
-      };
+    const table = md.table.bind(md);
+    md.table = async (...args: Parameters<typeof md.table>) => {
+      const t = await table(...args);
+      return t && t.name.toUpperCase() === 'TGFPAR'
+        ? {
+            ...t,
+            columns: t.columns.map((col) =>
+              col.name.toUpperCase() === 'EMAIL' ? { ...col, pk: true } : col,
+            ),
+          }
+        : t;
     };
     await expect(prepare(h, auth, SQL)).rejects.toMatchObject({
       code: 'OPERATION_NOT_SUPPORTED',
@@ -2286,5 +2281,178 @@ describe('DATA.PREVIEW: preview without execution', () => {
     });
     expect(saves(h.mock)).toEqual([]);
     expect(writeCalls(h.mock)).toEqual([]);
+  });
+});
+
+// ------------------------------------------------------- dictionary bigger than the row cap
+
+describe('a dictionary bigger than the gateway row cap', () => {
+  /**
+   * 50 fictitious TDDCAM rows come first, then TSICID's columns, then TGFPAR's: the cap (54 rows)
+   * ends the whole-dictionary read at TGFPAR.CODPARC, so the global catalog never has NOMEPARC.
+   * Every read the preview itself makes fits under the cap.
+   */
+  const CUT = { mock: { dictionaryPadding: 50, queryRowCap: 54 } };
+  const SQL = "UPDATE TGFPAR SET NOMEPARC = 'Prévia' WHERE CODPARC = 1";
+  const previewHttp = (h: Harness, cookie: string, sql: string) =>
+    h.call(cookie, { method: 'POST', url: '/api/query/preview', payload: { sql } });
+  /** The SQL of every executeQuery call made after the first `from` calls. */
+  const readsSince = (h: Harness, from: number) =>
+    h.mock.calls
+      .slice(from)
+      .filter((c) => c.serviceName === 'DbExplorerSP.executeQuery')
+      .map((c) => String((c.requestBody as { sql?: unknown }).sql));
+  /** The precondition of every test here: the global catalog really is cut before NOMEPARC. */
+  const cutCatalog = async (h: Harness) => {
+    const catalog = await h.app.services.metadata.get(ENV_CONNECTION_ID);
+    expect(catalog.degraded).toContain('TDDCAM:truncated');
+    const par = catalog.tables.find((t) => t.name === 'TGFPAR');
+    expect(par?.columns.map((c) => c.name)).toEqual(['CODPARC']);
+  };
+
+  it('previews an UPDATE of a column the cut global catalog never saw, with a filtered read', async () => {
+    const h = await setup({}, CUT);
+    await cutCatalog(h);
+    const { cookie } = await h.userWith(WRITER);
+    const before = await partner(h.mock, 1);
+    const from = h.mock.calls.length;
+
+    const res = await previewHttp(h, cookie, SQL);
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json().preview.targets).toEqual([
+      {
+        key: { CODPARC: 1 },
+        before: { CODPARC: 1, NOMEPARC: before },
+        after: { CODPARC: 1, NOMEPARC: 'Prévia' },
+      },
+    ]);
+    // The table was read on its own; the whole dictionary was not read again.
+    const reads = readsSince(h, from);
+    expect(reads.some((sql) => sql.includes("FROM TDDCAM WHERE NOMETAB = 'TGFPAR'"))).toBe(true);
+    expect(reads.filter((sql) => /FROM TDDCAM$/.test(sql))).toEqual([]);
+    expect(writeCalls(h.mock)).toEqual([]);
+    expect(await partner(h.mock, 1)).toBe(before);
+
+    // A second preview reuses the table metadata: no dictionary read at all.
+    const again = h.mock.calls.length;
+    expect((await previewHttp(h, cookie, SQL)).statusCode).toBe(200);
+    expect(readsSince(h, again).filter((sql) => sql.includes('TDD'))).toEqual([]);
+  });
+
+  it('a column the table really does not have is still COLUMN_NOT_FOUND', async () => {
+    const h = await setup({}, CUT);
+    await cutCatalog(h);
+    const { cookie } = await h.userWith(WRITER);
+    for (const sql of [
+      "UPDATE TGFPAR SET NAOEXISTE = 'X' WHERE CODPARC = 1",
+      "UPDATE TGFPAR SET NOMEPARC = 'X' WHERE NAOEXISTE = 1",
+    ]) {
+      const res = await previewHttp(h, cookie, sql);
+      expect(res.statusCode, sql).toBe(400);
+      expect(res.json().error).toMatchObject({ code: 'COLUMN_NOT_FOUND' });
+    }
+    expect(await h.audit('PLAN_CREATED')).toHaveLength(0);
+    expect(writeCalls(h.mock)).toEqual([]);
+  });
+
+  it('a table the connection does not have is still refused as unknown', async () => {
+    const h = await setup({}, CUT);
+    const { auth } = await h.userWith(WRITER);
+    await expect(
+      prepare(h, auth, "UPDATE TGFNAOEXISTE SET NOME = 'X' WHERE CODIGO = 1"),
+    ).rejects.toMatchObject({
+      code: 'OPERATION_NOT_SUPPORTED',
+      message: expect.stringContaining('neither a known Sankhya table'),
+    });
+    expect(writeCalls(h.mock)).toEqual([]);
+  });
+
+  it('a failed metadata read refuses the preview (fail closed), never an empty table', async () => {
+    const h = await setup({}, CUT);
+    const { cookie } = await h.userWith(WRITER);
+    h.mock.inject({ type: 'malformed' }, { sqlIncludes: "FROM TDDCAM WHERE NOMETAB = 'TGFPAR'" });
+    const res = await previewHttp(h, cookie, SQL);
+    expect(res.statusCode, res.body).toBe(502);
+    expect(res.json().error.code).toBe('SANKHYA_API_ERROR');
+    expect(res.body).not.toContain('"preview"');
+    expect(await h.audit('PLAN_CREATED')).toHaveLength(0);
+    expect(writeCalls(h.mock)).toEqual([]);
+    // Nothing was kept: the next preview reads the table again and succeeds.
+    expect((await previewHttp(h, cookie, SQL)).statusCode).toBe(200);
+  });
+
+  it('a column the policy does not allow to change is still refused', async () => {
+    const h = await setup({}, CUT);
+    const { cookie } = await h.userWith(WRITER);
+    await h.policy({ name: 'no name changes', columns: ['TGFPAR.NOMEPARC'] });
+    const res = await previewHttp(h, cookie, SQL);
+    expect(res.statusCode, res.body).toBe(403);
+    expect(res.json().error.code).toBe('FORBIDDEN');
+    expect(res.body).not.toContain('"preview"');
+    expect(writeCalls(h.mock)).toEqual([]);
+  });
+
+  it('a column hidden from the caller never shows in before/after, and hiding a written one refuses', async () => {
+    const h = await setup({}, CUT);
+    const { cookie } = await h.userWith(WRITER);
+    await h.policy({
+      name: 'mail is secret',
+      actions: ['QUERY.SELECT'],
+      columns: ['TGFPAR.EMAIL'],
+    });
+    const res = await previewHttp(h, cookie, SQL);
+    expect(res.statusCode, res.body).toBe(200);
+    for (const t of res.json().preview.targets as Array<Record<string, object>>) {
+      expect(Object.keys(t.before!)).not.toContain('EMAIL');
+      expect(Object.keys(t.after!)).not.toContain('EMAIL');
+    }
+    expect(res.body).not.toContain('EMAIL');
+
+    await h.policy({
+      name: 'names are secret',
+      actions: ['QUERY.SELECT'],
+      columns: ['TGFPAR.NOMEPARC'],
+    });
+    const hidden = await previewHttp(h, cookie, SQL);
+    expect(hidden.statusCode, hidden.body).toBe(403);
+    expect(hidden.body).not.toContain('"preview"');
+    expect(writeCalls(h.mock)).toEqual([]);
+  });
+
+  it('a SELECT still runs against the cut catalog', async () => {
+    const h = await setup({}, CUT);
+    const { cookie } = await h.userWith(WRITER);
+    const res = await h.call(cookie, {
+      method: 'POST',
+      url: '/api/query',
+      payload: { sql: 'SELECT CODPARC, NOMEPARC FROM TGFPAR WHERE CODPARC = 1' },
+    });
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json().rows).toHaveLength(1);
+    expect(writeCalls(h.mock)).toEqual([]);
+  });
+
+  it('with the safe default switches the preview works and execute is READ_ONLY_MODE', async () => {
+    const h = await setup({}, CUT);
+    const { cookie } = await h.userWith(WRITER);
+    const before = await partner(h.mock, 1);
+    const planned = await previewHttp(h, cookie, SQL);
+    expect(planned.statusCode, planned.body).toBe(200);
+    const plan = planned.json() as { planId: string; token: string };
+    expect(planned.json().execution).toMatchObject({
+      available: false,
+      safeMode: true,
+      globalWriteEnabled: false,
+      writeToSankhya: false,
+    });
+    const exec = await h.call(cookie, {
+      method: 'POST',
+      url: '/api/query/execute',
+      payload: { planId: plan.planId, token: plan.token, idempotencyKey: randomUUID() },
+    });
+    expect(exec.json().error?.code, exec.body).toBe('READ_ONLY_MODE');
+    expect(saves(h.mock)).toEqual([]);
+    expect(writeCalls(h.mock)).toEqual([]);
+    expect(await partner(h.mock, 1)).toBe(before);
   });
 });

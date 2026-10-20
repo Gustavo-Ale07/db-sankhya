@@ -147,7 +147,7 @@ export interface MutationDeps {
   policies: PolicyService;
   authz: Pick<AuthzService, 'activeGroupIds' | 'grants'>;
   connections: ConnectionsService;
-  metadata: Pick<MetadataService, 'get'>;
+  metadata: Pick<MetadataService, 'table'>;
   plans: Pick<PlansService, 'create' | 'consume' | 'peek'>;
   /** The only consume path of plans that require approval. */
   approvals: Pick<ApprovalsService, 'consumeForPlan'>;
@@ -378,7 +378,7 @@ export class MutationService {
       }
     }
 
-    const catalog = await metadata.get(connectionId);
+    const catalog = await tableCatalog(metadata, connectionId, write.table);
     let capability = resolveCapability(write, { catalog, scratchTables: [] });
     if (capability.class === 'UNSUPPORTED' || capability.route !== 'SANKHYA_SAVE') {
       throw refuse(
@@ -673,7 +673,7 @@ export class MutationService {
       );
     }
 
-    const catalog = await metadata.get(connectionId);
+    const catalog = await tableCatalog(metadata, connectionId, action.entity);
     const table = catalogTable(catalog, action.entity);
     const entity = table.name.toUpperCase();
     const known = new Set(table.columns.map((c) => c.name.toUpperCase()));
@@ -1776,6 +1776,24 @@ function policySummary(d: PolicyDecision): Record<string, unknown> {
     policyVersion: d.policyVersion,
     matchedRuleIds: d.matchedRuleIds,
     limits: d.limits,
+  };
+}
+
+/**
+ * A catalog holding only the written table, with its metadata read for that table alone: a
+ * write is never authorized against the whole-dictionary catalog, which the gateway may cut at
+ * its row cap. A table the connection does not have leaves it empty; a failed read throws.
+ */
+async function tableCatalog(
+  metadata: Pick<MetadataService, 'table'>,
+  connectionId: string,
+  name: string,
+): Promise<Catalog> {
+  const table = await metadata.table(connectionId, name);
+  return {
+    tables: table ? [table] : [],
+    fetchedAt: new Date().toISOString(),
+    source: 'dictionary',
   };
 }
 

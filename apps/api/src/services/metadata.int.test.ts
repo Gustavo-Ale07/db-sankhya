@@ -6,7 +6,7 @@ import { createMockSankhya } from '@dbx/sankhya-client/mock';
 import { isAppError } from '@dbx/shared';
 import { loadConfig } from '../config';
 import { ConnectionsService } from './connections';
-import { DEGRADED_TTL_MS, METADATA_TTL_MS, MetadataService } from './metadata';
+import { DEGRADED_TTL_MS, METADATA_TTL_MS, MetadataService, TABLE_TTL_MS } from './metadata';
 
 // Fictitious credentials, used only by these tests.
 const SECRETS = {
@@ -20,7 +20,9 @@ afterEach(async () => {
   for (const fn of cleanup.splice(0).reverse()) await fn();
 });
 
-async function setup(opts: { dialect?: 'oracle' | 'mssql'; queryRowCap?: number } = {}) {
+async function setup(
+  opts: { dialect?: 'oracle' | 'mssql'; queryRowCap?: number; dictionaryPadding?: number } = {},
+) {
   const config = loadConfig({
     NODE_ENV: 'test',
     DATABASE_URL: 'pglite:memory',
@@ -34,6 +36,7 @@ async function setup(opts: { dialect?: 'oracle' | 'mssql'; queryRowCap?: number 
     seed: 7,
     ...SECRETS,
     ...(opts.queryRowCap ? { queryRowCap: opts.queryRowCap } : {}),
+    ...(opts.dictionaryPadding ? { dictionaryPadding: opts.dictionaryPadding } : {}),
   });
   const conns = new ConnectionsService(database.db, config, {
     resolve: () => Promise.resolve(['203.0.113.10']),
@@ -54,6 +57,7 @@ async function setup(opts: { dialect?: 'oracle' | 'mssql'; queryRowCap?: number 
   return {
     database,
     mock,
+    conns,
     conn,
     service,
     advance: (ms: number) => (clock += ms),
@@ -62,6 +66,19 @@ async function setup(opts: { dialect?: 'oracle' | 'mssql'; queryRowCap?: number 
 
 const queries = (mock: { calls: Array<{ serviceName: string }> }) =>
   mock.calls.filter((c) => c.serviceName === 'DbExplorerSP.executeQuery').length;
+
+/** The SQL of every executeQuery call, in order. */
+const sqls = (mock: { calls: Array<{ serviceName: string; requestBody?: unknown }> }) =>
+  mock.calls
+    .filter((c) => c.serviceName === 'DbExplorerSP.executeQuery')
+    .map((c) => String((c.requestBody as { sql?: unknown } | undefined)?.sql ?? ''));
+
+/**
+ * A demo dictionary bigger than the gateway row cap, like a real one: 50 fictitious TDDCAM rows
+ * come first, then TSICID's 3 columns, then TGFPAR's. The cap (54 rows) ends the whole-dictionary
+ * read at TGFPAR.CODPARC, so it never sees TGFPAR.NOMEPARC. Every filtered read fits.
+ */
+const CUT_DICTIONARY = { dictionaryPadding: 50, queryRowCap: 54 };
 
 describe('MetadataService', () => {
   it('builds the catalog from the dictionary with primary keys and entities', async () => {
@@ -250,5 +267,141 @@ describe('MetadataService', () => {
     expect(await database.db.select().from(metadataCache)).toHaveLength(1);
     await database.db.delete(connections).where(eq(connections.id, conn.id));
     expect(await database.db.select().from(metadataCache)).toHaveLength(0);
+  });
+});
+
+describe('MetadataService.table (one table, read on demand)', () => {
+  it('finds a column the cut whole-dictionary read never saw (TGFPAR.NOMEPARC regression)', async () => {
+    const { service, conn, mock } = await setup(CUT_DICTIONARY);
+    const svc = service();
+    // The precondition: the global catalog is cut before NOMEPARC.
+    const catalog = await svc.get(conn.id);
+    expect(catalog.degraded).toContain('TDDCAM:truncated');
+    const global = catalog.tables.find((t) => t.name === 'TGFPAR');
+    expect(global?.columns.map((c) => c.name)).toEqual(['CODPARC']);
+
+    const before = sqls(mock).length;
+    const par = await svc.table(conn.id, 'tgfpar');
+    expect(par).toMatchObject({ name: 'TGFPAR', entityName: 'Parceiro' });
+    expect(par?.description).toBe('Parceiros (demo)');
+    expect(par?.columns.find((c) => c.name === 'CODPARC')).toMatchObject({
+      type: 'integer',
+      pk: true,
+    });
+    expect(par?.columns.find((c) => c.name === 'NOMEPARC')).toMatchObject({
+      type: 'string',
+      pk: false,
+    });
+    expect(par?.columns.some((c) => c.name.startsWith('CAMPO'))).toBe(false);
+    // Every read was filtered by the table; none read the whole dictionary again.
+    const reads = sqls(mock).slice(before);
+    expect(reads).toHaveLength(4);
+    for (const sql of reads) expect(sql).toContain("= 'TGFPAR'");
+  });
+
+  it('serves a second lookup from memory and reads again after the TTL', async () => {
+    const { service, conn, mock, advance } = await setup();
+    const svc = service();
+    const first = await svc.table(conn.id, 'TGFPAR');
+    const before = queries(mock);
+    expect(await svc.table(conn.id, 'TGFPAR')).toBe(first);
+    expect(queries(mock)).toBe(before);
+    advance(TABLE_TTL_MS);
+    expect(await svc.table(conn.id, 'TGFPAR')).toEqual(first);
+    expect(queries(mock)).toBe(before + 4);
+  });
+
+  it('drops the tables of a connection on invalidate and on a refreshed get', async () => {
+    const { service, conn, mock } = await setup();
+    const svc = service();
+    await svc.table(conn.id, 'TGFPAR');
+    let before = queries(mock);
+    await svc.invalidate(conn.id);
+    await svc.table(conn.id, 'TGFPAR');
+    expect(queries(mock)).toBe(before + 4);
+    await svc.get(conn.id, { refresh: true });
+    before = queries(mock);
+    await svc.table(conn.id, 'TGFPAR');
+    expect(queries(mock)).toBe(before + 4);
+  });
+
+  it('answers undefined for a table the connection does not have, reading only TDDTAB', async () => {
+    const { service, conn, mock } = await setup();
+    const before = queries(mock);
+    expect(await service().table(conn.id, 'TGFNAOEXISTE')).toBeUndefined();
+    expect(queries(mock)).toBe(before + 1);
+  });
+
+  it('never sends a name that is not a plain identifier to the gateway', async () => {
+    const { service, conn, mock } = await setup();
+    const svc = service();
+    const names = ["TGFPAR' OR '1'='1", 'TGFPAR--', 'SANKHYA.TGFPAR', '', 'TGF PAR', '1TGFPAR'];
+    for (const name of names) expect(await svc.table(conn.id, name), name).toBeUndefined();
+    expect(queries(mock)).toBe(0);
+  });
+
+  it.each(['FROM TDDTAB', 'FROM TDDCAM', 'FROM TDDINS', 'ALL_CONSTRAINTS'])(
+    'fails closed when the %s read fails, and caches nothing',
+    async (sqlIncludes) => {
+      const { service, conn, mock } = await setup();
+      const svc = service();
+      mock.inject({ type: 'malformed' }, { sqlIncludes });
+      const err = await svc.table(conn.id, 'TGFPAR').then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+      expect(err).toMatchObject({ code: 'SANKHYA_API_ERROR', details: { table: 'TGFPAR' } });
+      // The failure is not kept: the next lookup reads again and gets the whole table.
+      const par = await svc.table(conn.id, 'TGFPAR');
+      expect(par?.columns.map((c) => c.name)).toContain('NOMEPARC');
+    },
+  );
+
+  it('fails closed when a filtered read is cut at the row cap, instead of answering fewer columns', async () => {
+    const { service, conn } = await setup({ queryRowCap: 3 });
+    const err = await service()
+      .table(conn.id, 'TGFPAR')
+      .then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+    expect(err).toMatchObject({
+      code: 'SANKHYA_API_ERROR',
+      details: { table: 'TGFPAR', read: 'TDDCAM:truncated' },
+    });
+  });
+
+  it('reads the primary key filtered by the table on SQL Server too', async () => {
+    const { service, conn, mock } = await setup({ dialect: 'mssql' });
+    const par = await service().table(conn.id, 'TGFPAR');
+    expect(par?.columns.filter((c) => c.pk).map((c) => c.name)).toEqual(['CODPARC']);
+    expect(sqls(mock).at(-1)).toContain("UPPER(tc.TABLE_NAME) = 'TGFPAR'");
+  });
+
+  it('never mixes the tables of two connections', async () => {
+    const a = await setup();
+    const b = await setup();
+    // Connection B's dictionary has a column A's does not.
+    await b.mock.db.query(
+      "INSERT INTO TDDCAM (NUCAMPO, NOMETAB, NOMECAMPO, DESCRCAMPO, TIPCAMPO) VALUES (9001, 'TGFPAR', 'SOEMB', 'Só em B', 'S')",
+    );
+    const owners = new Map([
+      [a.conn.id, a.conns],
+      [b.conn.id, b.conns],
+    ]);
+    const svc = new MetadataService(a.database.db, {
+      getRuntime: (id) => owners.get(id)!.getRuntime(id),
+    });
+    const names = async (id: string) =>
+      (await svc.table(id, 'TGFPAR'))?.columns.map((c) => c.name) ?? [];
+    expect(await names(b.conn.id)).toContain('SOEMB');
+    expect(await names(a.conn.id)).not.toContain('SOEMB');
+    // Both are cached now, and each still answers its own; invalidating A keeps B's.
+    expect(await names(b.conn.id)).toContain('SOEMB');
+    expect(await names(a.conn.id)).not.toContain('SOEMB');
+    await svc.invalidate(a.conn.id);
+    const before = queries(b.mock);
+    expect(await names(b.conn.id)).toContain('SOEMB');
+    expect(queries(b.mock)).toBe(before);
   });
 });

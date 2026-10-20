@@ -67,6 +67,8 @@ export interface MockSankhyaOptions {
   pageSize?: number;
   /** Row cap of executeQuery; larger results are cut and flagged with `burstLimit`. */
   queryRowCap?: number;
+  /** Fictitious TDDCAM rows ahead of the demo tables' rows (see seedMockDataset). */
+  dictionaryPadding?: number;
   now?: () => number;
 }
 
@@ -140,7 +142,7 @@ export async function createMockSankhya(opts: MockSankhyaOptions = {}): Promise<
   const pageSize = opts.pageSize ?? 50;
   const rowCap = opts.queryRowCap ?? 1000;
   const db = new PGlite();
-  await seedMockDataset(db, opts.seed ?? 42);
+  await seedMockDataset(db, opts.seed ?? 42, { dictionaryPadding: opts.dictionaryPadding ?? 0 });
 
   const tokens = new Map<string, number>();
   const faults: Array<MockFault & MockFaultTarget> = [...(opts.faults?.queue ?? [])];
