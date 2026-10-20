@@ -8,12 +8,14 @@ import type { Theme } from '../app/theme';
 import { useSession } from '../app/session';
 import { setCompletionSchema } from '../editor/monaco';
 import { ErrorBox } from '../components/ErrorBox';
+import { Icon } from '../components/Icon';
 import { Modal } from '../components/Modal';
 import { MutationDialog } from './MutationDialog';
 import { dropPlan, getPendingPlan, rememberPlan, updatePlan, usePendingPlan } from './pendingPlans';
 import type { PendingPlan } from './pendingPlans';
 import { ResultsPanel } from './ResultsPanel';
 import type { ResultTab } from './ResultsPanel';
+import { SavedQueryPicker } from './SavedQueryPicker';
 import { SchemaTree } from './SchemaTree';
 import { SqlEditor } from './SqlEditor';
 import type { EditorApi } from './SqlEditor';
@@ -54,6 +56,34 @@ interface Props {
   connectionReady?: boolean;
 }
 
+const SCHEMA_WIDTH_KEY = 'dbx.schemaWidth';
+export const SCHEMA_WIDTH_MIN = 180;
+export const SCHEMA_WIDTH_MAX = 480;
+const SCHEMA_WIDTH_DEFAULT = 256;
+const SCHEMA_WIDTH_STEP = 16;
+
+const clampSchemaWidth = (n: number) =>
+  Math.round(Math.max(SCHEMA_WIDTH_MIN, Math.min(SCHEMA_WIDTH_MAX, n)));
+
+/** Width of the schema panel: a per-browser layout preference, never anything sensitive. */
+function loadSchemaWidth(): number {
+  try {
+    const n = Number(localStorage.getItem(SCHEMA_WIDTH_KEY));
+    if (Number.isFinite(n) && n > 0) return clampSchemaWidth(n);
+  } catch {
+    // Storage unavailable: the default width.
+  }
+  return SCHEMA_WIDTH_DEFAULT;
+}
+
+function saveSchemaWidth(n: number): void {
+  try {
+    localStorage.setItem(SCHEMA_WIDTH_KEY, String(n));
+  } catch {
+    // Storage unavailable: the width just won't survive a reload.
+  }
+}
+
 export function ExplorerPage({
   theme,
   openRequest,
@@ -69,6 +99,8 @@ export function ExplorerPage({
   const [runs, setRuns] = useState<Record<string, RunState>>({});
   const [resultTab, setResultTab] = useState<Record<string, ResultTab>>({});
   const [showSchema, setShowSchema] = useState(true);
+  const [schemaWidth, setSchemaWidth] = useState(loadSchemaWidth);
+  const [pickerOpen, setPickerOpen] = useState(false);
   const [saveDialog, setSaveDialog] = useState<{ name: string; description: string } | null>(null);
   const [saveError, setSaveError] = useState<unknown>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -99,6 +131,7 @@ export function ExplorerPage({
   const run: RunState = runs[tab.id] ?? { status: 'idle' };
 
   useEffect(() => saveTabs(user.id, tabs, tab.id), [user.id, tabs, tab.id]);
+  useEffect(() => saveSchemaWidth(schemaWidth), [schemaWidth]);
 
   const flash = useCallback((msg: string) => {
     setNotice(msg);
@@ -328,6 +361,41 @@ export function ExplorerPage({
     }
   }
 
+  /** A saved query from the picker: a new tab, or the tab that already holds it (left as is). */
+  function openSaved(q: SavedQuery) {
+    setPickerOpen(false);
+    const existing = tabs.find((t) => t.savedId === q.id);
+    if (existing) setActiveId(existing.id);
+    else addTab({ sql: q.sql, title: q.name, savedId: q.id });
+  }
+
+  function startSchemaDrag(e: React.PointerEvent) {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = schemaWidth;
+    const move = (ev: PointerEvent) =>
+      setSchemaWidth(clampSchemaWidth(startWidth + ev.clientX - startX));
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  }
+
+  function schemaResizeKey(e: React.KeyboardEvent) {
+    const steps: Record<string, number> = {
+      ArrowLeft: schemaWidth - SCHEMA_WIDTH_STEP,
+      ArrowRight: schemaWidth + SCHEMA_WIDTH_STEP,
+      Home: SCHEMA_WIDTH_MIN,
+      End: SCHEMA_WIDTH_MAX,
+    };
+    const next = steps[e.key];
+    if (next === undefined) return;
+    e.preventDefault();
+    setSchemaWidth(clampSchemaWidth(next));
+  }
+
   function startSplitDrag(e: React.PointerEvent) {
     e.preventDefault();
     const box = splitRef.current?.getBoundingClientRect();
@@ -344,127 +412,181 @@ export function ExplorerPage({
     window.addEventListener('pointerup', up);
   }
 
+  const labelCls = 'max-lg:sr-only';
   return (
-    <div className="flex h-full min-h-0">
-      {showSchema && (
-        <aside className="w-64 shrink-0 border-r border-line bg-panel" aria-label="Schema">
-          <SchemaTree
-            tables={schema.data?.catalog.tables}
-            loading={schema.isPending && connectionReady}
-            onSelectQuery={openTableQuery}
-            onInsertText={(text) => editorApi.current?.insertText(text)}
-          />
-          {schema.isError && <ErrorBox error={schema.error} className="m-2" />}
-        </aside>
-      )}
-
-      <div className="flex min-w-0 flex-1 flex-col" ref={splitRef}>
-        {/* Editor tabs */}
-        <div
-          className="flex items-end gap-0.5 overflow-x-auto border-b border-line bg-panel2 px-1 pt-1"
-          role="tablist"
-          aria-label="Abas do editor"
+    <div className="flex h-full min-h-0 flex-col">
+      {/* Toolbar */}
+      <div className="flex flex-wrap items-center gap-0.5 border-b border-line bg-panel px-1.5 py-0.5">
+        <button
+          type="button"
+          className="tbtn px-1"
+          onClick={() => setShowSchema((s) => !s)}
+          aria-pressed={showSchema}
+          aria-label="Painel de tabelas"
+          title="Mostrar/ocultar o painel de tabelas"
         >
-          {tabs.map((t) => (
-            <div
-              key={t.id}
-              className={`group flex items-center rounded-t border border-b-0 text-xs ${
-                t.id === tab.id
-                  ? 'border-line bg-panel font-semibold'
-                  : 'border-transparent text-muted hover:bg-hover'
-              }`}
+          <Icon name="sidebar" />
+        </button>
+        <span className="mx-1 h-4 w-px bg-line" aria-hidden />
+        <button
+          type="button"
+          className="tbtn tbtn-primary"
+          onClick={runCurrent}
+          disabled={run.status === 'running' || run.status === 'previewing' || !connectionId}
+          title={
+            connectionId
+              ? 'Executar (Ctrl+Enter / F5). SELECT executa direto; alterações só após prévia e confirmação.'
+              : 'Selecione uma conexão para executar (ambiente indisponível)'
+          }
+          data-testid="run-query"
+        >
+          <Icon name="play" size={12} />
+          <span>Executar</span>
+        </button>
+        <button
+          type="button"
+          className="tbtn"
+          onClick={() => void cancel()}
+          disabled={run.status !== 'running'}
+          aria-label="Cancelar execução"
+          title="Cancelar a consulta em execução"
+        >
+          <Icon name="stop" size={12} className="text-danger" />
+          <span className={labelCls}>Cancelar</span>
+        </button>
+        <span className="mx-1 h-4 w-px bg-line" aria-hidden />
+        <button
+          type="button"
+          className="tbtn"
+          onClick={() => addTab()}
+          title="Nova consulta em nova aba"
+        >
+          <Icon name="plus" />
+          <span className={labelCls}>Nova consulta</span>
+        </button>
+        <button type="button" className="tbtn" onClick={save} title="Salvar consulta (Ctrl+S)">
+          <Icon name="save" />
+          <span className={labelCls}>Salvar</span>
+        </button>
+        <button
+          type="button"
+          className="tbtn"
+          onClick={() => setPickerOpen(true)}
+          aria-haspopup="dialog"
+          title="Abrir uma consulta salva em nova aba"
+        >
+          <Icon name="folder" />
+          <span className={labelCls}>Consultas salvas</span>
+        </button>
+        <span className="ml-2 min-w-0 truncate text-[11px] text-muted max-md:hidden">
+          SELECT executa direto · alterações só após prévia e confirmação
+        </span>
+        {notice && (
+          <span role="status" className="ml-2 text-[11px] text-ok">
+            {notice}
+          </span>
+        )}
+        <span
+          className="ml-auto truncate pl-2 text-[11px] text-muted max-xl:hidden"
+          title="Ctrl+Enter/F5 executa a instrução sob o cursor (ou a seleção) · Ctrl+Space sugere tabelas e colunas · Ctrl+S salva"
+        >
+          Ctrl+Enter executa · Ctrl+Space sugere · Ctrl+S salva
+        </span>
+      </div>
+
+      <div className="flex min-h-0 flex-1">
+        {showSchema && (
+          <>
+            <aside
+              className="max-w-[50vw] shrink-0 overflow-hidden bg-panel"
+              style={{ width: schemaWidth }}
+              aria-label="Schema"
+              data-testid="schema-panel"
             >
-              <button
-                type="button"
-                role="tab"
-                aria-selected={t.id === tab.id}
-                className="max-w-48 truncate py-1 pr-1 pl-2.5"
-                onClick={() => setActiveId(t.id)}
-                onDoubleClick={() => {
-                  const name = window.prompt('Nome da aba', t.title);
-                  if (name?.trim()) updateTab(t.id, { title: name.trim().slice(0, 120) });
-                }}
-                title={t.title}
-              >
-                {t.dirty ? '● ' : ''}
-                {t.title}
-              </button>
-              <button
-                type="button"
-                className="mr-1 rounded px-1 text-muted opacity-60 hover:bg-hover hover:opacity-100"
-                onClick={() => closeTab(t.id)}
-                aria-label={`Fechar aba ${t.title}`}
-              >
-                ×
-              </button>
-            </div>
-          ))}
-          <button
-            type="button"
-            className="mb-0.5 rounded px-2 py-0.5 text-sm text-muted hover:bg-hover"
-            onClick={() => addTab()}
-            aria-label="Nova aba"
-            title="Nova aba"
-          >
-            +
-          </button>
-        </div>
+              <div className="flex h-full min-h-0 flex-col">
+                <div className="min-h-0 flex-1">
+                  <SchemaTree
+                    tables={schema.data?.catalog.tables}
+                    loading={schema.isPending && connectionReady}
+                    onSelectQuery={openTableQuery}
+                    onInsertText={(text) => editorApi.current?.insertText(text)}
+                  />
+                </div>
+                {schema.isError && <ErrorBox error={schema.error} className="m-2" />}
+              </div>
+            </aside>
+            <div
+              className="w-1 shrink-0 cursor-col-resize border-x border-line bg-panel2 hover:bg-accent/30 focus-visible:bg-accent/30"
+              onPointerDown={startSchemaDrag}
+              onKeyDown={schemaResizeKey}
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Redimensionar painel de tabelas"
+              aria-valuemin={SCHEMA_WIDTH_MIN}
+              aria-valuemax={SCHEMA_WIDTH_MAX}
+              aria-valuenow={schemaWidth}
+              tabIndex={0}
+              data-testid="schema-resizer"
+            />
+          </>
+        )}
 
-        {/* Toolbar */}
-        <div className="flex flex-wrap items-center gap-1 border-b border-line bg-panel px-2 py-1">
-          <button
-            type="button"
-            className="btn"
-            onClick={() => setShowSchema((s) => !s)}
-            aria-pressed={showSchema}
-            title="Mostrar/ocultar schema"
+        <div className="flex min-w-0 flex-1 flex-col">
+          {/* Editor tabs */}
+          <div
+            className="flex items-end gap-px overflow-x-auto border-b border-line bg-panel2 px-1 pt-0.5"
+            role="tablist"
+            aria-label="Abas do editor"
           >
-            ☰
-          </button>
-          <button
-            type="button"
-            className="btn btn-primary"
-            onClick={runCurrent}
-            disabled={run.status === 'running' || run.status === 'previewing' || !connectionId}
-            title={
-              connectionId
-                ? 'Executar (Ctrl+Enter / F5)'
-                : 'Selecione uma conexão para executar (ambiente indisponível)'
-            }
-            data-testid="run-query"
-          >
-            ▶ Executar
-          </button>
-          <button
-            type="button"
-            className="btn"
-            onClick={() => void cancel()}
-            disabled={run.status !== 'running'}
-            title="Cancelar consulta em execução"
-          >
-            ■ Cancelar
-          </button>
-          <button type="button" className="btn" onClick={save} title="Salvar consulta (Ctrl+S)">
-            Salvar
-          </button>
-          <span className="ml-2 text-[11px] text-muted">
-            SELECT executa direto · alterações só após prévia e confirmação
-          </span>
-          {notice && (
-            <span role="status" className="ml-2 text-[11px] text-ok">
-              {notice}
-            </span>
-          )}
-          <span
-            className="ml-auto truncate text-[11px] text-muted"
-            title="Ctrl+Enter/F5 executa a instrução sob o cursor (ou a seleção) · Ctrl+Space sugere tabelas e colunas · Ctrl+S salva"
-          >
-            Ctrl+Enter executa · Ctrl+Space sugere · Ctrl+S salva
-          </span>
-        </div>
+            {tabs.map((t) => (
+              <div
+                key={t.id}
+                className={`group flex shrink-0 items-center rounded-t-sm border border-b-0 text-xs ${
+                  t.id === tab.id
+                    ? 'border-line bg-panel font-semibold text-fg shadow-[inset_0_2px_0_var(--dbx-accent)]'
+                    : 'border-transparent text-muted hover:bg-hover hover:text-fg'
+                }`}
+              >
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={t.id === tab.id}
+                  className="max-w-48 truncate py-0.5 pr-1 pl-2"
+                  onClick={() => setActiveId(t.id)}
+                  onDoubleClick={() => {
+                    const name = window.prompt('Nome da aba', t.title);
+                    if (name?.trim()) updateTab(t.id, { title: name.trim().slice(0, 120) });
+                  }}
+                  title={t.title}
+                >
+                  {t.dirty ? '● ' : ''}
+                  {t.title}
+                </button>
+                <button
+                  type="button"
+                  className={`mr-0.5 rounded p-0.5 text-muted hover:bg-hover hover:text-fg ${
+                    t.id === tab.id ? 'opacity-80' : 'opacity-50 group-hover:opacity-100'
+                  }`}
+                  onClick={() => closeTab(t.id)}
+                  aria-label={`Fechar aba ${t.title}`}
+                  title="Fechar aba"
+                >
+                  <Icon name="close" size={11} />
+                </button>
+              </div>
+            ))}
+            <button
+              type="button"
+              className="mb-0.5 ml-0.5 rounded p-1 text-muted hover:bg-hover hover:text-fg"
+              onClick={() => addTab()}
+              aria-label="Nova aba"
+              title="Nova aba"
+            >
+              <Icon name="plus" size={12} />
+            </button>
+          </div>
 
-        <div className="flex min-h-0 flex-1">
-          <div className="flex min-w-0 flex-1 flex-col">
+          <div className="flex min-h-0 flex-1 flex-col" ref={splitRef}>
             <div
               style={{ height: `${editorHeight}%` }}
               className="min-h-0"
@@ -484,7 +606,7 @@ export function ExplorerPage({
               )}
             </div>
             <div
-              className="h-1.5 shrink-0 cursor-row-resize border-y border-line bg-panel2 hover:bg-accent/30"
+              className="h-1 shrink-0 cursor-row-resize border-y border-line bg-panel2 hover:bg-accent/30"
               onPointerDown={startSplitDrag}
               role="separator"
               aria-orientation="horizontal"
@@ -501,6 +623,8 @@ export function ExplorerPage({
           </div>
         </div>
       </div>
+
+      <SavedQueryPicker open={pickerOpen} onClose={() => setPickerOpen(false)} onPick={openSaved} />
 
       {mutation && (
         <MutationDialog
