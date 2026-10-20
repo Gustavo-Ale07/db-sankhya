@@ -80,6 +80,7 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
     connections,
     metadata,
     audit,
+    scratch: app.services.scratch,
     plans: new PlansService(app.services.database.db, {
       secret: config.session.secret,
       ttlSeconds: config.planTtlSeconds,

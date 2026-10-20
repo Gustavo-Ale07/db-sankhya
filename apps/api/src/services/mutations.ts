@@ -24,11 +24,19 @@ import type { PlansService } from './plans';
 import { strongConfirmationPhrase } from './plans';
 import type { PolicyService } from './policy';
 import { executeRead } from './read-executor';
-import { authorizeConnection, connectionDenied, evaluateFor, readTargets } from './read-policy';
+import {
+  SCRATCH_CONNECTION_ID,
+  SCRATCH_ENVIRONMENT,
+  authorizeConnection,
+  connectionDenied,
+  evaluateFor,
+  readTargets,
+} from './read-policy';
+import type { ScratchManager } from './scratch';
+import { analyzeScratchSql } from './scratch-guard';
 import type { AuditService } from './records';
 
-export type PreviewKind =
-  'SIMULATED_PREVIEW' | 'IMPACT_ANALYSIS+SIMULATED_PREVIEW' | 'TRANSACTIONAL_DRY_RUN';
+export type PreviewKind = 'SIMULATED_PREVIEW' | 'IMPACT_ANALYSIS' | 'TRANSACTIONAL_DRY_RUN';
 
 export type RecordValues = Record<string, Value>;
 
@@ -43,8 +51,10 @@ export interface PreparedMutation {
   token: string;
   expiresAt: string;
   capability: Capability;
-  /** UPDATE carries both labels: IMPACT_ANALYSIS (real before values) + SIMULATED_PREVIEW. */
+  /** The primary label, always one exact value. */
   previewKind: PreviewKind;
+  /** Every label that applies: a Sankhya UPDATE is IMPACT_ANALYSIS (real before) + SIMULATED_PREVIEW. */
+  previewLabels: PreviewKind[];
   preview: { targets: PreviewTarget[]; affected: number };
   impact: { entities: string[]; rows: number; environment: Environment };
   requires: { strongConfirmation: string | null; approval: boolean };
@@ -64,6 +74,7 @@ export interface MutationDeps {
   connections: ConnectionsService;
   metadata: Pick<MetadataService, 'get'>;
   plans: Pick<PlansService, 'create'>;
+  scratch: Pick<ScratchManager, 'workspace'>;
   audit: AuditService;
   /** SANKHYA_MAX_ROWS: ceiling of the before-snapshot read. */
   maxReadRows: number;
@@ -77,6 +88,7 @@ const PERMISSION: Record<WriteClassified['kind'], Permission> = {
   DELETE: 'DATA.DELETE',
 };
 
+const SCRATCH_TABLE = /^tmp_/i;
 const IDENT = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 
 /** A refusal with the stage that produced it and audit-only details (never sent to the user). */
@@ -144,6 +156,12 @@ export class MutationService {
             ),
           );
         }
+      }
+
+      // A write to a scratch table never touches Sankhya: it gets a transactional dry run.
+      if (SCRATCH_TABLE.test(write.table)) {
+        environment = SCRATCH_ENVIRONMENT;
+        return await this.prepareScratch(ctx, write);
       }
 
       // ---------------------------------------------------------------- AUTHORIZE
@@ -215,16 +233,19 @@ export class MutationService {
       const maxWriteRows = decision.limits.maxWriteRows;
       let targets: PreviewTarget[];
       let previewKind: PreviewKind;
+      let previewLabels: PreviewKind[];
       if (stmt.type === 'insert') {
         targets = [insertTarget(stmt, table)];
         previewKind = 'SIMULATED_PREVIEW';
+        previewLabels = ['SIMULATED_PREVIEW'];
       } else {
         targets = await this.updateTargets(ctx, stmt, table, catalog, {
           groupIds,
           environment,
           maxWriteRows,
         });
-        previewKind = 'IMPACT_ANALYSIS+SIMULATED_PREVIEW';
+        previewKind = 'IMPACT_ANALYSIS';
+        previewLabels = ['IMPACT_ANALYSIS', 'SIMULATED_PREVIEW'];
       }
       if (targets.length > maxWriteRows) {
         throw refuse(
@@ -237,66 +258,198 @@ export class MutationService {
         );
       }
 
-      // ---------------------------------------------------------------- IMPACT
-      const affected = targets.length;
-      const entity = table.name.toUpperCase();
-      const preview = { targets, affected };
-      const created = await this.deps.plans.create({
-        userId: auth.user.id,
-        sessionId: auth.session.id,
-        connectionId: ctx.connectionId,
+      return await this.finishPlan(ctx, {
+        write,
+        permission,
         environment,
-        sql,
-        params: null,
+        connectionId: ctx.connectionId,
         capability,
         decision,
         targets,
-        preview,
+        entity: table.name.toUpperCase(),
         previewKind,
-        summary: { action: write.kind, count: affected, entity },
+        previewLabels,
       });
-      const needsPhrase = decision.limits.requireStrongConfirmation || environment === 'PRODUCTION';
-      const prepared: PreparedMutation = {
-        planId: created.id,
-        token: created.token,
-        expiresAt: created.expiresAt.toISOString(),
-        capability,
-        previewKind,
-        preview,
-        impact: { entities: [entity], rows: affected, environment },
-        requires: {
-          strongConfirmation: needsPhrase
-            ? strongConfirmationPhrase(environment, write.kind, affected, entity)
-            : null,
-          approval: decision.limits.requireApproval,
-        },
-      };
-      await this.deps.audit.recordPlanCreated(
-        {
-          userId: auth.user.id,
-          userEmail: auth.user.email,
-          ip: ctx.meta?.ip ?? null,
-          requestId: ctx.meta?.requestId ?? null,
-          connectionId: ctx.connectionId,
-          environment,
-          planId: created.id,
-          planHash: created.planHash,
-          capability: permission,
-        },
-        {
-          statement: sql,
-          policyDecision: policySummary(decision),
-          details: { operation: write.kind, resource: entity, affected, previewKind },
-          before: targets.flatMap((t) => (t.before ? [t.before] : [])),
-          after: targets.map((t) => t.after),
-        },
-      );
-      return prepared;
     } catch (err) {
       await this.auditRefusal(ctx, classified, environment, err);
       if (err instanceof Refusal) throw new AppError(err.code, err.message, err.details);
       throw err;
     }
+  }
+
+  /** IMPACT: persists the immutable plan, audits it and shapes the response. */
+  private async finishPlan(
+    ctx: PrepareContext,
+    o: {
+      write: WriteClassified;
+      permission: Permission;
+      environment: Environment;
+      connectionId: string;
+      capability: Capability;
+      decision: PolicyDecision;
+      targets: PreviewTarget[];
+      entity: string;
+      previewKind: PreviewKind;
+      previewLabels: PreviewKind[];
+    },
+  ): Promise<PreparedMutation> {
+    const { auth, sql } = ctx;
+    const { write, permission, environment, capability, decision, targets, entity } = o;
+    const { previewKind, previewLabels } = o;
+    const affected = targets.length;
+    const preview = { targets, affected };
+    const created = await this.deps.plans.create({
+      userId: auth.user.id,
+      sessionId: auth.session.id,
+      connectionId: o.connectionId,
+      environment,
+      sql,
+      params: null,
+      capability,
+      decision,
+      targets,
+      preview,
+      previewKind,
+      summary: { action: write.kind, count: affected, entity },
+    });
+    const needsPhrase = decision.limits.requireStrongConfirmation || environment === 'PRODUCTION';
+    const prepared: PreparedMutation = {
+      planId: created.id,
+      token: created.token,
+      expiresAt: created.expiresAt.toISOString(),
+      capability,
+      previewKind,
+      previewLabels,
+      preview,
+      impact: { entities: [entity], rows: affected, environment },
+      requires: {
+        strongConfirmation: needsPhrase
+          ? strongConfirmationPhrase(environment, write.kind, affected, entity)
+          : null,
+        approval: decision.limits.requireApproval,
+      },
+    };
+    await this.deps.audit.recordPlanCreated(
+      {
+        userId: auth.user.id,
+        userEmail: auth.user.email,
+        ip: ctx.meta?.ip ?? null,
+        requestId: ctx.meta?.requestId ?? null,
+        connectionId: o.connectionId,
+        environment,
+        planId: created.id,
+        planHash: created.planHash,
+        capability: permission,
+      },
+      {
+        statement: sql,
+        policyDecision: policySummary(decision),
+        details: { operation: write.kind, resource: entity, affected, previewKind, previewLabels },
+        before: targets.flatMap((t) => (t.before ? [t.before] : [])),
+        after: targets.map((t) => t.after),
+      },
+    );
+    return prepared;
+  }
+
+  /**
+   * Scratch preview: the statement runs inside a transaction of the caller's own workspace and is
+   * rolled back (TRANSACTIONAL_DRY_RUN). Policy is evaluated first, exactly as for a real write.
+   */
+  private async prepareScratch(
+    ctx: PrepareContext,
+    write: WriteClassified,
+  ): Promise<PreparedMutation> {
+    const { auth, sql } = ctx;
+    const permission: Permission = 'TEMP.WRITE';
+    if (!auth.grants.permissions.has(permission)) {
+      throw refuse(
+        'AUTHORIZE',
+        new AppError('FORBIDDEN', 'You do not have permission for this action', { permission }),
+      );
+    }
+    const workspace = await this.deps.scratch.workspace(auth.user.id);
+    const names = (await workspace.tables()).map((t) => t.name);
+    const capability = resolveCapability(write, { catalog: { tables: [] }, scratchTables: names });
+    if (capability.class === 'UNSUPPORTED' || capability.route !== 'SCRATCH') {
+      throw refuse(
+        'AUTHORIZE',
+        new AppError('OPERATION_NOT_SUPPORTED', capability.reason, {
+          capability: capability.class,
+        }),
+      );
+    }
+    if (capability.blocked) {
+      throw refuse('VALIDATE', new AppError('WHERE_REQUIRED', capability.blocked.reason));
+    }
+    let stmt;
+    try {
+      stmt = analyzeScratchSql(sql);
+    } catch (err) {
+      throw refuse(
+        'VALIDATE',
+        isAppError(err) ? new AppError(err.code, err.message, err.details) : notSimulable(),
+      );
+    }
+    if (stmt.target === null || !stmt.mutating || stmt.action !== 'TEMP.WRITE') {
+      throw refuse(
+        'VALIDATE',
+        new AppError('OPERATION_NOT_SUPPORTED', 'Only INSERT, UPDATE and DELETE can be previewed.'),
+      );
+    }
+    const entity = stmt.target.toUpperCase();
+    const groupIds = await this.deps.authz.activeGroupIds(auth.user.id);
+    const decision = await evaluateFor({
+      policies: this.deps.policies,
+      auth,
+      groupIds,
+      action: 'TEMP.WRITE',
+      environment: SCRATCH_ENVIRONMENT,
+      connectionId: SCRATCH_CONNECTION_ID,
+      entities: [...new Set([...stmt.tables, stmt.target])],
+      hasWhere: write.hasWhere,
+    });
+    if (decision.effect !== 'ALLOW') {
+      throw refuse('AUTHORIZE', new AppError('FORBIDDEN', 'The change was denied by policy'), {
+        reasons: decision.reasons,
+        matchedRuleIds: decision.matchedRuleIds,
+        policyVersion: decision.policyVersion,
+      });
+    }
+    // Like the scratch route, the write cap applies only when a rule sets it.
+    const writeCap = decision.rowLimitsFromRules.maxWriteRows ? decision.limits.maxWriteRows : null;
+
+    const dry = await workspace.transactionalDryRun(sql);
+    if (writeCap !== null && dry.rowCount > writeCap) {
+      throw refuse(
+        'PREVIEW',
+        new AppError('WRITE_ROW_LIMIT_EXCEEDED', `The change affects more than ${writeCap} rows.`, {
+          maxWriteRows: writeCap,
+        }),
+      );
+    }
+    const targets = diffSnapshots(write.kind, dry.before, dry.after);
+    if (targets.length !== dry.rowCount) {
+      throw refuse(
+        'PREVIEW',
+        new AppError(
+          'OPERATION_NOT_SUPPORTED',
+          'The affected rows cannot be identified in the preview (large table or no visible change).',
+        ),
+      );
+    }
+    return this.finishPlan(ctx, {
+      write,
+      permission,
+      environment: SCRATCH_ENVIRONMENT,
+      connectionId: SCRATCH_CONNECTION_ID,
+      capability,
+      decision,
+      targets,
+      entity,
+      previewKind: 'TRANSACTIONAL_DRY_RUN',
+      previewLabels: ['TRANSACTIONAL_DRY_RUN'],
+    });
   }
 
   /** Before snapshot of the UPDATE targets through the read path, capped at maxWriteRows + 1. */
@@ -399,7 +552,9 @@ export class MutationService {
     err: unknown,
   ): Promise<void> {
     const code = isAppError(err) ? err.code : 'INTERNAL_ERROR';
-    const denied = err instanceof Refusal || code === 'FORBIDDEN' || code === 'SQL_FORBIDDEN';
+    const denied =
+      err instanceof Refusal ||
+      ['FORBIDDEN', 'SQL_FORBIDDEN', 'SQL_UNSUPPORTED', 'SQL_PARSE_ERROR'].includes(code);
     const write =
       classified && classified.kind !== 'UNKNOWN' && classified.kind !== 'SELECT'
         ? classified
@@ -572,7 +727,8 @@ export function renderExpr(e: Expr, qualifiers: Set<string>, known: Set<string>)
     case 'not':
       return `(NOT ${r(e.expr)})`;
     case 'neg':
-      return `(-${r(e.expr)})`;
+      // The space keeps a negated negative literal from forming `--`, a line comment.
+      return `(- ${r(e.expr)})`;
     case 'in':
       return `(${r(e.expr)}${e.negated ? ' NOT' : ''} IN (${e.list.map(r).join(', ')}))`;
     case 'between':
@@ -622,7 +778,12 @@ function isTrivialWhere(e: Expr): boolean {
   if (!hasColumn(e)) return true;
   if (e.kind === 'and') return isTrivialWhere(e.left) && isTrivialWhere(e.right);
   if (e.kind === 'or') return isTrivialWhere(e.left) || isTrivialWhere(e.right);
-  if (e.kind === 'compare' && e.op === '=' && e.left.kind === 'column' && e.right.kind === 'column') {
+  if (
+    e.kind === 'compare' &&
+    e.op === '=' &&
+    e.left.kind === 'column' &&
+    e.right.kind === 'column'
+  ) {
     return (
       e.left.name.toUpperCase() === e.right.name.toUpperCase() &&
       (e.left.table ?? '').toUpperCase() === (e.right.table ?? '').toUpperCase()
@@ -704,4 +865,40 @@ function toValue(v: unknown): Value {
   if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return v;
   if (v instanceof Date) return v.toISOString();
   return String(v);
+}
+
+const SCALAR = (v: unknown): Value => toValue(v);
+
+/**
+ * Per-row before/after from the two table snapshots of a dry run. A scratch table has no known
+ * key, so rows are matched as whole values: rows only in `before` were changed or removed, rows
+ * only in `after` were changed or added. Changed rows are paired in scan order.
+ */
+function diffSnapshots(
+  kind: WriteClassified['kind'],
+  before: { columns: string[]; rows: unknown[][] },
+  after: { columns: string[]; rows: unknown[][] },
+): PreviewTarget[] {
+  const toRecord = (columns: string[], row: unknown[]): RecordValues => {
+    const r: RecordValues = {};
+    columns.forEach((c, i) => (r[c] = SCALAR(row[i])));
+    return r;
+  };
+  const sig = (r: RecordValues) => JSON.stringify(r);
+  const b = before.rows.map((r) => toRecord(before.columns, r));
+  const a = after.rows.map((r) => toRecord(after.columns, r));
+  const only = (xs: RecordValues[], ys: RecordValues[]): RecordValues[] => {
+    const left = new Map<string, number>();
+    for (const y of ys) left.set(sig(y), (left.get(sig(y)) ?? 0) + 1);
+    return xs.filter((x) => {
+      const n = left.get(sig(x)) ?? 0;
+      if (n > 0) left.set(sig(x), n - 1);
+      return n === 0;
+    });
+  };
+  const removed = only(b, a);
+  const added = only(a, b);
+  if (kind === 'INSERT') return added.map((r) => ({ key: {}, before: null, after: r }));
+  if (kind === 'DELETE') return removed.map((r) => ({ key: {}, before: r, after: {} }));
+  return removed.map((r, i) => ({ key: {}, before: r, after: added[i] ?? {} }));
 }

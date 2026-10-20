@@ -9,7 +9,7 @@ import { buildApp } from '../app';
 import { loadConfig } from '../config';
 import type { AuthState } from '../context';
 import { ENV_CONNECTION_ID } from './connections';
-import { MutationService } from './mutations';
+import { MutationService, renderExpr } from './mutations';
 import { PlansService } from './plans';
 import type { PolicyInput } from './policy';
 
@@ -75,6 +75,7 @@ async function setup(env: Record<string, string> = {}): Promise<Harness> {
     connections: s.connections,
     metadata: s.metadata,
     audit: s.audit,
+    scratch: s.scratch,
     plans: new PlansService(database.db, { secret: config.session.secret, ttlSeconds: 300 }),
     maxReadRows: config.sankhya.maxRows,
   });
@@ -171,7 +172,8 @@ describe('MutationService.prepare', () => {
     const before = await partner(h.mock, 1);
     const p = await prepare(h, auth, "UPDATE TGFPAR SET NOMEPARC = 'Novo nome' WHERE CODPARC = 1");
 
-    expect(p.previewKind).toBe('IMPACT_ANALYSIS+SIMULATED_PREVIEW');
+    expect(p.previewKind).toBe('IMPACT_ANALYSIS');
+    expect(p.previewLabels).toEqual(['IMPACT_ANALYSIS', 'SIMULATED_PREVIEW']);
     expect(p.capability).toMatchObject({ class: 'SUPPORTED', route: 'SANKHYA_SAVE' });
     expect(p.preview.affected).toBe(1);
     expect(p.preview.targets).toEqual([
@@ -219,6 +221,7 @@ describe('MutationService.prepare', () => {
       "INSERT INTO TGFPAR (CODPARC, NOMEPARC, ATIVO) VALUES (9999, 'Parceiro novo', 'S')",
     );
     expect(p.previewKind).toBe('SIMULATED_PREVIEW');
+    expect(p.previewLabels).toEqual(['SIMULATED_PREVIEW']);
     expect(p.preview).toEqual({
       affected: 1,
       targets: [
@@ -357,7 +360,8 @@ describe('POST /api/query/preview', () => {
     const body = res.json();
     expect(body).toMatchObject({
       type: 'preview',
-      previewKind: 'IMPACT_ANALYSIS+SIMULATED_PREVIEW',
+      previewKind: 'IMPACT_ANALYSIS',
+      previewLabels: ['IMPACT_ANALYSIS', 'SIMULATED_PREVIEW'],
       preview: { affected: 1 },
       impact: { entities: ['TGFPAR'], rows: 1 },
       requires: { strongConfirmation: null, approval: false },
@@ -431,6 +435,167 @@ describe('POST /api/query/preview', () => {
     expect(res.json().error.code).toBe('SQL_UNSUPPORTED');
     expect(writeCalls(h.mock)).toEqual([]);
     expect(await partner(h.mock, 1)).toBe(before);
+  });
+});
+
+describe('WHERE fidelity of the snapshot', () => {
+  // Each renders to an equivalent predicate: the planned targets equal what a direct SELECT with
+  // the original WHERE returns on the mock.
+  const FAITHFUL = [
+    'CODPARC = 1 OR CODPARC = 2',
+    'CODPARC IN (1, 2, 3)',
+    'CODPARC NOT IN (1, 2) AND CODPARC < 20',
+    'CODPARC BETWEEN 2 AND 3',
+    'CODPARC NOT BETWEEN 2 AND 1000000 AND CODPARC < 20',
+    "CODPARC < 20 AND NOMEPARC LIKE '%a%'",
+    "CODPARC < 20 AND NOMEPARC NOT LIKE '%a%'",
+    'NOMEPARC IS NULL',
+    'NOMEPARC IS NOT NULL AND CODPARC > 2 AND CODPARC < 20',
+    'CODPARC - 1 = -(-1)',
+    'CODPARC = - -1',
+    'CODPARC = 1 /* trailing */',
+  ];
+  // Constructs the renderer cannot reproduce faithfully: the preview must refuse, never alter them.
+  const REFUSED = [
+    'NOT (CODPARC > 2)',
+    'UPPER(NOMEPARC) = NOMEPARC',
+    'CODPARC IN (SELECT CODPARC FROM TGFPAR WHERE CODPARC = 1)',
+    'CASE WHEN CODPARC = 1 THEN 1 ELSE 0 END = 1',
+    'CAST(CODPARC AS VARCHAR(10)) = 1',
+    'EXISTS (SELECT 1 FROM TGFPAR)',
+    'CODPARC = (SELECT MAX(CODPARC) FROM TGFPAR)',
+  ];
+
+  it.each(FAITHFUL)('renders an equivalent predicate: %s', async (where) => {
+    const h = await setup();
+    const { auth } = await h.userWith(WRITER);
+    const direct = (
+      await h.mock.db.query<{ codparc: number }>(`SELECT codparc FROM tgfpar WHERE ${where}`)
+    ).rows
+      .map((x) => x.codparc)
+      .sort((a, b) => a - b);
+    const planned = await prepare(h, auth, `UPDATE TGFPAR SET ATIVO = 'N' WHERE ${where}`);
+    const keys = planned.preview.targets.map((t) => Number(t.key.CODPARC)).sort((a, b) => a - b);
+    expect(keys).toEqual(direct);
+    expect(writeCalls(h.mock)).toEqual([]);
+  });
+
+  it.each(REFUSED)('refuses what it cannot render faithfully: %s', async (where) => {
+    const h = await setup();
+    const { auth } = await h.userWith(WRITER);
+    await expect(
+      prepare(h, auth, `UPDATE TGFPAR SET ATIVO = 'N' WHERE ${where}`),
+    ).rejects.toMatchObject({
+      code: expect.stringMatching(/^(OPERATION_NOT_SUPPORTED|SQL_UNSUPPORTED|SQL_PARSE_ERROR)$/),
+    });
+    expect(writeCalls(h.mock)).toEqual([]);
+    expect(await h.audit('write.denied')).toHaveLength(1);
+    expect(await h.audit('PLAN_CREATED')).toHaveLength(0);
+  });
+});
+
+describe('scratch TRANSACTIONAL_DRY_RUN', () => {
+  const SCRATCH: Permission[] = ['TEMP.CREATE', 'TEMP.WRITE', 'QUERY.SELECT'];
+
+  async function withTable(h: Harness, auth: AuthState) {
+    const ws = await h.app.services.scratch.workspace(auth.user.id);
+    await ws.exec('CREATE TABLE tmp_a (id int, v text)');
+    await ws.exec("INSERT INTO tmp_a VALUES (1, 'x'), (2, 'y'), (3, 'z')");
+    return ws;
+  }
+
+  it('UPDATE: before/after rows and affected count, rolled back, with a plan', async () => {
+    const h = await setup();
+    const { auth } = await h.userWith(SCRATCH);
+    const ws = await withTable(h, auth);
+    const p = await prepare(h, auth, "UPDATE tmp_a SET v = 'new' WHERE id = 2");
+    expect(p.previewKind).toBe('TRANSACTIONAL_DRY_RUN');
+    expect(p.previewLabels).toEqual(['TRANSACTIONAL_DRY_RUN']);
+    expect(p.capability).toMatchObject({ class: 'SCRATCH_ONLY', route: 'SCRATCH' });
+    expect(p.preview.affected).toBe(1);
+    expect(p.preview.targets).toEqual([
+      { key: {}, before: { id: 2, v: 'y' }, after: { id: 2, v: 'new' } },
+    ]);
+    expect(p.impact).toEqual({ entities: ['TMP_A'], rows: 1, environment: 'SANDBOX' });
+    expect(p.planId).toMatch(/^[0-9a-f-]{36}$/);
+    // Nothing persisted, nothing sent to Sankhya.
+    expect((await ws.exec('SELECT id, v FROM tmp_a ORDER BY id')).rows).toEqual([
+      [1, 'x'],
+      [2, 'y'],
+      [3, 'z'],
+    ]);
+    expect(h.mock.calls).toEqual([]);
+    expect(await h.audit('PLAN_CREATED')).toHaveLength(1);
+  });
+
+  it('INSERT and DELETE dry runs report their rows', async () => {
+    const h = await setup();
+    const { auth } = await h.userWith(SCRATCH);
+    const ws = await withTable(h, auth);
+    const ins = await prepare(h, auth, "INSERT INTO tmp_a VALUES (4, 'w')");
+    expect(ins.preview.targets).toEqual([{ key: {}, before: null, after: { id: 4, v: 'w' } }]);
+    const del = await prepare(h, auth, 'DELETE FROM tmp_a WHERE id = 1');
+    expect(del.preview.targets).toEqual([{ key: {}, before: { id: 1, v: 'x' }, after: {} }]);
+    expect((await ws.tables())[0]).toMatchObject({ name: 'tmp_a', rows: 3 });
+  });
+
+  it('refuses a policy DENY before running anything, audited as denied', async () => {
+    const h = await setup();
+    const { auth } = await h.userWith(SCRATCH);
+    const ws = await withTable(h, auth);
+    await h.policy({ actions: ['TEMP.WRITE'] });
+    await expect(prepare(h, auth, "UPDATE tmp_a SET v = 'n' WHERE id = 2")).rejects.toMatchObject({
+      code: 'FORBIDDEN',
+    });
+    expect(await h.audit('write.denied')).toHaveLength(1);
+    expect(await h.audit('PLAN_CREATED')).toHaveLength(0);
+    expect((await ws.exec('SELECT v FROM tmp_a WHERE id = 2')).rows).toEqual([['y']]);
+  });
+
+  it('refuses without TEMP.WRITE, without WHERE, and for a table the caller does not have', async () => {
+    const h = await setup();
+    const { auth } = await h.userWith(SCRATCH);
+    await withTable(h, auth);
+    await expect(prepare(h, auth, 'DELETE FROM tmp_a')).rejects.toMatchObject({
+      code: 'WHERE_REQUIRED',
+    });
+    await expect(prepare(h, auth, 'DELETE FROM tmp_other WHERE id = 1')).rejects.toMatchObject({
+      code: 'OPERATION_NOT_SUPPORTED',
+    });
+    const reader = await h.userWith(['QUERY.SELECT', 'DATA.UPDATE']);
+    await expect(
+      prepare(h, reader.auth, "UPDATE tmp_a SET v = 'n' WHERE id = 2"),
+    ).rejects.toMatchObject({ code: 'FORBIDDEN' });
+  });
+
+  it('enforces a maxWriteRows rule on the dry run', async () => {
+    const h = await setup();
+    const { auth } = await h.userWith(SCRATCH);
+    await withTable(h, auth);
+    await h.policy({
+      name: 'cap',
+      effect: 'ALLOW',
+      actions: ['TEMP.WRITE'],
+      limits: { maxWriteRows: 1 },
+    });
+    await expect(prepare(h, auth, "UPDATE tmp_a SET v = 'n' WHERE id > 0")).rejects.toMatchObject({
+      code: 'WRITE_ROW_LIMIT_EXCEEDED',
+    });
+  });
+});
+
+describe('renderExpr', () => {
+  it('never produces a line comment from a negated negative literal', () => {
+    const lit = { kind: 'literal', value: -5 } as const;
+    const sql = renderExpr({ kind: 'neg', expr: lit }, new Set(), new Set());
+    expect(sql).not.toContain('--');
+    expect(sql).toBe('(- -5)');
+    const nested = renderExpr(
+      { kind: 'neg', expr: { kind: 'neg', expr: lit } },
+      new Set(),
+      new Set(),
+    );
+    expect(nested).not.toContain('--');
   });
 });
 
