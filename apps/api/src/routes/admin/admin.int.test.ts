@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance, InjectOptions } from 'fastify';
-import { createDatabase } from '@dbx/database';
+import { createDatabase, rolePermissions, roles } from '@dbx/database';
 import type { DatabaseHandle } from '@dbx/database';
 import { MOCK_CREDENTIALS } from '@dbx/sankhya-client/mock';
 import type { Permission } from '@dbx/shared';
@@ -46,6 +46,12 @@ interface Harness {
   call(cookie: string | null, opts: InjectOptions): Promise<Response>;
   /** A user holding exactly `permissions` through a custom role; returns a session cookie. */
   userWith(permissions: Permission[]): Promise<string>;
+  /**
+   * A user holding `roleKeys`, plus a role seeded directly with `extra` permissions when given
+   * (no acting user, so nothing the bootstrap admin lacks is refused). Returns the id and a
+   * session cookie.
+   */
+  userWithRoles(roleKeys: string[], extra?: Permission[]): Promise<{ id: string; cookie: string }>;
   auditRows(action: string): Promise<Array<Record<string, unknown>>>;
 }
 
@@ -104,6 +110,30 @@ async function setup(env: Record<string, string> = {}): Promise<Harness> {
     return login(email, PASSWORD);
   };
 
+  const userWithRoles = async (roleKeys: string[], extra: Permission[] = []) => {
+    n += 1;
+    const keys = [...roleKeys];
+    if (extra.length > 0) {
+      const key = `SEEDED_${n}`;
+      const [r] = await database.db
+        .insert(roles)
+        .values({ key, name: key, system: false })
+        .returning({ id: roles.id });
+      await database.db
+        .insert(rolePermissions)
+        .values(extra.map((permission) => ({ roleId: r!.id, permission })));
+      keys.push(key);
+    }
+    const email = `user${n}@example.com`;
+    const user = await app.services.users.create({
+      email,
+      name: `Pessoa ${n}`,
+      password: PASSWORD,
+      roles: keys,
+    });
+    return { id: user.id, cookie: await login(email, PASSWORD) };
+  };
+
   const auditRows = async (action: string) =>
     (await app.services.audit.list({ action, limit: 100, offset: 0 })).items as unknown as Array<
       Record<string, unknown>
@@ -115,6 +145,7 @@ async function setup(env: Record<string, string> = {}): Promise<Harness> {
     admin: await login(ADMIN.email, ADMIN.password),
     call,
     userWith,
+    userWithRoles,
     auditRows,
   };
 }
@@ -250,6 +281,106 @@ describe('policies', () => {
     });
     expect(extra.statusCode).toBe(400);
     expect(await h.app.services.policies.list()).toEqual([]);
+  });
+});
+
+describe('policies: separation of duties', () => {
+  const policyChanges = (id: string): InjectOptions[] => [
+    { method: 'POST', url: '/api/admin/policies', payload: POLICY },
+    { method: 'PATCH', url: `/api/admin/policies/${id}`, payload: { enabled: false } },
+    { method: 'DELETE', url: `/api/admin/policies/${id}` },
+  ];
+
+  it('refuses and audits every policy change by an ADMIN that also holds OPERATOR', async () => {
+    const h = await setup();
+    const existing = await h.app.services.policies.create(POLICY as never);
+    const before = (await h.app.services.policies.current()).version;
+    const mixed = await h.userWithRoles(['ADMIN', 'OPERATOR']);
+    for (const opts of policyChanges(existing.id)) {
+      const res = await h.call(mixed.cookie, opts);
+      expect(res.statusCode, `${opts.method} ${opts.url}`).toBe(403);
+      expect(codeOf(res)).toBe('FORBIDDEN');
+      expect(res.json().error.details).toEqual({
+        reason: 'separation_of_duties',
+        conflicting: ['DATA.INSERT', 'DATA.UPDATE'],
+      });
+    }
+    // Nothing changed, and reading the rules is still allowed.
+    expect((await h.app.services.policies.current()).version).toBe(before);
+    expect(await h.app.services.policies.list()).toHaveLength(1);
+    const listed = await h.call(mixed.cookie, { method: 'GET', url: '/api/admin/policies' });
+    expect(listed.statusCode).toBe(200);
+
+    for (const action of ['policy.create', 'policy.update', 'policy.delete']) {
+      const rows = await h.auditRows(action);
+      expect(rows, action).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ status: 'denied', userId: mixed.id, errorCode: 'FORBIDDEN' });
+    }
+  });
+
+  it.each([
+    'DATA.INSERT',
+    'DATA.UPDATE',
+    'DATA.DELETE',
+    'DDL.CUSTOM.GENERATE',
+    'SANKHYA.BUSINESS_ACTION.EXECUTE',
+  ] as const)('refuses a policy change by an ADMIN that also holds %s', async (permission) => {
+    const h = await setup();
+    const actor = await h.userWithRoles(['ADMIN'], [permission]);
+    const res = await h.call(actor.cookie, {
+      method: 'POST',
+      url: '/api/admin/policies',
+      payload: POLICY,
+    });
+    expect(res.statusCode, res.body).toBe(403);
+    expect(res.json().error.details).toEqual({
+      reason: 'separation_of_duties',
+      conflicting: [permission],
+    });
+    expect(await h.app.services.policies.list()).toEqual([]);
+  });
+
+  it('lets a plain ADMIN change policies, and still refuses them granting themselves OPERATOR', async () => {
+    const h = await setup();
+    const created = await h.call(h.admin, {
+      method: 'POST',
+      url: '/api/admin/policies',
+      payload: POLICY,
+    });
+    expect(created.statusCode, created.body).toBe(201);
+    const id = created.json().item.id as string;
+    for (const opts of policyChanges(id).slice(1)) {
+      const res = await h.call(h.admin, opts);
+      expect(res.statusCode, `${opts.method} ${opts.url} ${res.body}`).toBe(200);
+    }
+
+    // The admin cannot turn themselves into a dual-role account: not directly, and not through
+    // a group carrying OPERATOR (a role they do not hold).
+    const self = await h.call(h.admin, {
+      method: 'PUT',
+      url: `/api/admin/users/${h.adminId}/roles`,
+      payload: { roles: ['ADMIN', 'OPERATOR'] },
+    });
+    expect(self.statusCode).toBe(403);
+    expect(self.json().error.details).toMatchObject({ reason: 'self_change' });
+    const group = await h.call(h.admin, {
+      method: 'POST',
+      url: '/api/admin/groups',
+      payload: { name: 'Operação' },
+    });
+    const gid = group.json().item.id as string;
+    const viaGroup = await h.call(h.admin, {
+      method: 'PUT',
+      url: `/api/admin/groups/${gid}/roles`,
+      payload: { roles: ['OPERATOR'] },
+    });
+    expect(viaGroup.statusCode).toBe(403);
+    expect(viaGroup.json().error.details).toMatchObject({
+      reason: 'beyond_own',
+      missing: ['DATA.INSERT', 'DATA.UPDATE'],
+    });
+    const me = await h.call(h.admin, { method: 'GET', url: '/api/auth/me' });
+    expect(me.json().user.permissions).not.toContain('DATA.UPDATE');
   });
 });
 

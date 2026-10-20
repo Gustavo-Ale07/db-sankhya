@@ -55,6 +55,19 @@ const ADMIN: Permission[] = [
   'ADMIN.SECURITY',
 ];
 
+/**
+ * Separation of duties: an account holding any of these may not create, change or delete access
+ * policy rules. Otherwise it could relax the rules (WHERE override, four-eyes, row caps) that
+ * govern its own writes. The ADMIN role holds none of them.
+ */
+export const POLICY_ADMIN_CONFLICTS: readonly Permission[] = [
+  'DATA.INSERT',
+  'DATA.UPDATE',
+  'DATA.DELETE',
+  'DDL.CUSTOM.GENERATE',
+  'SANKHYA.BUSINESS_ACTION.EXECUTE',
+];
+
 /** Permissions of the seeded system roles. The RBAC migration mirrors them; a test keeps both equal. */
 export const SYSTEM_ROLE_PERMISSIONS: Readonly<Record<SystemRole, readonly Permission[]>> = {
   VIEWER,

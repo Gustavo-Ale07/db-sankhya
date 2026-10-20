@@ -185,7 +185,11 @@ instead of executing. A second person with `APPROVAL.DECIDE` decides in **Aprova
 - the approval is bound to the plan hash and expires with the plan (`APPROVAL_TTL_MINUTES`);
 - a rejection invalidates the plan;
 - an approved plan is then executed by its owner with the same execute call, and goes through
-  every step above.
+  every step above;
+- the rules that ask for approval cannot be changed by an account that can write: policy
+  create, update and delete (`/api/admin/policies`) are refused with reason
+  `separation_of_duties` to anyone holding `DATA.*`, `DDL.CUSTOM.GENERATE` or
+  `SANKHYA.BUSINESS_ACTION.EXECUTE`.
 
 ### Assisted rollback
 

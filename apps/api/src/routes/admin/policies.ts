@@ -1,5 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import { AppError, POLICY_ADMIN_CONFLICTS } from '@dbx/shared';
+import type { AuthState } from '../../context';
 import type { PolicyInput, PolicyPatch } from '../../services/policy';
 import { noStore, parseBody, requirePermission, uuidParam } from '../../http';
 import { adminAudit } from './shared';
@@ -23,6 +25,22 @@ const ruleFields = {
   overrideWhereRequired: z.unknown(),
   enabled: z.unknown(),
 };
+/**
+ * Separation of duties: an account that can write ERP data, generate DDL or run business actions
+ * may not change the rules that govern those writes (it could drop a WHERE requirement, four-eyes
+ * or a row cap for itself). Reading the rules stays allowed.
+ */
+function assertSeparateFromWrites(auth: AuthState): void {
+  const conflicting = POLICY_ADMIN_CONFLICTS.filter((p) => auth.grants.permissions.has(p));
+  if (conflicting.length > 0) {
+    throw new AppError(
+      'FORBIDDEN',
+      'Accounts that can write data cannot change access policies (separation of duties)',
+      { reason: 'separation_of_duties', conflicting },
+    );
+  }
+}
+
 const createPolicyBody = z.object(ruleFields).strict();
 const updatePolicyBody = z
   .object(ruleFields)
@@ -36,7 +54,7 @@ const updatePolicyBody = z
  */
 export async function adminPolicyRoutes(app: FastifyInstance): Promise<void> {
   const { policies } = app.services;
-  const { record } = adminAudit(app);
+  const { record, attempt } = adminAudit(app);
   const version = async () => (await policies.current()).version;
 
   app.get('/api/admin/policies', async (request, reply) => {
@@ -51,9 +69,13 @@ export async function adminPolicyRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.post('/api/admin/policies', async (request, reply) => {
-    const { user: actor } = requirePermission(request, 'ADMIN.POLICIES');
+    const auth = requirePermission(request, 'ADMIN.POLICIES');
+    const actor = auth.user;
     const body = parseBody(createPolicyBody, request.body);
-    const item = await policies.create(body as PolicyInput);
+    const item = await attempt(request, actor, 'policy.create', { name: body.name }, () => {
+      assertSeparateFromWrites(auth);
+      return policies.create(body as PolicyInput);
+    });
     const policyVersion = await version();
     await record(request, actor, 'policy.create', { policyId: item.id, policyVersion, rule: item });
     void reply.code(201);
@@ -61,10 +83,14 @@ export async function adminPolicyRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.patch('/api/admin/policies/:id', async (request) => {
-    const { user: actor } = requirePermission(request, 'ADMIN.POLICIES');
+    const auth = requirePermission(request, 'ADMIN.POLICIES');
+    const actor = auth.user;
     const { id } = parseBody(uuidParam, request.params);
     const body = parseBody(updatePolicyBody, request.body);
-    const item = await policies.update(id, body as PolicyPatch);
+    const item = await attempt(request, actor, 'policy.update', { policyId: id }, () => {
+      assertSeparateFromWrites(auth);
+      return policies.update(id, body as PolicyPatch);
+    });
     const policyVersion = await version();
     await record(request, actor, 'policy.update', {
       policyId: id,
@@ -75,9 +101,13 @@ export async function adminPolicyRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.delete('/api/admin/policies/:id', async (request) => {
-    const { user: actor } = requirePermission(request, 'ADMIN.POLICIES');
+    const auth = requirePermission(request, 'ADMIN.POLICIES');
+    const actor = auth.user;
     const { id } = parseBody(uuidParam, request.params);
-    await policies.delete(id);
+    await attempt(request, actor, 'policy.delete', { policyId: id }, () => {
+      assertSeparateFromWrites(auth);
+      return policies.delete(id);
+    });
     const policyVersion = await version();
     await record(request, actor, 'policy.delete', { policyId: id, policyVersion });
     return { ok: true, policyVersion };

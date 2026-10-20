@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   PERMISSIONS,
+  POLICY_ADMIN_CONFLICTS,
   SYSTEM_ROLE_PERMISSIONS,
   isPermission,
   isWriteKind,
@@ -57,6 +58,13 @@ describe('permission catalog', () => {
       expect(admin).toContain(p);
     expect(admin).not.toContain('DATA.UPDATE');
     for (const p of admin) expect(p).not.toMatch(/^(DATA|DDL|SANKHYA)\./);
+  });
+
+  it('separates policy administration from every write permission, and ADMIN holds none', () => {
+    expect([...POLICY_ADMIN_CONFLICTS].sort()).toEqual(
+      PERMISSIONS.filter((p) => /^(DATA|DDL|SANKHYA)\./.test(p)).sort(),
+    );
+    for (const p of POLICY_ADMIN_CONFLICTS) expect(SYSTEM_ROLE_PERMISSIONS.ADMIN).not.toContain(p);
   });
 
   it('seeded roles have no duplicates and only catalog permissions', () => {

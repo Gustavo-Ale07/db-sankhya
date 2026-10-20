@@ -133,6 +133,13 @@ or reset each account and with which roles. Writes covered by a rule with `requi
 second person (four-eyes, see [Write protection](#write-protection)), and the requester can never
 approve their own plan.
 
+**Separation of duties for policies.** An account that holds any `DATA.*`, `DDL.CUSTOM.GENERATE` or
+`SANKHYA.BUSINESS_ACTION.EXECUTE` permission cannot create, change or delete policy rules, even with
+`ADMIN.POLICIES`; it can still read them. Otherwise it could remove the `requireApproval` or `WHERE`
+rule that governs its own writes and skip four-eyes. The refusal is `FORBIDDEN` with reason
+`separation_of_duties` and is audited as `denied`. A plain `ADMIN` is not affected; an
+`ADMIN,OPERATOR` account (such as that bootstrap admin) needs a second, policy-only administrator.
+
 Permission checks happen on the server for every request. History, saved queries, running executions
 and write previews are always scoped by the owner's user id (no IDOR through ids in the URL);
 administrators see the audit log of all users.
@@ -219,7 +226,8 @@ A write runs only as a plan (see [architecture.md](architecture.md#writes)):
   `<ENVIRONMENT> <ACTION> <N> <ENTITY>`.
 - **Four-eyes approval.** A rule with `requireApproval` (and every `WHERE` override) needs a second
   active user with `APPROVAL.DECIDE`, the plan's permissions and a policy `ALLOW`. The requester
-  cannot approve their own plan; a rejection invalidates it.
+  cannot approve their own plan; a rejection invalidates it. Nobody who can write can change the
+  rules that ask for approval (see separation of duties above).
 - **Re-authorization.** Permissions, policy version, capability, target rows and the kill
   switches are checked again at execution, and the switches and policy version again before every
   gateway call.

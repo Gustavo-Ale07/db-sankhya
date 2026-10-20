@@ -77,7 +77,7 @@ Notes:
 | `ADMIN.USERS`                     | `/api/admin/users` (assigning roles also needs `ADMIN.ROLES`)                                                                                                          |
 | `ADMIN.GROUPS`                    | `/api/admin/groups` (granting roles to a group also needs `ADMIN.ROLES`)                                                                                               |
 | `ADMIN.ROLES`                     | `/api/admin/roles`                                                                                                                                                     |
-| `ADMIN.POLICIES`                  | `/api/admin/policies`                                                                                                                                                  |
+| `ADMIN.POLICIES`                  | `/api/admin/policies` (changing a rule is refused to an account that also holds a `DATA.*`, `DDL.*` or `SANKHYA.*` permission)                                         |
 | `ADMIN.CONNECTIONS`               | `/api/admin/connections` (create, edit, replace secrets, test, delete)                                                                                                 |
 | `ADMIN.SECURITY`                  | `GET` / `PUT /api/admin/security` (the runtime write kill switch), cancelling another user's running query                                                             |
 
