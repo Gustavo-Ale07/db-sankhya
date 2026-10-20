@@ -52,7 +52,9 @@ curl -fsS http://127.0.0.1:3001/health/ready
 
 ### Production refusals
 
-With `NODE_ENV=production` (the image default) the app does not start when, among others:
+With `NODE_ENV=production` the app does not start when, among others (the image sets it, and both
+`compose.yaml` and `docker-compose.production.example.yml` set it again in the service
+`environment`, which wins over `.env`, so a stray `NODE_ENV` there cannot skip these checks):
 
 - `AUTH_SECRET` is missing, a placeholder or shorter than 32 random characters;
 - `ENCRYPTION_KEY` is missing or not base64 of 32 bytes;

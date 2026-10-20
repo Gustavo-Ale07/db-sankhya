@@ -15,6 +15,9 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
+      # Set here, not only in the image: this value wins over .env, so a stray NODE_ENV there
+      # cannot switch off the production startup checks.
+      NODE_ENV: production
       # Built from POSTGRES_* so the credentials live in one place.
       # Set DATABASE_URL in .env to use an external database instead.
       DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-dbsankhya}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-dbsankhya}}
