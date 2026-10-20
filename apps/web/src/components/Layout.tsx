@@ -184,7 +184,14 @@ export function Layout({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: 
             {view === 'connections' && allowed('connections') && <ConnectionsPage />}
             {view === 'security' && allowed('security') && <SecurityPage />}
             {view === 'approvals' && allowed('approvals') && <ApprovalsPage />}
-            {view === 'audit' && allowed('audit') && <AuditPage />}
+            {view === 'audit' && allowed('audit') && (
+              <AuditPage
+                onOpen={(req, connectionId) => {
+                  selectConnection(connectionId);
+                  openInEditor(req);
+                }}
+              />
+            )}
             {view === 'status' && <StatusPage />}
             {view === 'password' && <ChangePasswordPage onDone={refresh} />}
           </div>

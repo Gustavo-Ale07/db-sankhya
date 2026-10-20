@@ -6,6 +6,7 @@ import { ErrorBox } from '../components/ErrorBox';
 import { JsonView } from '../components/JsonView';
 import { Modal } from '../components/Modal';
 import { formatDateTime, formatDuration } from '../lib/format';
+import { RollbackPlanAction, type OpenRollback } from './AuditRollback';
 
 const PAGE = 50;
 const ACTIONS = [
@@ -46,6 +47,9 @@ const ACTIONS = [
   'read.denied',
   'scratch.materialize',
   'scratch.denied',
+  'PLAN_CREATED',
+  'PLAN_EXECUTED',
+  'rollback.planned',
 ];
 const STATUSES = ['success', 'partial', 'failed', 'denied', 'info'] as const;
 const STATUS_CLS: Record<AuditEvent['status'], string> = {
@@ -66,7 +70,8 @@ interface Filters {
 }
 const EMPTY: Filters = { action: '', userEmail: '', resource: '', status: '', from: '', to: '' };
 
-export function AuditPage() {
+/** `onOpen` hands a rollback statement to the SQL editor; without it the action is hidden. */
+export function AuditPage({ onOpen }: { onOpen?: OpenRollback } = {}) {
   const [form, setForm] = useState<Filters>(EMPTY);
   const [filters, setFilters] = useState<Filters>(EMPTY);
   const [offset, setOffset] = useState(0);
@@ -237,8 +242,11 @@ export function AuditPage() {
         testId="audit-detail"
       >
         {detail && (
-          <div className="h-[60vh]">
-            <JsonView value={detail} />
+          <div className="space-y-3">
+            {onOpen && <RollbackPlanAction key={detail.id} event={detail} onOpen={onOpen} />}
+            <div className="h-[60vh]">
+              <JsonView value={detail} />
+            </div>
           </div>
         )}
       </Modal>
