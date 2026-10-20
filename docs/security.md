@@ -9,7 +9,7 @@ described in [SECURITY.md](../SECURITY.md).
 | --------------------------------- | --------------------------------------------------------------------- |
 | Sankhya gateway credentials       | leaking to the browser, logs, audit records, error messages, the repo |
 | ERP data read through the gateway | unauthorized reads, over-fetching, exfiltration                       |
-| ERP records (future writes)       | accidental or malicious changes (mutations are refused today)         |
+| ERP records                       | accidental or malicious changes, partial or unverifiable writes       |
 | User accounts and sessions        | brute force, session theft or fixation, CSRF, privilege escalation    |
 | The server itself                 | SSRF through configurable URLs, injection, resource exhaustion        |
 
@@ -128,8 +128,9 @@ lock everyone out.
 **Residual risk:** an administrator can create accounts, or reset weaker ones, with at most their
 own permissions, and then sign in as them (an equal-privilege "sock puppet"). This does not raise
 their privileges, but it hides who acted behind a second identity. The audit log records who created
-or reset each account and with which roles, and approvals that require a second person (four-eyes)
-are planned for Stage 14.
+or reset each account and with which roles. Writes covered by a rule with `requireApproval` need a
+second person (four-eyes, see [Write protection](#write-protection)), and the requester can never
+approve their own plan.
 
 Permission checks happen on the server for every request. History, saved queries, running executions
 and write previews are always scoped by the owner's user id (no IDOR through ids in the URL);
@@ -167,19 +168,71 @@ there: they are targeted by environment, or by a rule with no connection list. A
   The copy is capped at `MATERIALIZE_MAX_ROWS` and at the lowest `maxReadRows` of the rules matched
   in either context.
 
+## Policy engine
+
+After the permission check, every read, write, scratch statement, materialization, DDL artifact
+and business action is evaluated by the policy engine (`packages/shared/src/policy.ts`) against
+the stored rules (**Políticas**, `ADMIN.POLICIES`). A rule has an effect (`ALLOW` or `DENY`), a
+subject (a user, a group or everyone), and optional filters: environments, connections, actions,
+entities (tables, `*` wildcards allowed) and columns. It can carry limits and the
+`overrideWhereRequired` flag.
+
+The decision is made in this order:
+
+1. The user lacks the permission for the action: **DENY**.
+2. Any enabled `DENY` rule overlaps the request: **DENY**. A deny always wins.
+3. Writes (`DATA.*`, `DDL.CUSTOM.GENERATE`, `SANKHYA.BUSINESS_ACTION.EXECUTE`) are
+   **default-deny**: every entity the request touches must be covered by an `ALLOW` rule. Other
+   actions are allowed by the permission unless denied.
+4. Limits from every matching rule are combined, the most restrictive value winning: `maxReadRows`
+   and `maxWriteRows` take the lowest value; `requireWhere`, `requireStrongConfirmation` and
+   `requireApproval` are on if any rule sets them; `auditSnapshots` is off if any rule turns it
+   off. `requirePreview` and `requireConfirmation` are always on.
+5. Any write on a `PRODUCTION` connection requires strong confirmation.
+6. An `UPDATE` or `DELETE` without `WHERE` is refused unless an `ALLOW` rule with
+   `overrideWhereRequired` covers each entity and no rule sets `requireWhere`. The override then
+   forces strong confirmation and approval.
+
+Defaults when no rule sets a limit: `maxReadRows` 1000, `maxWriteRows` 50, strong confirmation and
+approval off, snapshots on. Hard ceilings: 100000 rows read, 1000 rows written. There is no
+administrator bypass. The policy version is frozen into each plan and checked again before
+execution, so changing the rules invalidates pending plans.
+
 ## Write protection
 
-Mutations are **not available yet**. Every mutation entry point fails closed:
+`POST /api/query` never executes a mutation: `INSERT`, `UPDATE` and `DELETE` are refused with
+`SQL_UNSUPPORTED` and a pointer to the preview route, other mutations are refused outright, and
+both are audited as `write.denied`. The legacy `POST /api/query/confirm` is always refused. Reads
+go through a lexical gate that refuses write keywords, so a mutation cannot reach the gateway
+through the read path either (`SQL_FORBIDDEN`). Native DDL is never executed for anyone.
 
-- `POST /api/query` with `INSERT`, `UPDATE`, `DELETE` or DDL answers `SQL_UNSUPPORTED`
-  ("Mutations are not available yet.") before anything is planned or sent, whatever the user's
-  role or the flags below. The refusal is recorded in the history and audited as `write.denied`.
-- `POST /api/query/confirm` always answers `SQL_UNSUPPORTED` and is audited as `write.denied`.
-- Reads go through a lexical gate that refuses write keywords, so a mutation cannot reach the
-  gateway through the read path either (`SQL_FORBIDDEN`).
+A write runs only as a plan (see [architecture.md](architecture.md#writes)):
 
-`SAFE_MODE=true`, `GLOBAL_WRITE_ENABLED=false` and `WRITE_TO_SANKHYA=false` are the defaults and
-are kept as kill switches for the future write path. Turning them on does not enable writes today.
+- **Capability first.** Only `INSERT` and `UPDATE` of catalog tables (through `DatasetSP.save`)
+  and registered business actions can reach Sankhya. Everything else is `UNSUPPORTED` (see
+  [capabilities.md](capabilities.md)).
+- **Immutable plans.** The previewed plan is stored with a hash; the token is an HMAC over the
+  plan id, its hash and the session, signed with `AUTH_SECRET`, valid for `PLAN_TTL_SECONDS`,
+  and consumed at most once. What runs is exactly what was previewed.
+- **Typed confirmation.** `PRODUCTION` writes, and rules that ask for it, need the exact phrase
+  `<ENVIRONMENT> <ACTION> <N> <ENTITY>`.
+- **Four-eyes approval.** A rule with `requireApproval` (and every `WHERE` override) needs a second
+  active user with `APPROVAL.DECIDE`, the plan's permissions and a policy `ALLOW`. The requester
+  cannot approve their own plan; a rejection invalidates it.
+- **Re-authorization.** Permissions, policy version, capability, target rows and the kill
+  switches are checked again at execution, and the switches and policy version again before every
+  gateway call.
+- **Kill switches.** `GLOBAL_WRITE_ENABLED` (default `false`, with a runtime half that an
+  administrator with `ADMIN.SECURITY` can turn off without a restart), `WRITE_TO_SANKHYA` (default
+  `false`) and `SAFE_MODE` (default `true`, blocks `PRODUCTION` writes). Business actions also
+  need their id in `BUSINESS_ACTIONS_ENABLED` on live connections.
+- **No retries.** A write is sent once. An unclear outcome is reported as `WRITE_OUTCOME_UNKNOWN`,
+  never repeated automatically.
+- **Verification.** Every changed row is read back and the run is labelled `VERIFIED`,
+  `PARTIALLY_VERIFIED`, `UNVERIFIED` or `FAILED`.
+- **Audit.** `PLAN_CREATED`, `PLAN_DENIED`, `PLAN_EXECUTED` and `VERIFICATION` events carry the
+  plan, the decision and the before and after rows (unless `auditSnapshots` is off). An assisted
+  rollback is a new plan built from those snapshots and goes through every step above.
 
 ## Query safety
 
@@ -215,7 +268,14 @@ are kept as kill switches for the future write path. Turning them on does not en
 
 Logs are structured (pino) and go to stdout. Request logs omit bodies, cookies and authorization
 headers. The audit log stores: logins (success, and failures including lockouts), logouts, password changes,
-user administration, read denials and write denials. It never stores gateway credentials, session
+the bootstrap, user, group, role, policy and connection administration (`connection.rotate_secrets`
+included), the runtime write switch (`security.update`), reads (`read.executed`, `read.denied`),
+write refusals (`write.denied`), the plan lifecycle (`PLAN_CREATED`, `PLAN_DENIED`,
+`PLAN_EXECUTED`, `VERIFICATION`), approvals (`approval.request`, `approval.decide`,
+`approval.execute`), rollback plans (`rollback.planned`), DDL artifacts (`ddl.generate`,
+`ddl.denied`) and scratch materializations (`scratch.materialize`, `scratch.denied`). Scratch
+reads are not audited. Row snapshots are capped (50 rows, 256 KiB, strings clipped at 2000
+characters) and redacted like everything else. It never stores gateway credentials, session
 tokens, passwords, cookies or authorization headers.
 
 ## Supply chain

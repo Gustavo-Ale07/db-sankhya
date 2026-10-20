@@ -1,0 +1,186 @@
+# Operations
+
+Day-to-day running of a DB-Sankhya installation: backups, keys, the write switches and what to do
+when a write ends in an uncertain state. Installation is in [deployment.md](deployment.md).
+
+The commands below use the default `compose.yaml`. With the hardened file, add
+`--env-file .env.production -f docker-compose.production.example.yml` to each `docker compose`
+command.
+
+## Backup and restore
+
+All application state lives in PostgreSQL: users, roles, groups, policies, sessions, history,
+saved queries, connections (secrets encrypted), the cached data dictionary, plans, approvals,
+runtime settings and the audit log. ERP rows are not stored, apart from the snapshots of rows that
+plans changed. The scratch workspaces are in memory and are not backed up.
+
+### Back up the database
+
+```bash
+docker compose exec -T db sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' \
+  > backup-$(date +%F).dump
+```
+
+Schedule it with cron or a systemd timer, keep copies off the host and test a restore regularly.
+The dump holds password hashes, the audit log (with row snapshots) and the encrypted connection
+secrets: store it encrypted and restrict who can read it.
+
+### Restore the database
+
+```bash
+docker compose stop app
+docker compose exec -T db sh -c 'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists' \
+  < backup-2026-01-31.dump
+docker compose start app
+```
+
+`--clean --if-exists` replaces the existing objects. Restore into the same or an older app version,
+never a newer dump into an older app: migrations only move forward and run when the app starts.
+
+### Back up the master key separately
+
+`ENCRYPTION_KEY` encrypts the connection secrets (gateway client secret and X-Token) stored in the
+database. **It is not in the dump.** Keep it, and `AUTH_SECRET`, in a password manager or secret
+store, **separately from the database backups**: a stolen dump without the key exposes no
+gateway credentials, and a restore with the key brings the connections back as they were.
+
+| You restore with …                     | Result                                                                                  |
+| -------------------------------------- | --------------------------------------------------------------------------------------- |
+| the dump and the same key              | everything works as before                                                              |
+| the dump and a different/lost key      | users, policies and audit are intact; **stored connection secrets cannot be decrypted** |
+| the dump and a different `AUTH_SECRET` | pending plan tokens become invalid: preview those writes again                          |
+
+**Losing `ENCRYPTION_KEY` means every stored connection secret must be entered again.** There is
+no recovery. Generate a new key (`openssl rand -base64 32`), start the app with it, then for each
+connection open **Conexões** and replace its secrets (`PUT /api/admin/connections/:id/secrets`,
+audited as `connection.rotate_secrets`). Until then, using that connection fails with "The
+connection credentials cannot be decrypted; replace them". The environment connection
+(`env-default`) is not stored in the database and is not affected: its secrets come from
+`SANKHYA_*`.
+
+## Write switches
+
+| Variable                   | Default | Meaning                                                 |
+| -------------------------- | ------- | ------------------------------------------------------- |
+| `GLOBAL_WRITE_ENABLED`     | `false` | master switch for every write, scratch included         |
+| `WRITE_TO_SANKHYA`         | `false` | allows writes to Sankhya tables                         |
+| `SAFE_MODE`                | `true`  | blocks writes on `PRODUCTION` connections while on      |
+| `BUSINESS_ACTIONS_ENABLED` | empty   | comma-separated action ids allowed on live connections  |
+| `PLAN_TTL_SECONDS`         | `300`   | how long a previewed plan can be confirmed (30 to 3600) |
+| `APPROVAL_TTL_MINUTES`     | `60`    | how long a plan waiting for approval stays valid        |
+
+With the defaults no write reaches the ERP. To allow writes on a homologation connection set
+`GLOBAL_WRITE_ENABLED=true` and `WRITE_TO_SANKHYA=true`; production writes also need
+`SAFE_MODE=false`. Users then still need the permissions and an `ALLOW` policy rule (see
+[permissions.md](permissions.md) and [security.md](security.md#policy-engine)).
+
+### Emergency stop
+
+An administrator with `ADMIN.SECURITY` can stop every write at once without a restart: **Segurança**
+→ turn writes off, or
+
+```bash
+curl -X PUT https://app.example.com/api/admin/security \
+  -H 'Content-Type: application/json' -H 'Origin: https://app.example.com' \
+  -H 'Cookie: <session cookie>' -d '{"globalWriteEnabled":false}'
+```
+
+It takes effect before the next gateway save, including the remaining rows of a plan already
+running, and is audited as `security.update`. The runtime switch can only turn writes off; while
+`GLOBAL_WRITE_ENABLED` is `false` in the environment, turning it on again changes nothing.
+
+`GET /api/status` (signed in) shows the current state:
+
+```json
+{
+  "writes": {
+    "safeMode": true,
+    "globalWriteEnabled": false,
+    "globalWrite": { "env": true, "runtime": false, "effective": false },
+    "writeToSankhya": true,
+    "available": false,
+    "productionAvailable": false,
+    "scratchAvailable": false
+  }
+}
+```
+
+`effective` is `env` AND `runtime`. If the stored runtime value cannot be read, writes are
+refused ("The write switches could not be read.").
+
+## Operator notes
+
+These are known behaviours to keep in mind when reading results and audit records.
+
+- **`WRITE_OUTCOME_UNKNOWN`.** The gateway did not confirm a save (timeout, dropped connection,
+  unreadable answer), or the audit could not be written after it. The change may or may not be in
+  the ERP. **Do not repeat the plan.** Check the row in the ERP first, then prepare a new plan if
+  it is still needed.
+- **A lost single-step response shows as `PARTIALLY_VERIFIED`.** When a plan with one row loses
+  the gateway's answer, the verification cannot prove the row either way and labels the run
+  `PARTIALLY_VERIFIED`, not `UNVERIFIED`. Check the row in the ERP.
+- **`INSERT` verification trusts the key returned by the gateway.** The new row is read back by
+  the key in the save result and only the inserted columns are compared. If the gateway returned
+  the wrong key, the check reads the wrong row. Without a complete key the step is `UNVERIFIED`.
+- **Rollback SQL uses the app's dialect.** In an assisted rollback, string literals have their
+  backslashes doubled, because the app's SQL parser reads backslash escapes. The text is correct
+  for DB-Sankhya (preview it and execute it in the app) but **wrong if pasted into a native Oracle
+  or SQL Server tool**, which would write two backslashes. A negative zero in a snapshot is
+  restored as `0`.
+- **Rollback is a new plan.** It is offered only for a fully `VERIFIED` `UPDATE` with complete
+  snapshots, needs `DATA.UPDATE` and an `ALLOW` rule, and only the first statement is prepared
+  for you. Rows changed since are flagged as conflicts.
+- **The `auditSnapshots` policy limit.** A rule with `auditSnapshots: false` (any matching rule
+  wins) stops storing the before and after rows. The audit still keeps the counts, the row keys
+  (up to 50) and the full SQL text, **including the values in `SET`**. With snapshots off, no
+  rollback plan can be built for that write. Use it for tables whose values must not be copied
+  into the audit, and keep sensitive literals out of the statements themselves.
+- **Business actions.** Test one cancellation in `HOMOLOGATION` before listing
+  `CACSP.cancelarNota` in `BUSINESS_ACTIONS_ENABLED` for a production installation. Its request
+  body was validated only against the bundled mock. See
+  [sankhya.md](sankhya.md#business-actions).
+- **Plans expire.** A preview older than `PLAN_TTL_SECONDS` is `CONFIRMATION_EXPIRED`; preview
+  again. A plan can be executed once (`CONFIRMATION_USED`); repeating with the same
+  `idempotencyKey` returns the first result.
+- **`TARGETS_CHANGED`.** The rows changed between preview and execution. Preview again.
+
+## Health, logs and version
+
+| Task               | Command / where                                                                          |
+| ------------------ | ---------------------------------------------------------------------------------------- |
+| Logs               | `docker compose logs -f app` (JSON lines; ship them to your log stack)                   |
+| Liveness           | `GET /health/live`                                                                       |
+| Readiness          | `GET /health/ready` (database and scratch manager)                                       |
+| Version and commit | footer of the UI, `GET /api/meta`; the commit comes from the `GIT_COMMIT` build argument |
+| Writes and Sankhya | **Status** page, `GET /api/status`                                                       |
+| Audit trail        | **Auditoria** page (`AUDIT.READ`)                                                        |
+| Stop               | `docker compose down` (data stays in the `db-data` volume)                               |
+| Remove everything  | `docker compose down -v` — **deletes the database volume**                               |
+
+`LOG_LEVEL` is `info` by default; `debug` and `trace` are refused in production. Secrets are
+redacted from logs.
+
+## Accounts
+
+```bash
+# First administrator, when BOOTSTRAP_ADMIN_EMAIL is set (prints a one-time password)
+docker compose exec app node dist/admin.mjs bootstrap --email admin@example.com
+
+# Reset a password (prints a one-time password that must be changed at the next login)
+docker compose exec app node dist/admin.mjs reset-password --email user@example.com
+```
+
+`bootstrap` refuses when users already exist, unless `--force-additional` is given. Another
+administrator can also reset a password in **Usuários**.
+
+## Upgrades
+
+```bash
+docker compose exec -T db sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' > pre-upgrade.dump
+git pull
+GIT_COMMIT=$(git rev-parse --short HEAD) docker compose up -d --build
+```
+
+Migrations are versioned and applied when the app starts. Read the release notes first: upgrading
+from a version before the permission catalog changes what administrators can do (see
+[permissions.md](permissions.md#upgrading-from-an-earlier-version)).

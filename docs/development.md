@@ -58,28 +58,31 @@ apps/
   api/            Fastify server (routes, services, security), esbuild bundle
   web/            React 19 + Vite UI
 packages/
-  shared/         errors, RBAC, redaction, shared types
-  sql-engine/     read gate and analyzer, parser, statement classification, local evaluator
+  shared/         errors, permissions, policy engine, redaction, shared types
+  sql-engine/     read gate and analyzer, parser, capability resolution, write planning,
+                  DDL artifacts, scratch guard, local evaluator
   sankhya-client/ gateway transport, auth, limiter, circuit breaker, mock gateway + dataset
   database/       Drizzle schema, migrations, PGlite / node-postgres client
 e2e/              Playwright end-to-end tests
+scripts/          small repository scripts (permissions reference)
 docs/             documentation, ADRs, screenshots
 ```
 
 ## Scripts
 
-| Command                        | What it does                                                         |
-| ------------------------------ | -------------------------------------------------------------------- |
-| `pnpm dev`                     | API and web in watch mode                                            |
-| `pnpm build`                   | builds the web UI, then bundles the API into `apps/api/dist`         |
-| `pnpm lint`                    | ESLint (type-aware rules, React hooks)                               |
-| `pnpm format` / `format:check` | Prettier                                                             |
-| `pnpm typecheck`               | `tsc` in every package                                               |
-| `pnpm test`                    | all Vitest projects                                                  |
-| `pnpm test:unit`               | unit tests (packages, API and web)                                   |
-| `pnpm test:integration`        | API integration tests (Fastify `inject` + PGlite + mock Sankhya)     |
-| `pnpm test:e2e`                | Playwright against the built app (run `pnpm build` first)            |
-| `pnpm db:generate`             | generates a new SQL migration from `packages/database/src/schema.ts` |
+| Command                            | What it does                                                                                 |
+| ---------------------------------- | -------------------------------------------------------------------------------------------- |
+| `pnpm dev`                         | API and web in watch mode                                                                    |
+| `pnpm build`                       | builds the web UI, then bundles the API into `apps/api/dist`                                 |
+| `pnpm lint`                        | ESLint (type-aware rules, React hooks)                                                       |
+| `pnpm format` / `format:check`     | Prettier                                                                                     |
+| `pnpm typecheck`                   | `tsc` in every package                                                                       |
+| `pnpm test`                        | all Vitest projects                                                                          |
+| `pnpm test:unit`                   | unit tests (packages, API and web)                                                           |
+| `pnpm test:integration`            | API integration tests (Fastify `inject` + PGlite + mock Sankhya)                             |
+| `pnpm test:e2e`                    | Playwright against the built app (run `pnpm build` first)                                    |
+| `pnpm db:generate`                 | generates a new SQL migration from `packages/database/src/schema.ts`                         |
+| `node scripts/permissions-doc.mjs` | rewrites the table in `docs/permissions.md` from `packages/shared` (`--check` only compares) |
 
 First-time Playwright setup: `pnpm --filter @dbx/e2e exec playwright install chromium`.
 `UPDATE_SCREENSHOTS=1 pnpm test:e2e` refreshes the images in `docs/screenshots`.
@@ -95,6 +98,8 @@ was already released.
 - TypeScript strict mode everywhere, ES modules, exact dependency versions.
 - Errors are `AppError` with a code from `packages/shared/src/errors.ts`; keep the web
   translations in `apps/web/src/api/errors.ts` in sync.
+- After changing `PERMISSIONS`, the seeded roles or `POLICY_ACTION_CLASS`, run
+  `node scripts/permissions-doc.mjs` and commit `docs/permissions.md`.
 - UI text is Portuguese (pt-BR); code, comments, logs and API messages are English.
 - Commits follow [Conventional Commits](https://www.conventionalcommits.org/).
 - Test data is fictitious: `example.com` e-mails, invented company names, generated CNPJ/CPF.

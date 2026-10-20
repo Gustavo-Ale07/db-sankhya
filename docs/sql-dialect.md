@@ -43,8 +43,22 @@ The server returns at most `SANKHYA_MAX_ROWS` rows (default 1000). When more row
 `truncated: true` and the UI shows a message; the rows are never cut silently. When it is safe
 the cap is applied by wrapping the statement; otherwise the server stops reading at the cap.
 
+## Known refusals
+
+The analyzer is deliberately narrow. Some constructs are refused even though the database accepts
+them:
+
+- `EXISTS (subquery)` is refused ("Function EXISTS is not allowed."). Rewrite it with
+  `IN (subquery)` or a `JOIN`, which are accepted.
+- Hexadecimal literals such as `0x1F` are refused by the gate.
+
 ## Writes
 
-Mutations are **not available yet**. `INSERT`, `UPDATE`, `DELETE` and DDL are refused with
-`SQL_UNSUPPORTED` ("Mutations are not available yet.") and audited as `write.denied`. See
-[security.md](security.md).
+`POST /api/query` runs reads only. `INSERT` and `UPDATE` of Sankhya tables are written in the same
+dialect but run as previewed plans through the write dialog (`POST /api/query/preview`, then
+`/api/query/execute`); `DELETE` and native DDL are not supported on Sankhya tables. Each
+`INSERT` needs an explicit column list and a single `VALUES` row. See
+[capabilities.md](capabilities.md) and [architecture.md](architecture.md#writes).
+
+Statements over `tmp_` tables run in the scratch workspace, which uses PostgreSQL syntax (PGlite),
+not the ERP dialect.

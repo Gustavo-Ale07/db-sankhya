@@ -4,7 +4,7 @@
 #   docker compose --env-file .env.production -f docker-compose.production.example.yml up -d --build
 #
 # --env-file feeds the ${...} interpolation below; env_file feeds the container. .env.production is
-# git-ignored and must never be committed. See docs/deploy.md.
+# git-ignored and must never be committed. See docs/deployment.md.
 # The API listens on 127.0.0.1 only: put a TLS reverse proxy (Nginx/Caddy) in front of it.
 
 name: db-sankhya-prod

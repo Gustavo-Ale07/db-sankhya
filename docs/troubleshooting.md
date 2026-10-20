@@ -14,7 +14,8 @@ names the variable and the problem. Common ones:
 
 | Message                                                         | Fix                                                 |
 | --------------------------------------------------------------- | --------------------------------------------------- |
-| `SESSION_SECRET is missing, a placeholder or too weak`          | `openssl rand -base64 48` and paste it into `.env`  |
+| `AUTH_SECRET (legacy name SESSION_SECRET) is missing, …`        | `openssl rand -base64 48` and paste it into `.env`  |
+| `ENCRYPTION_KEY is required in production`                      | `openssl rand -base64 32`; keep a copy apart        |
 | `BOOTSTRAP_ADMIN_PASSWORD is no longer supported`               | remove it; use the bootstrap token or the admin CLI |
 | `DATABASE_URL still contains the placeholder database password` | change `POSTGRES_PASSWORD` in `.env`                |
 | `APP_URL must use https:// in production`                       | use the public HTTPS URL served by your proxy       |
@@ -57,7 +58,7 @@ docker compose exec app node dist/admin.mjs reset-password --email admin@example
 | Code                     | Meaning and fix                                                                                                                                             |
 | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `SQL_FORBIDDEN`          | The read gate or analyzer refused the statement (comments, several statements, write keywords, an unknown construct). See [sql-dialect.md](sql-dialect.md). |
-| `SQL_UNSUPPORTED`        | A mutation (`INSERT`, `UPDATE`, `DELETE`, DDL): mutations are not available yet.                                                                            |
+| `SQL_UNSUPPORTED`        | A mutation sent to the read route. Use the write dialog (preview, then confirm); DDL is not executed. See [capabilities.md](capabilities.md).               |
 | `RESOURCE_NOT_FOUND`     | The table is not in the connection's catalog. Check the schema tree.                                                                                        |
 | `SANKHYA_NOT_CONFIGURED` | No Sankhya connection is ready. Set the `SANKHYA_*` variables or register a connection.                                                                     |
 
@@ -71,3 +72,23 @@ docker compose exec app node dist/admin.mjs reset-password --email admin@example
 | `SANKHYA_UNAVAILABLE`  | Network error or gateway 5xx.                                                                    |
 | `SANKHYA_API_ERROR`    | The Sankhya service refused the request; its message is shown with credentials redacted.         |
 | `SANKHYA_BAD_RESPONSE` | The response did not have the expected shape.                                                    |
+
+## Writes
+
+| Code                       | Meaning and fix                                                                                                                             |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `READ_ONLY_MODE`           | A kill switch is off ("Writes are disabled (<switch>)"). See **Status** and [operations.md](operations.md#write-switches).                  |
+| `FORBIDDEN`                | Missing permission, or no policy `ALLOW` rule covers the table. Writes are default-deny.                                                    |
+| `OPERATION_NOT_SUPPORTED`  | The statement or action has no supported route (for example a Sankhya `DELETE`, or an action not in `BUSINESS_ACTIONS_ENABLED`).            |
+| `WHERE_REQUIRED`           | An `UPDATE` or `DELETE` without `WHERE`. Add a `WHERE`, or ask for an override rule.                                                        |
+| `WRITE_ROW_LIMIT_EXCEEDED` | More rows than the policy's `maxWriteRows`. Narrow the `WHERE`.                                                                             |
+| `CONFIRMATION_REQUIRED`    | A destructive DDL artifact needs the typed confirmation `DESTRUCTIVE <TABLE>`.                                                              |
+| `CONFIRMATION_INVALID`     | Wrong token, session or typed phrase (e.g. `PRODUCTION UPDATE 3 TGFPAR`). Check the phrase, or preview again.                               |
+| `CONFIRMATION_EXPIRED`     | The plan is older than `PLAN_TTL_SECONDS`. Preview again.                                                                                   |
+| `CONFIRMATION_USED`        | The plan was already executed. Check **Auditoria** for its result.                                                                          |
+| `TARGETS_CHANGED`          | The rows changed between preview and execution. Preview again.                                                                              |
+| `WRITE_OUTCOME_UNKNOWN`    | The gateway did not confirm the save. **Do not repeat it**: check the row in the ERP first ([operations.md](operations.md#operator-notes)). |
+
+`SANKHYA_NOT_CONFIGURED` with "The connection credentials cannot be decrypted; replace them" means
+`ENCRYPTION_KEY` changed since the connection was saved. Replace its secrets in **Conexões** (see
+[operations.md](operations.md#back-up-the-master-key-separately)).
