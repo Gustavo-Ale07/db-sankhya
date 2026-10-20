@@ -3,7 +3,8 @@
  * policy check and the stable hashes used to bind a confirmation to exactly the
  * statement and the targets that were previewed.
  *
- * Mutations themselves are not available yet; the API fails closed.
+ * No gateway code lives here: mutations run through the API write lifecycle (preview, plan,
+ * confirmation, execute) in apps/api/src/services/mutations.ts.
  */
 import { createHash } from 'node:crypto';
 import { AppError } from '@dbx/shared';

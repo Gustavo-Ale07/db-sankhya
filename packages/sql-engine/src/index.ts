@@ -10,7 +10,7 @@ export type {
 } from './local/evaluate';
 export type { ColumnType } from './eval';
 export type { Row, Value } from './values';
-/** Reserved for Stage 11 (mutation lifecycle). */
+/** Write-side helpers: environment switch check and stable statement/target hashes. */
 export { assertWriteEnabled, statementHash, sha256, targetsHashOf } from './writes';
 export type { WriteKind, WritePolicy, WriteTarget, RecordValues } from './writes';
 export { tokenGate, DENY_WORDS, DENY_PREFIXES } from './gate';
