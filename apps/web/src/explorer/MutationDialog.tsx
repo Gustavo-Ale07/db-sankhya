@@ -6,7 +6,7 @@ import { executePlan, requestApproval } from '../api/mutations';
 import type {
   ExecutionReport,
   ExecutionStep,
-  MutationPreview,
+  PreparedPlan,
   PreviewTarget,
   StepOutcome,
   VerificationLabel,
@@ -58,6 +58,29 @@ const PLAN_DEAD = new Set([
   'READ_ONLY_MODE',
   'WRITE_OUTCOME_UNKNOWN',
 ]);
+
+/** FORBIDDEN because the approver rejected the plan: it can never run. */
+function isApprovalRejected(err: unknown): boolean {
+  return (
+    err instanceof ApiError &&
+    err.code === 'FORBIDDEN' &&
+    err.details?.reason === 'approval_rejected'
+  );
+}
+
+/** A refusal after which this plan can never run (a new preview is needed). */
+function isPlanDead(err: unknown): boolean {
+  return (err instanceof ApiError && PLAN_DEAD.has(err.code)) || isApprovalRejected(err);
+}
+
+/** The verification the server recorded with a WRITE_OUTCOME_UNKNOWN answer, if any. */
+function recordedVerification(err: unknown): VerificationLabel | null {
+  if (!(err instanceof ApiError) || err.code !== 'WRITE_OUTCOME_UNKNOWN') return null;
+  const v = err.details?.verification;
+  return typeof v === 'string' && Object.hasOwn(VERIFICATION_TEXT, v)
+    ? (v as VerificationLabel)
+    : null;
+}
 
 const FOCUSABLE =
   'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])';
@@ -160,7 +183,13 @@ function Report({ report }: { report: ExecutionReport }) {
   );
 }
 
-function UnknownWarning({ canReplay = false }: { canReplay?: boolean }) {
+function UnknownWarning({
+  canReplay = false,
+  verification = null,
+}: {
+  canReplay?: boolean;
+  verification?: VerificationLabel | null;
+}) {
   return (
     <div
       role="alert"
@@ -169,6 +198,12 @@ function UnknownWarning({ canReplay = false }: { canReplay?: boolean }) {
     >
       NÃO repita esta operação. A alteração pode ter sido gravada, mas o resultado não pôde ser
       confirmado. Confira os registros no Sankhya antes de qualquer nova tentativa.
+      {verification && (
+        <span className="mt-1 block font-normal" data-testid="outcome-unknown-verification">
+          Verificação registrada pelo servidor: <strong>{verification}</strong>.{' '}
+          {VERIFICATION_TEXT[verification]}
+        </span>
+      )}
       {canReplay && (
         <span className="mt-1 block font-normal">
           &quot;Consultar resultado&quot; reenvia o mesmo pedido, com a mesma chave de idempotência:
@@ -198,8 +233,14 @@ function ApprovalPending({ error }: { error: unknown }) {
   );
 }
 
-function Refusal({ error }: { error: unknown }) {
+/**
+ * A refusal, with the capability label and request id the server sent. After an unknown outcome
+ * the generic title (which may say "gere uma nova prévia") is replaced: the do-not-repeat warning
+ * next to it is what the user must follow.
+ */
+function Refusal({ error, afterUnknown = false }: { error: unknown; afterUnknown?: boolean }) {
   const e = describeError(error);
+  const capability = error instanceof ApiError ? error.details?.capability : undefined;
   return (
     <div
       role="alert"
@@ -207,15 +248,39 @@ function Refusal({ error }: { error: unknown }) {
       data-testid="mutation-error"
     >
       <div className="font-semibold">
-        {e.title} <span className="font-mono text-xs opacity-80">[{e.code}]</span>
+        {typeof capability === 'string' && capability !== '' && (
+          <span className="badge mr-1.5 font-semibold" data-testid="refusal-capability">
+            {capability}
+          </span>
+        )}
+        {afterUnknown ? 'O servidor recusou o reenvio.' : e.title}{' '}
+        <span className="font-mono text-xs opacity-80">[{e.code}]</span>
       </div>
       {e.detail && <div className="mt-0.5 text-xs text-fg/80">{e.detail}</div>}
+      {e.requestId && (
+        <div className="mt-0.5 text-[11px] text-muted">request id: {e.requestId}</div>
+      )}
     </div>
   );
 }
 
+/** The write switches that block this plan; SCRATCH skips the Sankhya write switches. */
+function blockingSwitches(plan: PreparedPlan): string[] {
+  const x = plan.execution;
+  if (!x) return [];
+  const scratch = plan.capability.route === 'SCRATCH';
+  const out: string[] = [];
+  if (!scratch && x.safeMode && plan.impact.environment === 'PRODUCTION') {
+    out.push('SAFE_MODE ativo');
+  }
+  if (!x.globalWriteEnabled) out.push('GLOBAL_WRITE_ENABLED desligado');
+  if (!scratch && !x.writeToSankhya) out.push('WRITE_TO_SANKHYA desligado');
+  return out;
+}
+
 interface Props {
-  preview: MutationPreview;
+  /** The plan: a /api/query/preview answer, or a plan the server prepared elsewhere. */
+  preview: PreparedPlan;
   sql: string;
   onClose: () => void;
   /**
@@ -223,43 +288,64 @@ interface Props {
    * whose outcome may be unknown (so the page can keep warning after the dialog closes).
    */
   onOutcome?: (outcome: MutationOutcome) => void;
-  /** Idempotency key factory; one key per dialog (per plan), reused by every retry. */
+  /** The plan's idempotency key, when the caller keeps it (a reopened plan reuses its key). */
+  idempotencyKey?: string;
+  /** Idempotency key factory, used only without `idempotencyKey`; one key per plan. */
   newKey?: () => string;
+  /** What earlier executes of this plan produced (a reopened plan). */
+  initialOutcome?: MutationOutcome;
+  /** The approval of this plan was already requested (a reopened plan). */
+  approvalRequested?: boolean;
+  onApprovalRequested?: () => void;
+  /** The plan reached a final outcome: a report, or a refusal after which it can never run. */
+  onSettled?: () => void;
 }
 
 /**
  * Preview, confirmation and execution of one mutation plan. Opening it never writes: only the
- * explicit "Executar" click calls /api/query/execute. The plan token stays in this component's
- * memory and is never stored or logged.
+ * explicit "Executar" click calls /api/query/execute. The plan token stays in memory (here and in
+ * the caller's pending-plan store) and is never stored or logged.
  */
-export function MutationDialog({ preview, sql, onClose, onOutcome, newKey }: Props) {
+export function MutationDialog({
+  preview,
+  sql,
+  onClose,
+  onOutcome,
+  idempotencyKey: givenKey,
+  newKey,
+  initialOutcome,
+  approvalRequested = false,
+  onApprovalRequested,
+  onSettled,
+}: Props) {
   const titleId = useId();
   const confirmId = useId();
   const ref = useRef<HTMLDivElement>(null);
   // One key per plan: a double click or a retry after a lost answer never executes twice.
-  const [idempotencyKey] = useState(() => (newKey ?? (() => crypto.randomUUID()))());
+  const [idempotencyKey] = useState(() => givenKey ?? (newKey ?? (() => crypto.randomUUID()))());
   const inFlight = useRef(false);
   const approvalInFlight = useRef(false);
   // Everything known about this plan's executes so far (sticky once unknown).
-  const outcomeSoFar = useRef<MutationOutcome | undefined>(undefined);
+  const outcomeSoFar = useRef<MutationOutcome | undefined>(initialOutcome);
   const [busy, setBusy] = useState(false);
   const [typed, setTyped] = useState('');
   const [error, setError] = useState<unknown>(null);
   const [report, setReport] = useState<ExecutionReport | null>(null);
-  const [approval, setApproval] = useState<'none' | 'requesting' | 'requested'>('none');
+  const [approval, setApproval] = useState<'none' | 'requesting' | 'requested'>(
+    approvalRequested ? 'requested' : 'none',
+  );
   const [approvalError, setApprovalError] = useState<unknown>(null);
   const [now, setNow] = useState(() => Date.now());
   // Sticky once an answer left the outcome unknown; only a replayed report clears it.
-  const [unknownSeen, setUnknownSeen] = useState(false);
+  const [unknownSeen, setUnknownSeen] = useState(initialOutcome?.unknown === true);
 
   const remaining = remainingSeconds(preview.expiresAt, now);
   const expired = remaining <= 0;
   const phrase = preview.requires.strongConfirmation;
   const matches = confirmationMatches(typed, phrase);
-  const errorCode = error instanceof ApiError ? error.code : null;
   const outcomeUnknown = unknownSeen;
   const approvalPending = isApprovalPending(error);
-  const planDead = errorCode !== null && PLAN_DEAD.has(errorCode);
+  const planDead = isPlanDead(error);
   // After an unknown outcome the same-key resend stays possible past the countdown: the server
   // replays a recorded result before checking the expiry.
   const canExecute =
@@ -336,9 +422,11 @@ export function MutationDialog({ preview, sql, onClose, onOutcome, newKey }: Pro
       });
       setReport(res);
       record(outcomeOf({ report: res }));
+      onSettled?.();
     } catch (err) {
       setError(err);
       record(outcomeOf({ error: err }));
+      if (isPlanDead(err)) onSettled?.();
     } finally {
       inFlight.current = false;
       setBusy(false);
@@ -360,6 +448,7 @@ export function MutationDialog({ preview, sql, onClose, onOutcome, newKey }: Pro
     try {
       await requestApproval(preview.planId);
       setApproval('requested');
+      onApprovalRequested?.();
     } catch (err) {
       setApprovalError(err);
       setApproval('none');
@@ -369,6 +458,7 @@ export function MutationDialog({ preview, sql, onClose, onOutcome, newKey }: Pro
   }
 
   const labels = previewLabelsOf(preview);
+  const blocked = blockingSwitches(preview);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
@@ -445,13 +535,10 @@ export function MutationDialog({ preview, sql, onClose, onOutcome, newKey }: Pro
 
           <Diff targets={preview.preview.targets} />
 
-          {!preview.execution.available && report === null && (
+          {preview.execution?.available === false && report === null && (
             <p className="rounded border border-warn/60 bg-warn/10 px-3 py-2 text-warn" role="note">
               A escrita está indisponível agora
-              {preview.execution.safeMode ? ' (SAFE_MODE ativo)' : ''}
-              {!preview.execution.globalWriteEnabled ? ' (GLOBAL_WRITE_ENABLED desligado)' : ''}
-              {!preview.execution.writeToSankhya ? ' (WRITE_TO_SANKHYA desligado)' : ''}. O servidor
-              recusará a execução.
+              {blocked.map((b) => ` (${b})`).join('')}. O servidor recusará a execução.
             </p>
           )}
 
@@ -501,9 +588,15 @@ export function MutationDialog({ preview, sql, onClose, onOutcome, newKey }: Pro
             </div>
           )}
 
-          {outcomeUnknown && report === null && <UnknownWarning canReplay={!planDead} />}
+          {outcomeUnknown && report === null && (
+            <UnknownWarning canReplay={!planDead} verification={recordedVerification(error)} />
+          )}
           {error !== null &&
-            (approvalPending ? <ApprovalPending error={error} /> : <Refusal error={error} />)}
+            (approvalPending ? (
+              <ApprovalPending error={error} />
+            ) : (
+              <Refusal error={error} afterUnknown={outcomeUnknown} />
+            ))}
           {planDead && !outcomeUnknown && (
             <p className="text-muted">Este plano não pode mais ser executado.</p>
           )}

@@ -15,9 +15,20 @@ export interface PreviewTarget {
   after: RecordValues;
 }
 
-/** Answer of POST /api/query/preview. The plan token lives only in memory, never persisted. */
-export interface MutationPreview {
-  type: 'preview';
+/** Whether execute would pass the write switches when the preview was made. */
+export interface ExecutionSwitches {
+  available: boolean;
+  safeMode: boolean;
+  globalWriteEnabled: boolean;
+  writeToSankhya: boolean;
+}
+
+/**
+ * A plan the server prepared, with its token. /api/query/preview answers it as a
+ * `MutationPreview`; POST /api/audit/:id/rollback-plan hands it out as `plan`, without `type` and
+ * without the write-switch summary. The token lives only in memory, never persisted.
+ */
+export interface PreparedPlan {
   planId: string;
   token: string;
   expiresAt: string;
@@ -27,12 +38,37 @@ export interface MutationPreview {
   preview: { targets: PreviewTarget[]; affected: number };
   impact: { entities: string[]; rows: number; environment: string };
   requires: { strongConfirmation: string | null; approval: boolean };
-  execution: {
-    available: boolean;
-    safeMode: boolean;
-    globalWriteEnabled: boolean;
-    writeToSankhya: boolean;
-  };
+  execution?: ExecutionSwitches;
+}
+
+/** Answer of POST /api/query/preview. The plan token lives only in memory, never persisted. */
+export interface MutationPreview extends PreparedPlan {
+  type: 'preview';
+  execution: ExecutionSwitches;
+}
+
+const isRecord = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v);
+
+/**
+ * Whether a server answer can be opened as a plan: an id, a token, an expiry and the parts the
+ * dialog renders. Anything else is refused rather than half-shown.
+ */
+export function isPreparedPlan(v: unknown): v is PreparedPlan {
+  if (!isRecord(v)) return false;
+  return (
+    typeof v.planId === 'string' &&
+    v.planId !== '' &&
+    typeof v.token === 'string' &&
+    v.token !== '' &&
+    typeof v.expiresAt === 'string' &&
+    isRecord(v.capability) &&
+    isRecord(v.preview) &&
+    Array.isArray(v.preview.targets) &&
+    isRecord(v.impact) &&
+    Array.isArray(v.impact.entities) &&
+    isRecord(v.requires)
+  );
 }
 
 export interface ExecutionStep {

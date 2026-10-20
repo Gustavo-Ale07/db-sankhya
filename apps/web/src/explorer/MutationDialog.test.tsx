@@ -498,4 +498,263 @@ describe('MutationDialog', () => {
     expect(execButton().disabled).toBe(false);
     expect(screen.getByTestId('outcome-unknown').textContent).toContain('uma única vez');
   });
+
+  it('uses the idempotency key it is given, so a reopened plan resends with the same key', async () => {
+    vi.mocked(executePlan).mockResolvedValue(report());
+    const newKey = vi.fn(() => 'fresh-key');
+    render(
+      <MutationDialog
+        preview={preview({ requires: { strongConfirmation: null, approval: false } })}
+        sql="x"
+        onClose={() => {}}
+        idempotencyKey="kept-key"
+        newKey={newKey}
+      />,
+    );
+    fireEvent.click(execButton());
+    await screen.findByTestId('execution-report');
+    expect(vi.mocked(executePlan).mock.calls[0]![0].idempotencyKey).toBe('kept-key');
+    expect(newKey).not.toHaveBeenCalled();
+  });
+
+  it('reopens on an unknown outcome with the warning and the same-key "Consultar resultado"', () => {
+    render(
+      <MutationDialog
+        preview={preview({ requires: { strongConfirmation: null, approval: false } })}
+        sql="x"
+        onClose={() => {}}
+        idempotencyKey="kept-key"
+        initialOutcome={{ sent: true, unknown: true, errorCode: 'NETWORK_ERROR' }}
+      />,
+    );
+    expect(screen.getByTestId('outcome-unknown').textContent).toContain('NÃO repita');
+    expect(execButton().textContent).toBe('Consultar resultado');
+    expect(execButton().disabled).toBe(false);
+  });
+
+  it('reopens a plan whose approval was already requested without offering the request again', () => {
+    render(
+      <MutationDialog
+        preview={preview({ requires: { strongConfirmation: null, approval: true } })}
+        sql="x"
+        onClose={() => {}}
+        approvalRequested
+      />,
+    );
+    expect(screen.getByTestId('approval-requested')).toBeTruthy();
+    expect(screen.queryByTestId('request-approval')).toBeNull();
+  });
+
+  it('tells the caller when the approval was requested', async () => {
+    vi.mocked(requestApproval).mockResolvedValue({ approval: { id: 'a1', expiresAt: 'x' } });
+    const onApprovalRequested = vi.fn();
+    render(
+      <MutationDialog
+        preview={preview({ requires: { strongConfirmation: null, approval: true } })}
+        sql="x"
+        onClose={() => {}}
+        onApprovalRequested={onApprovalRequested}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Solicitar aprovação' }));
+    await screen.findByTestId('approval-requested');
+    expect(onApprovalRequested).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['a report', () => vi.mocked(executePlan).mockResolvedValue(report())],
+    [
+      'a plan-dead refusal',
+      () =>
+        vi
+          .mocked(executePlan)
+          .mockRejectedValue(new ApiError(400, { code: 'CONFIRMATION_USED', message: 'x' })),
+    ],
+    [
+      'a rejected approval',
+      () =>
+        vi.mocked(executePlan).mockRejectedValue(
+          new ApiError(403, {
+            code: 'FORBIDDEN',
+            message: 'x',
+            details: { reason: 'approval_rejected' },
+          }),
+        ),
+    ],
+  ])('settles the plan after %s', async (_name, arrange) => {
+    arrange();
+    const onSettled = vi.fn();
+    render(
+      <MutationDialog
+        preview={preview({ requires: { strongConfirmation: null, approval: false } })}
+        sql="x"
+        onClose={() => {}}
+        onSettled={onSettled}
+      />,
+    );
+    fireEvent.click(execButton());
+    await waitFor(() => expect(onSettled).toHaveBeenCalledTimes(1));
+  });
+
+  it.each([
+    ['a lost answer', new ApiError(0, { code: 'NETWORK_ERROR', message: 'x' })],
+    [
+      'a pending approval',
+      new ApiError(403, {
+        code: 'FORBIDDEN',
+        message: 'x',
+        details: { reason: 'approval_pending' },
+      }),
+    ],
+  ])('does not settle the plan after %s', async (_name, err) => {
+    vi.mocked(executePlan).mockRejectedValue(err);
+    const onSettled = vi.fn();
+    const onOutcome = vi.fn();
+    render(
+      <MutationDialog
+        preview={preview({ requires: { strongConfirmation: null, approval: false } })}
+        sql="x"
+        onClose={() => {}}
+        onOutcome={onOutcome}
+        onSettled={onSettled}
+      />,
+    );
+    fireEvent.click(execButton());
+    await waitFor(() => expect(onOutcome).toHaveBeenCalled());
+    expect(onSettled).not.toHaveBeenCalled();
+  });
+
+  it('treats a rejected approval as plan-dead: no more execute', async () => {
+    vi.mocked(executePlan).mockRejectedValue(
+      new ApiError(403, {
+        code: 'FORBIDDEN',
+        message: 'x',
+        details: { reason: 'approval_rejected' },
+      }),
+    );
+    render(
+      <MutationDialog
+        preview={preview({ requires: { strongConfirmation: null, approval: true } })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    fireEvent.click(execButton());
+    await screen.findByTestId('mutation-error');
+    expect(execButton().disabled).toBe(true);
+    expect(screen.getByText('Este plano não pode mais ser executado.')).toBeTruthy();
+  });
+
+  it('shows the capability label and the request id of a refusal', async () => {
+    vi.mocked(executePlan).mockRejectedValue(
+      new ApiError(403, {
+        code: 'OPERATION_NOT_SUPPORTED',
+        message: 'x',
+        requestId: 'req-42',
+        details: { capability: 'UNSUPPORTED' },
+      }),
+    );
+    render(
+      <MutationDialog
+        preview={preview({ requires: { strongConfirmation: null, approval: false } })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    fireEvent.click(execButton());
+    const alert = await screen.findByTestId('mutation-error');
+    expect(alert.textContent).toContain('UNSUPPORTED');
+    expect(alert.textContent).toContain('req-42');
+  });
+
+  it('does not tell the user to generate a new preview next to the do-not-repeat warning', async () => {
+    vi.mocked(executePlan)
+      .mockRejectedValueOnce(new ApiError(0, { code: 'NETWORK_ERROR', message: 'x' }))
+      .mockRejectedValueOnce(new ApiError(400, { code: 'CONFIRMATION_EXPIRED', message: 'x' }));
+    render(
+      <MutationDialog
+        preview={preview({ requires: { strongConfirmation: null, approval: false } })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    fireEvent.click(execButton());
+    await screen.findByTestId('outcome-unknown');
+    fireEvent.click(execButton());
+    await waitFor(() =>
+      expect(screen.getByTestId('mutation-error').textContent).toContain('[CONFIRMATION_EXPIRED]'),
+    );
+    expect(screen.getByTestId('outcome-unknown')).toBeTruthy();
+    expect(screen.getByRole('dialog').textContent).not.toMatch(/gere um novo preview/i);
+  });
+
+  it('shows the verification the server recorded with WRITE_OUTCOME_UNKNOWN', async () => {
+    vi.mocked(executePlan).mockRejectedValue(
+      new ApiError(502, {
+        code: 'WRITE_OUTCOME_UNKNOWN',
+        message: 'x',
+        details: { planId: 'p', status: 'success', verification: 'VERIFIED' },
+      }),
+    );
+    render(
+      <MutationDialog
+        preview={preview({ requires: { strongConfirmation: null, approval: false } })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    fireEvent.click(execButton());
+    const warning = await screen.findByTestId('outcome-unknown');
+    expect(warning.textContent).toContain('VERIFIED');
+  });
+
+  it('lists only the write switches that apply to the plan', () => {
+    const off = {
+      available: false,
+      safeMode: true,
+      globalWriteEnabled: true,
+      writeToSankhya: false,
+    };
+    render(
+      <MutationDialog
+        preview={preview({
+          capability: { class: 'SUPPORTED', route: 'SCRATCH', reason: 'x' },
+          impact: { entities: ['T'], rows: 1, environment: 'SCRATCH' },
+          execution: { ...off, globalWriteEnabled: false },
+        })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    let note = screen.getByRole('note').textContent;
+    expect(note).toContain('GLOBAL_WRITE_ENABLED');
+    expect(note).not.toContain('SAFE_MODE');
+    expect(note).not.toContain('WRITE_TO_SANKHYA');
+    cleanup();
+    render(
+      <MutationDialog
+        preview={preview({
+          impact: { entities: ['T'], rows: 1, environment: 'SANDBOX' },
+          execution: off,
+        })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    note = screen.getByRole('note').textContent;
+    expect(note).not.toContain('SAFE_MODE');
+    expect(note).toContain('WRITE_TO_SANKHYA');
+    cleanup();
+    render(<MutationDialog preview={preview({ execution: off })} sql="x" onClose={() => {}} />);
+    note = screen.getByRole('note').textContent;
+    expect(note).toContain('SAFE_MODE');
+    expect(note).toContain('WRITE_TO_SANKHYA');
+  });
+
+  it('opens a server-prepared plan that carries no write-switch summary', () => {
+    const { type: _type, execution: _execution, ...prepared } = preview();
+    render(<MutationDialog preview={prepared} sql="x" onClose={() => {}} />);
+    expect(screen.getByRole('dialog', { name: 'Prévia da alteração' })).toBeTruthy();
+    expect(screen.queryByRole('note')).toBeNull();
+  });
 });
