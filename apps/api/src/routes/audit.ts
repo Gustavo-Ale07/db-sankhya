@@ -118,26 +118,41 @@ export async function auditRoutes(app: FastifyInstance): Promise<void> {
       meta: { ip: clientIp(request), requestId: request.id },
     });
     const conflict = conflictOf(first, prepared);
-    await audit.record({
-      action: 'rollback.planned',
-      status: 'info',
-      userId: auth.user.id,
-      userEmail: auth.user.email,
-      ip: clientIp(request),
-      requestId: request.id,
-      operation: 'UPDATE',
-      resource: analysis.entity,
-      statement: first.sql,
-      connectionId: analysis.connectionId,
-      environment: prepared.impact.environment,
-      planId: prepared.planId,
-      details: {
-        sourceEventId: event.id,
-        sourcePlanId: event.planId,
-        statements: analysis.targets.length,
-        conflict: conflict.detected,
-      },
-    });
+    // The link from the source event to the new plan must exist before the plan is handed out:
+    // if it cannot be written, the caller gets a stable error and no token (the plan stays
+    // unusable and lapses with its TTL), never a plan the audit cannot trace back.
+    try {
+      await audit.record({
+        action: 'rollback.planned',
+        status: 'info',
+        userId: auth.user.id,
+        userEmail: auth.user.email,
+        ip: clientIp(request),
+        requestId: request.id,
+        operation: 'UPDATE',
+        resource: analysis.entity,
+        statement: first.sql,
+        connectionId: analysis.connectionId,
+        environment: prepared.impact.environment,
+        planId: prepared.planId,
+        details: {
+          sourceEventId: event.id,
+          sourcePlanId: event.planId,
+          statements: analysis.targets.length,
+          conflict: conflict.detected,
+        },
+      });
+    } catch (err) {
+      request.log.error(
+        { planId: prepared.planId, errorName: err instanceof Error ? err.name : typeof err },
+        'The rollback plan could not be audited',
+      );
+      throw new AppError(
+        'INTERNAL_ERROR',
+        'The rollback plan could not be recorded in the audit, so it was not issued. Try again.',
+        { reason: 'ROLLBACK_AUDIT_FAILED' },
+      );
+    }
     // The plan token is the caller's own confirmation credential: returned outside the redactor.
     const { token, ...shown } = prepared;
     const body = redact({

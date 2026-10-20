@@ -4,8 +4,10 @@
  *
  * It never writes: the route hands the first statement to `MutationService.prepare`, so a
  * rollback follows the whole lifecycle (policy, preview, confirmation, re-authorization) like any
- * other write. The SQL is rendered from engine AST nodes through `renderExpr`, the same renderer
- * (and literal escaping) the mutation preview uses; identifiers must be plain names.
+ * other write. Identifiers must be plain names, numbers plain notation, and string literals are
+ * escaped for the engine parser (which reads backslash escapes, so backslashes are doubled as well
+ * as quotes). Every generated statement is then parsed back and must yield exactly the intended
+ * table, SET values and key (same type, same value): anything else refuses the rollback.
  *
  * Fails closed (no plan) whenever the audit cannot restore the row faithfully: no snapshot
  * (auditSnapshots=false), an incomplete snapshot, a redacted or clipped value, a key that does
@@ -16,7 +18,6 @@ import type { AuditEventRow } from '@dbx/database';
 import { REDACTED, SNAPSHOT_MAX_STRING_CHARS } from '@dbx/shared';
 import { classifyStatement } from '@dbx/sql-engine';
 import type { Expr, Value } from '@dbx/sql-engine';
-import { renderExpr } from './mutations';
 import { SCRATCH_CONNECTION_ID } from './read-policy';
 
 /** The label every rollback plan carries. */
@@ -64,7 +65,14 @@ function unrestorable(v: unknown): string | null {
   if (v === null) return null;
   if (typeof v === 'string') {
     if (v.includes(REDACTED)) return 'a value was redacted in the audit';
-    if (v.length > SNAPSHOT_MAX_STRING_CHARS) return 'a value was clipped in the audit';
+    // The snapshot clips at SNAPSHOT_MAX_STRING_CHARS plus an ellipsis; a cut that split a
+    // surrogate pair drops the orphan, so a clipped value can be exactly the limit long.
+    if (
+      v.length > SNAPSHOT_MAX_STRING_CHARS ||
+      (v.length === SNAPSHOT_MAX_STRING_CHARS && v.endsWith(ELLIPSIS))
+    ) {
+      return 'a value was clipped in the audit';
+    }
     return null;
   }
   if (typeof v === 'number') {
@@ -72,15 +80,29 @@ function unrestorable(v: unknown): string | null {
       ? null
       : 'a numeric value cannot be written back exactly';
   }
-  if (typeof v === 'boolean') return null;
+  if (typeof v === 'boolean') return 'a boolean value has no literal in the gateway dialects';
   return 'a value is not a plain scalar';
 }
 
-/** Gateway booleans are S/N flags; everything else is written as stored. */
-const literal = (v: Value): Expr => ({
-  kind: 'literal',
-  value: typeof v === 'boolean' ? (v ? 'S' : 'N') : v,
-});
+const ELLIPSIS = '…';
+const BACKSLASH = String.fromCharCode(92);
+
+/**
+ * A SQL literal the engine parser reads back as `v`: quotes doubled and, because the parser
+ * honours backslash escapes, backslashes doubled too. Numbers are already plain notation.
+ */
+function literalSql(v: Value): string {
+  if (v === null) return 'NULL';
+  if (typeof v === 'number') return String(v);
+  if (typeof v === 'string') {
+    return `'${v
+      .split(BACKSLASH)
+      .join(BACKSLASH + BACKSLASH)
+      .split("'")
+      .join("''")}'`;
+  }
+  throw new Error('unsupported literal');
+}
 
 const sameScalar = (a: unknown, b: unknown) =>
   a === b || (a !== null && b !== null && a !== undefined && String(a) === String(b));
@@ -177,33 +199,92 @@ export function analyzeRollback(event: AuditEventRow): RollbackAnalysis {
     } catch {
       return no('The rollback statement could not be built from the stored values.');
     }
+    const mismatch = checkRoundTrip(sql, entity, restore, key);
+    if (mismatch) return no(mismatch);
     targets.push({ key, restore, expectedCurrent, sql });
   }
   return { ok: true, entity, connectionId: event.connectionId, targets };
 }
 
-/** `UPDATE <entity> SET <col> = <before> … WHERE <pk> = …` through the preview's renderer. */
+/** `UPDATE <entity> SET <col> = <before> … WHERE (<pk> = …)`, the key AND-chained. */
 function render(
   entity: string,
   restore: Record<string, Value>,
   key: Record<string, Value>,
 ): string {
-  const columns = [...Object.keys(restore), ...Object.keys(key)];
-  const known = new Set(columns);
-  const qualifiers = new Set([entity]);
-  const r = (e: Expr) => renderExpr(e, qualifiers, known);
   const set = Object.entries(restore)
-    .map(([col, v]) => `${r({ kind: 'column', name: col })} = ${r(literal(v))}`)
+    .map(([col, v]) => `${col} = ${literalSql(v)}`)
     .join(', ');
   const where = Object.entries(key)
+    .map(([k, v]) => `(${k} = ${literalSql(v)})`)
+    .reduce((left, right) => `(${left} AND ${right})`);
+  return `UPDATE ${entity} SET ${set} WHERE ${where}`;
+}
+
+/** The key as the parser should read it: `k1 = v1 AND k2 = v2 …`, left-associated. */
+function keyExpr(key: Record<string, Value>): Expr {
+  return Object.entries(key)
     .map(([k, v]): Expr => ({
       kind: 'compare',
       op: '=',
       left: { kind: 'column', name: k },
-      right: literal(v),
+      right: { kind: 'literal', value: v },
     }))
     .reduce((left, right): Expr => ({ kind: 'and', left, right }));
-  return `UPDATE ${entity} SET ${set} WHERE ${r(where)}`;
+}
+
+const isLiteral = (e: unknown, value: Value): boolean =>
+  isRecord(e) && e.kind === 'literal' && e.value === value;
+
+/** Whether the parsed WHERE is exactly the expected key chain (same columns, types and values). */
+function sameKey(actual: unknown, expected: Expr): boolean {
+  if (!isRecord(actual) || actual.kind !== expected.kind) return false;
+  if (expected.kind === 'and')
+    return sameKey(actual.left, expected.left) && sameKey(actual.right, expected.right);
+  if (expected.kind !== 'compare' || actual.op !== '=' || expected.right.kind !== 'literal')
+    return false;
+  const left = actual.left;
+  return (
+    isRecord(left) &&
+    left.kind === 'column' &&
+    left.table === undefined &&
+    typeof left.name === 'string' &&
+    expected.left.kind === 'column' &&
+    left.name.toUpperCase() === expected.left.name.toUpperCase() &&
+    isLiteral(actual.right, expected.right.value)
+  );
+}
+
+/**
+ * Parses a generated rollback statement back and checks the engine reads exactly what was meant:
+ * an UPDATE of `entity`, the SET columns in order with literals strictly equal to `restore`, and
+ * a WHERE that is exactly the key chain. Returns why not, or null when it round-trips.
+ */
+export function checkRoundTrip(
+  sql: string,
+  entity: string,
+  restore: Record<string, Value>,
+  key: Record<string, Value>,
+): string | null {
+  const why = 'The rollback statement would not be read back as the stored values.';
+  let c: ReturnType<typeof classifyStatement>;
+  try {
+    c = classifyStatement(sql);
+  } catch {
+    return why;
+  }
+  if (c.kind !== 'UPDATE' || c.stmt?.type !== 'update') return why;
+  const stmt = c.stmt;
+  if (c.table.toUpperCase() !== entity.toUpperCase()) return why;
+  if (isRecord(stmt.table) && stmt.table.schema !== undefined) return why;
+  const wanted = Object.entries(restore);
+  if (stmt.set.length !== wanted.length) return why;
+  for (let i = 0; i < wanted.length; i++) {
+    const [col, value] = wanted[i]!;
+    const got = stmt.set[i]!;
+    if (got.column.toUpperCase() !== col.toUpperCase() || !isLiteral(got.value, value)) return why;
+  }
+  return sameKey(stmt.where, keyExpr(key)) ? null : why;
 }
 
 /**

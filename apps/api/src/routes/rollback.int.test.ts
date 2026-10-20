@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance, InjectOptions } from 'fastify';
 import { createDatabase, rolePermissions, roles } from '@dbx/database';
 import type { DatabaseHandle } from '@dbx/database';
@@ -318,5 +318,155 @@ describe('POST /api/audit/:id/rollback-plan', () => {
     const r3 = await rollbackPlan(h, writer, event.id);
     expect(r3.statusCode).toBe(403);
     expect(r3.json().error.code).toBe('FORBIDDEN');
+  });
+});
+
+const BS = String.fromCharCode(92);
+
+const column = async (mock: MockSankhya, col: string, id: number) =>
+  (
+    await mock.db.query<Record<string, unknown>>(
+      `SELECT ${col} AS v FROM tgfpar WHERE codparc = $1`,
+      [id],
+    )
+  ).rows[0]?.v;
+
+const eventsOf = async (h: Harness, cookie: string, action: string) =>
+  (await h.call(cookie, { method: 'GET', url: `/api/audit?action=${action}` })).json() as {
+    total: number;
+    items: Array<{ id: string; connectionId: string; snapshot: unknown }>;
+  };
+
+describe('rollback-plan: exact values, scope and failures', () => {
+  it('backslashes and quotes are restored byte for byte and VERIFIED', async () => {
+    const h = await setup();
+    const cookie = await h.userWith(WRITER);
+    const original = `C:${BS}temp${BS}new ${BS}${BS}share ${BS}n O'Neil ${BS}`;
+    await h.mock.db.query('UPDATE tgfpar SET nomeparc = $1 WHERE codparc = 1', [original]);
+    const done = await run(h, cookie, "UPDATE TGFPAR SET NOMEPARC = 'Novo' WHERE CODPARC = 1");
+    expect(done.json().verification).toBe('VERIFIED');
+    const event = await lastExecuted(h, cookie);
+
+    const res = await rollbackPlan(h, cookie, event.id);
+    expect(res.statusCode, res.body).toBe(200);
+    const body = res.json();
+    const back = await executePlan(h, cookie, body.plan.planId, body.plan.token);
+    expect(back.statusCode, back.body).toBe(200);
+    expect(back.json().verification).toBe('VERIFIED');
+    expect(await partner(h.mock, 1)).toBe(original);
+  });
+
+  it('a multi-row UPDATE: one statement per target, only the first prepared', async () => {
+    const h = await setup();
+    const cookie = await h.userWith(WRITER);
+    const one = await partner(h.mock, 1);
+    const two = await partner(h.mock, 2);
+    const done = await run(
+      h,
+      cookie,
+      "UPDATE TGFPAR SET NOMEPARC = 'Mesmo' WHERE CODPARC IN (1, 2)",
+    );
+    expect(done.json().verification).toBe('VERIFIED');
+    const event = await lastExecuted(h, cookie);
+
+    const res = await rollbackPlan(h, cookie, event.id);
+    expect(res.statusCode, res.body).toBe(200);
+    const body = res.json();
+    expect(body.statements).toBe(2);
+    const lines = (body.displaySql as string).split(';\n');
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toBe(body.sql);
+    expect(lines.join('\n')).toMatch(/WHERE \(CODPARC = 1\)/);
+    expect(lines.join('\n')).toMatch(/WHERE \(CODPARC = 2\)/);
+    expect(body.plan.preview.targets).toHaveLength(1);
+
+    const back = await executePlan(h, cookie, body.plan.planId, body.plan.token);
+    expect(back.json().verification).toBe('VERIFIED');
+    const restored = lines[0]!.includes('CODPARC = 1') ? 1 : 2;
+    expect(await partner(h.mock, restored)).toBe(restored === 1 ? one : two);
+    expect(await partner(h.mock, restored === 1 ? 2 : 1)).toBe('Mesmo');
+  });
+
+  it('a date and an S/N flag are restored exactly', async () => {
+    const h = await setup();
+    const cookie = await h.userWith(WRITER);
+    const ativo = await column(h.mock, 'ativo', 3);
+    const dtcad = await column(h.mock, "to_char(dtcad, 'YYYY-MM-DD')", 3);
+    const flip = ativo === 'S' ? 'N' : 'S';
+    const done = await run(
+      h,
+      cookie,
+      `UPDATE TGFPAR SET ATIVO = '${flip}', DTCAD = '2001-02-03' WHERE CODPARC = 3`,
+    );
+    expect(done.statusCode, done.body).toBe(200);
+    expect(done.json().verification).toBe('VERIFIED');
+    const event = await lastExecuted(h, cookie);
+
+    const res = await rollbackPlan(h, cookie, event.id);
+    expect(res.statusCode, res.body).toBe(200);
+    const body = res.json();
+    expect(body.sql).toContain(`ATIVO = '${ativo}'`);
+    const back = await executePlan(h, cookie, body.plan.planId, body.plan.token);
+    expect(back.statusCode, back.body).toBe(200);
+    expect(back.json().verification).toBe('VERIFIED');
+    expect(await column(h.mock, 'ativo', 3)).toBe(ativo);
+    expect(await column(h.mock, "to_char(dtcad, 'YYYY-MM-DD')", 3)).toBe(dtcad);
+  });
+
+  it('a DENY scoped to the event connection refuses the plan; nothing is prepared', async () => {
+    const h = await setup();
+    const cookie = await h.userWith(WRITER);
+    const conn = await h.app.services.connections.create({
+      name: 'Demo',
+      environment: 'SANDBOX',
+      mode: 'mock',
+      baseUrl: 'mock://local',
+      dialect: 'oracle',
+      secrets: { ...MOCK_CREDENTIALS },
+    });
+    const planned = await h.call(cookie, {
+      method: 'POST',
+      url: '/api/query/preview',
+      payload: {
+        sql: "UPDATE TGFPAR SET NOMEPARC = 'Escopo' WHERE CODPARC = 4",
+        connectionId: conn.id,
+      },
+    });
+    expect(planned.statusCode, planned.body).toBe(200);
+    const done = await executePlan(h, cookie, planned.json().planId, planned.json().token);
+    expect(done.json().verification).toBe('VERIFIED');
+    const [event] = (await eventsOf(h, cookie, 'PLAN_EXECUTED')).items;
+    expect(event!.connectionId).toBe(conn.id);
+    // Before the rule the same caller can plan the rollback on that connection.
+    expect((await rollbackPlan(h, cookie, event!.id)).statusCode).toBe(200);
+    const created = (await eventsOf(h, cookie, 'PLAN_CREATED')).total;
+    const linked = (await eventsOf(h, cookie, 'rollback.planned')).total;
+
+    await h.policy({ name: 'deny this connection', connectionIds: [conn.id] });
+    const res = await rollbackPlan(h, cookie, event!.id);
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error.code).toBe('FORBIDDEN');
+    expect(res.body).not.toContain('token');
+    expect((await eventsOf(h, cookie, 'PLAN_CREATED')).total).toBe(created);
+    expect((await eventsOf(h, cookie, 'rollback.planned')).total).toBe(linked);
+  });
+
+  it('when the rollback.planned record cannot be written: a stable 5xx and no token', async () => {
+    const h = await setup();
+    const cookie = await h.userWith(WRITER);
+    await run(h, cookie, "UPDATE TGFPAR SET NOMEPARC = 'Sem auditoria' WHERE CODPARC = 6");
+    const event = await lastExecuted(h, cookie);
+    const record = h.app.services.audit.record.bind(h.app.services.audit);
+    vi.spyOn(h.app.services.audit, 'record').mockImplementation(async (input) => {
+      if (input.action === 'rollback.planned') throw new Error('audit store down');
+      return record(input);
+    });
+
+    const res = await rollbackPlan(h, cookie, event.id);
+    expect(res.statusCode).toBe(500);
+    expect(res.json().error.code).toBe('INTERNAL_ERROR');
+    expect(res.json().error.details).toEqual({ reason: 'ROLLBACK_AUDIT_FAILED' });
+    expect(res.body).not.toMatch(/token/i);
+    vi.restoreAllMocks();
   });
 });

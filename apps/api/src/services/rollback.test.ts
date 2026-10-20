@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { AuditEventRow } from '@dbx/database';
-import { REDACTED, SNAPSHOT_MAX_STRING_CHARS } from '@dbx/shared';
+import { REDACTED, SNAPSHOT_MAX_STRING_CHARS, redactSnapshot } from '@dbx/shared';
 import { classifyStatement } from '@dbx/sql-engine';
-import { analyzeRollback, buildRollbackSql } from './rollback';
+import { analyzeRollback, buildRollbackSql, checkRoundTrip } from './rollback';
 
 type Row = Record<string, unknown>;
 
@@ -198,4 +198,122 @@ describe('buildRollbackSql', () => {
       if (!a.ok) expect(a.reason).toMatch(reason);
     });
   }
+});
+
+const BS = String.fromCharCode(92);
+
+/** The value the engine reads back from the first SET of a statement. */
+function setValue(sql: string): unknown {
+  const c = classifyStatement(sql);
+  if (c.kind !== 'UPDATE' || c.stmt?.type !== 'update') throw new Error(`not an UPDATE: ${sql}`);
+  return (c.stmt.set[0]!.value as { value: unknown }).value;
+}
+
+describe('literals round-trip exactly through the engine parser', () => {
+  const values: Array<[string, string]> = [
+    ['a backslash', `C:${BS}temp${BS}new`],
+    ['a doubled backslash', `${BS}${BS}share`],
+    ['backslash-n and backslash-t sequences', `x${BS}n${BS}ty${BS}r`],
+    ['a trailing backslash', `back${BS}`],
+    ['a lone backslash', BS],
+    ['quotes mixed with backslashes', `${BS}'q${BS}'' O${BS}${BS}'Neil${BS}`],
+    ['an injection attempt through a backslash', `${BS}' WHERE CODPARC > 0 OR 'a'='a`],
+    ['a date as the gateway sends it', '20/10/2026 10:00:00'],
+  ];
+  for (const [name, value] of values) {
+    it(`restores ${name} byte for byte`, () => {
+      const a = analyzeRollback(executed({ before: [{ CODPARC: 1, NOMEPARC: value }] }));
+      expect(a.ok).toBe(true);
+      if (!a.ok) return;
+      expect(setValue(a.targets[0]!.sql)).toBe(value);
+      expect(a.targets[0]!.restore.NOMEPARC).toBe(value);
+    });
+  }
+
+  it('a backslash in a string key still matches the WHERE exactly', () => {
+    const key = `A${BS}1`;
+    const a = analyzeRollback(
+      executed({
+        statement: "UPDATE TGFPAR SET NOMEPARC = 'x' WHERE CODPARC = 'A'",
+        before: [{ CODPARC: key, NOMEPARC: 'y' }],
+        after: [{ CODPARC: key, NOMEPARC: 'x' }],
+      }),
+    );
+    expect(a.ok).toBe(true);
+    if (!a.ok) return;
+    const c = classifyStatement(a.targets[0]!.sql);
+    if (c.kind !== 'UPDATE' || c.stmt?.type !== 'update') throw new Error('not an UPDATE');
+    expect(c.stmt.where).toEqual({
+      kind: 'compare',
+      op: '=',
+      left: { kind: 'column', name: 'codparc' },
+      right: { kind: 'literal', value: key },
+    });
+  });
+
+  it('a boolean is refused: the gateway dialects have no boolean literal', () => {
+    const a = analyzeRollback(executed({ before: [{ CODPARC: 1, NOMEPARC: true }] }));
+    expect(a.ok).toBe(false);
+    if (!a.ok) expect(a.reason).toMatch(/boolean/i);
+  });
+});
+
+describe('checkRoundTrip', () => {
+  const restore = { NOMEPARC: `a${BS}b` };
+  const key = { CODPARC: 1 };
+
+  it('accepts a statement the parser reads back as intended', () => {
+    expect(
+      checkRoundTrip(
+        `UPDATE TGFPAR SET NOMEPARC = 'a${BS}${BS}b' WHERE (CODPARC = 1)`,
+        'TGFPAR',
+        restore,
+        key,
+      ),
+    ).toBeNull();
+  });
+
+  const bad: Array<[string, string]> = [
+    ['a backslash read as an escape', `UPDATE TGFPAR SET NOMEPARC = 'a${BS}b' WHERE (CODPARC = 1)`],
+    ['another table', `UPDATE TGFPRO SET NOMEPARC = 'a${BS}${BS}b' WHERE (CODPARC = 1)`],
+    ['another key value', `UPDATE TGFPAR SET NOMEPARC = 'a${BS}${BS}b' WHERE (CODPARC = 2)`],
+    ['a key of another type', `UPDATE TGFPAR SET NOMEPARC = 'a${BS}${BS}b' WHERE (CODPARC = '1')`],
+    [
+      'a widened WHERE',
+      `UPDATE TGFPAR SET NOMEPARC = 'a${BS}${BS}b' WHERE (CODPARC = 1) OR (1 = 1)`,
+    ],
+    [
+      'an extra SET',
+      `UPDATE TGFPAR SET NOMEPARC = 'a${BS}${BS}b', EMAIL = NULL WHERE (CODPARC = 1)`,
+    ],
+    ['an expression for a value', `UPDATE TGFPAR SET NOMEPARC = NOMEPARC WHERE (CODPARC = 1)`],
+    ['unparseable SQL', `UPDATE TGFPAR SET NOMEPARC = 'a${BS}' WHERE (CODPARC = 1)`],
+  ];
+  for (const [name, sql] of bad) {
+    it(`refuses ${name}`, () => {
+      expect(checkRoundTrip(sql, 'TGFPAR', restore, key)).toMatch(/read back/i);
+    });
+  }
+});
+
+describe('clipped values', () => {
+  it('a value clipped on a surrogate pair (2000 chars ending in …) is refused', () => {
+    const long = `${'a'.repeat(SNAPSHOT_MAX_STRING_CHARS - 1)}😀${'b'.repeat(500)}`;
+    const [row] = redactSnapshot([{ CODPARC: 1, NOMEPARC: long }]).rows as Array<{
+      NOMEPARC: string;
+    }>;
+    expect(row!.NOMEPARC.length).toBe(SNAPSHOT_MAX_STRING_CHARS);
+    const a = analyzeRollback(executed({ before: [{ CODPARC: 1, NOMEPARC: row!.NOMEPARC }] }));
+    expect(a.ok).toBe(false);
+    if (!a.ok) expect(a.reason).toMatch(/clipped/i);
+  });
+
+  it('a value of exactly the limit that was not clipped is still restorable', () => {
+    const exact = 'a'.repeat(SNAPSHOT_MAX_STRING_CHARS);
+    const [row] = redactSnapshot([{ CODPARC: 1, NOMEPARC: exact }]).rows as Array<{
+      NOMEPARC: string;
+    }>;
+    expect(row!.NOMEPARC).toBe(exact);
+    expect(analyzeRollback(executed({ before: [{ CODPARC: 1, NOMEPARC: exact }] })).ok).toBe(true);
+  });
 });
