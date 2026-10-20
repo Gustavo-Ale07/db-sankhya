@@ -68,7 +68,7 @@ import type { ScratchStatement } from './scratch-guard';
 import type { AuditLifecycleContext, AuditService } from './records';
 import type { SecuritySettingsService } from './security-settings';
 import { labelOf, statusOf, valuesMatch, verifyByKey } from './verification';
-import type { ExecutionReport, ExecutionStep } from './verification';
+import type { ExecutionReport, ExecutionStep, VerifyResult } from './verification';
 
 export type { ExecutionReport, ExecutionStep } from './verification';
 
@@ -1212,7 +1212,12 @@ export class MutationService {
           : null,
         statement: plan.sql,
         policyDecision: policySummary(decision),
-        details: { operation, resource: entity, report },
+        // auditSnapshots=false: the stored report (and so a replay) keeps no row values either.
+        details: {
+          operation,
+          resource: entity,
+          report: decision.limits.auditSnapshots === false ? withoutValues(report) : report,
+        },
         before: attempted.flatMap((t) => (t.before ? [t.before] : [])),
         after: attempted.map((t) => t.after),
         auditSnapshots: decision.limits.auditSnapshots,
@@ -1332,10 +1337,15 @@ export class MutationService {
       targets: check.map(({ i }) => ({ key: keys[i]!, expected: expected[i]! })),
     });
     check.forEach(({ i }, n) => {
-      const verified = results[n];
-      if (verified !== undefined) steps[i] = { ...steps[i]!, verified };
+      steps[i] = readBack(steps[i]!, results[n]);
     });
-    return steps;
+    // Every step carries what the plan meant to write and the row before it (null for an
+    // INSERT); `observed` only ever comes from the read-back above.
+    return steps.map((st, i) => ({
+      ...st,
+      before: update ? pick(r.targets[i]!.before, expected[i]!) : null,
+      expected: expected[i]!,
+    }));
   }
 
   /**
@@ -1349,8 +1359,12 @@ export class MutationService {
   ): Promise<ExecutionStep[]> {
     const runtime = await this.deps.connections.getRuntime(plan.connectionId);
     const t = a.targets[0]!;
+    const expected = Object.fromEntries(
+      Object.entries(a.action.effect(a.input)).map(([c, v]) => [c.toUpperCase(), v]),
+    );
+    const values = { before: pick(t.before, expected), expected };
     const stop = await guard();
-    if (stop) return [{ key: t.key, outcome: 'not_attempted', errorCode: stop.code }];
+    if (stop) return [{ key: t.key, outcome: 'not_attempted', errorCode: stop.code, ...values }];
     let step: ExecutionStep;
     try {
       await runtime.client.call(
@@ -1371,17 +1385,14 @@ export class MutationService {
         errorCode: code,
       };
     }
-    if (step.outcome === 'error') return [step];
+    if (step.outcome === 'error') return [{ ...step, ...values }];
     const pk = a.table.columns.filter((c) => c.pk).map((c) => c.name.toUpperCase());
-    const expected = Object.fromEntries(
-      Object.entries(a.action.effect(a.input)).map(([c, v]) => [c.toUpperCase(), v]),
-    );
-    const [verified] = await verifyByKey(runtime.client, {
+    const [result] = await verifyByKey(runtime.client, {
       entityName: a.table.entityName!,
       pk,
       targets: [{ key: t.key, expected }],
     });
-    return [verified === undefined ? step : { ...step, verified }];
+    return [{ ...readBack(step, result), ...values }];
   }
 
   /**
@@ -1671,6 +1682,34 @@ function sameRows(
   const x = sigs(a);
   const y = sigs(b);
   return x.length === y.length && x.every((s, i) => s === y[i]);
+}
+
+/** A step with its read-back: `verified` and `observed` only when the row was actually read. */
+function readBack(step: ExecutionStep, result: VerifyResult | undefined): ExecutionStep {
+  return {
+    ...step,
+    ...(result?.verified !== undefined ? { verified: result.verified } : {}),
+    ...(result?.observed !== undefined ? { observed: result.observed } : {}),
+  };
+}
+
+/** `row` restricted to the keys of `fields` (missing ones are null); null without a row. */
+function pick(
+  row: RecordValues | null,
+  fields: Record<string, unknown>,
+): Record<string, unknown> | null {
+  if (!row) return null;
+  return Object.fromEntries(Object.keys(fields).map((f) => [f, row[f] ?? null]));
+}
+
+/** The report without any row value (before / expected / observed), for auditSnapshots=false. */
+function withoutValues(report: ExecutionReport): ExecutionReport {
+  return {
+    ...report,
+    steps: report.steps.map(
+      ({ before: _b, expected: _e, observed: _o, ...step }): ExecutionStep => step,
+    ),
+  };
 }
 
 function isReport(v: unknown): v is ExecutionReport {

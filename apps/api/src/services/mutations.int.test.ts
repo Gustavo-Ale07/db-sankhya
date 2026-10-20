@@ -1305,6 +1305,200 @@ describe('MutationService.execute', () => {
   });
 });
 
+describe('execution report: before, expected and observed', () => {
+  const SQL = "UPDATE TGFPAR SET NOMEPARC = 'Novo nome' WHERE CODPARC = 1";
+  const storedReport = async (h: Harness, planId: string) =>
+    (
+      (await h.audit('PLAN_EXECUTED')).find((r) => r.planId === planId)!.details as {
+        report: unknown;
+      }
+    ).report;
+
+  it('VERIFIED: observed is the real read-back, equal to expected; before has the old value', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    const old = await partner(h.mock, 1);
+    const p = await prepare(h, auth, SQL);
+    const report = await execute(h, auth, p);
+    expect(report.verification).toBe('VERIFIED');
+    expect(report.steps).toEqual([
+      {
+        key: { CODPARC: 1 },
+        outcome: 'ok',
+        verified: true,
+        before: { NOMEPARC: old },
+        expected: { NOMEPARC: 'Novo nome' },
+        observed: { NOMEPARC: 'Novo nome' },
+      },
+    ]);
+    // Only the fields the plan wrote: never the key or any other column of the row.
+    expect(Object.keys(report.steps[0]!.observed!)).toEqual(['NOMEPARC']);
+    expect(await storedReport(h, p.planId)).toEqual(report);
+  });
+
+  it('a divergent read-back: FAILED, observed shows the value read, expected the intended one', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    const old = await partner(h.mock, 1);
+    const p = await prepare(h, auth, SQL);
+    h.mock.inject({ type: 'ignoreWrite' }, { service: 'DatasetSP.save' });
+    const report = await execute(h, auth, p);
+    expect(report.verification).toBe('FAILED');
+    expect(report.steps[0]).toEqual({
+      key: { CODPARC: 1 },
+      outcome: 'ok',
+      verified: false,
+      before: { NOMEPARC: old },
+      expected: { NOMEPARC: 'Novo nome' },
+      observed: { NOMEPARC: old },
+    });
+  });
+
+  it('the read-back fails: UNVERIFIED and no observed values', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    const p = await prepare(h, auth, SQL);
+    h.mock.inject({ type: 'malformed' }, { service: 'CRUDServiceProvider.loadRecords' });
+    const report = await execute(h, auth, p);
+    expect(report.verification).toBe('UNVERIFIED');
+    expect(report.steps[0]).toMatchObject({ expected: { NOMEPARC: 'Novo nome' } });
+    expect(report.steps[0]).not.toHaveProperty('observed');
+    expect(report.steps[0]).not.toHaveProperty('verified');
+  });
+
+  it('a partial run: PARTIALLY_VERIFIED, observed only for the step that was read back', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    const p = await prepare(
+      h,
+      auth,
+      "UPDATE TGFPAR SET NOMEPARC = 'Lote' WHERE CODPARC IN (1, 2, 3)",
+    );
+    h.mock.inject({ type: 'rateLimited' }, { service: 'DatasetSP.save', after: 1 });
+    const report = await execute(h, auth, p);
+    expect(report.verification).toBe('PARTIALLY_VERIFIED');
+    expect(report.steps[0]).toMatchObject({ verified: true, observed: { NOMEPARC: 'Lote' } });
+    for (const step of report.steps.slice(1)) {
+      expect(step).not.toHaveProperty('observed');
+      expect(step.expected).toEqual({ NOMEPARC: 'Lote' });
+    }
+  });
+
+  it('INSERT: before is null, observed comes from the row read by its generated key', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    const p = await prepare(
+      h,
+      auth,
+      "INSERT INTO TGFPAR (NOMEPARC, ATIVO) VALUES ('Parceiro gerado', 'S')",
+    );
+    const report = await execute(h, auth, p);
+    expect(report.verification).toBe('VERIFIED');
+    expect(report.steps[0]).toMatchObject({
+      before: null,
+      expected: { NOMEPARC: 'Parceiro gerado', ATIVO: 'S' },
+      observed: { NOMEPARC: 'Parceiro gerado', ATIVO: 'S' },
+    });
+  });
+
+  it('the same idempotency key again replays the identical report, values included', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    const p = await prepare(h, auth, SQL);
+    const key = randomUUID();
+    const first = await execute(h, auth, p, { idempotencyKey: key });
+    const second = await execute(h, auth, p, { idempotencyKey: key });
+    expect(first.steps[0]!.observed).toEqual({ NOMEPARC: 'Novo nome' });
+    expect(second).toEqual(first);
+    expect(saves(h.mock)).toHaveLength(1);
+  });
+
+  it('through the route, a replay answers the same body as the first execute', async () => {
+    const h = await setup(WRITES);
+    const { cookie } = await h.userWith(WRITER);
+    const planned = await h.call(cookie, {
+      method: 'POST',
+      url: '/api/query/preview',
+      payload: { sql: SQL },
+    });
+    const { planId, token } = planned.json() as { planId: string; token: string };
+    const payload = { planId, token, idempotencyKey: randomUUID() };
+    const first = await h.call(cookie, { method: 'POST', url: '/api/query/execute', payload });
+    const again = await h.call(cookie, { method: 'POST', url: '/api/query/execute', payload });
+    expect(first.statusCode, first.body).toBe(200);
+    expect(first.json().steps[0]).toMatchObject({
+      expected: { NOMEPARC: 'Novo nome' },
+      observed: { NOMEPARC: 'Novo nome' },
+    });
+    expect(again.json()).toEqual(first.json());
+    expect(saves(h.mock)).toHaveLength(1);
+  });
+
+  it('auditSnapshots=false: the caller gets the values, the audit (and a replay) does not', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    await h.policy({
+      name: 'no snapshots',
+      effect: 'ALLOW',
+      actions: ['DATA.UPDATE'],
+      entities: ['TGFPAR'],
+      limits: { auditSnapshots: false },
+    });
+    const old = (await partner(h.mock, 1))!;
+    const p = await prepare(h, auth, SQL);
+    const key = randomUUID();
+    const report = await execute(h, auth, p, { idempotencyKey: key });
+    expect(report.steps[0]).toMatchObject({
+      verified: true,
+      before: { NOMEPARC: old },
+      observed: { NOMEPARC: 'Novo nome' },
+    });
+    const stored = JSON.stringify(await storedReport(h, p.planId));
+    expect(stored).not.toContain(old);
+    expect(stored).not.toContain('Novo nome');
+    const replayed = await execute(h, auth, p, { idempotencyKey: key });
+    expect(replayed).toMatchObject({ verification: 'VERIFIED' });
+    expect(replayed.steps).toEqual([{ key: { CODPARC: 1 }, outcome: 'ok', verified: true }]);
+  });
+
+  it('a business action reports the effect field before, expected and as read back', async () => {
+    const h = await setup(WRITES);
+    await h.policy({
+      name: 'actions allowed',
+      effect: 'ALLOW',
+      actions: ['SANKHYA.BUSINESS_ACTION.EXECUTE'],
+    });
+    const { cookie } = await h.userWith(['QUERY.SELECT', 'SANKHYA.BUSINESS_ACTION.EXECUTE']);
+    const status = (
+      await h.mock.db.query<{ statusnota: string }>(
+        'SELECT statusnota FROM tgfcab WHERE nunota = 7',
+      )
+    ).rows[0]!.statusnota;
+    const planned = await h.call(cookie, {
+      method: 'POST',
+      url: '/api/actions/CACSP.cancelarNota/prepare',
+      payload: { input: { nunota: 7, justificativa: 'Nota emitida em duplicidade' } },
+    });
+    const { planId, token } = planned.json() as { planId: string; token: string };
+    const res = await h.call(cookie, {
+      method: 'POST',
+      url: '/api/actions/CACSP.cancelarNota/execute',
+      payload: { planId, token, idempotencyKey: randomUUID() },
+    });
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json().steps).toEqual([
+      {
+        key: { NUNOTA: 7 },
+        outcome: 'ok',
+        verified: true,
+        before: { STATUSNOTA: status },
+        expected: { STATUSNOTA: 'C' },
+        observed: { STATUSNOTA: 'C' },
+      },
+    ]);
+  });
+});
+
 describe('business actions', () => {
   const ACTOR: Permission[] = ['QUERY.SELECT', 'SANKHYA.BUSINESS_ACTION.EXECUTE'];
   const BASE = '/api/actions/CACSP.cancelarNota';
