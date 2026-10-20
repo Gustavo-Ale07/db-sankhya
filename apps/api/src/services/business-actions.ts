@@ -75,13 +75,16 @@ export function listActions(): BusinessAction[] {
   return [...REGISTRY.values()];
 }
 
-/** Live connections run only the actions listed in BUSINESS_ACTIONS_ENABLED; mock ones run all. */
+/**
+ * Only mock connections run every registered action. Any other mode (live, or one added later)
+ * runs only the actions listed in BUSINESS_ACTIONS_ENABLED, by exact id (fail closed).
+ */
 export function actionEnabled(
   action: BusinessAction,
-  mode: 'live' | 'mock',
+  mode: string,
   enabled: readonly string[],
 ): boolean {
-  return mode !== 'live' || enabled.includes(action.id);
+  return mode === 'mock' || enabled.includes(action.id);
 }
 
 /** A word for the plan summary and the strong phrase: `CACSP.cancelarNota` → `CACSP_CANCELARNOTA`. */

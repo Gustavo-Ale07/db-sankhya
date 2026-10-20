@@ -382,16 +382,25 @@ export class PlansService {
    * applies. Undefined for a malformed id, an unknown plan or a plan of someone else: the caller
    * then goes through `consume`, which answers CONFIRMATION_INVALID without leaking anything.
    */
-  async peek(id: string, userId: string): Promise<{ requiresApproval: boolean } | undefined> {
+  async peek(
+    id: string,
+    userId: string,
+  ): Promise<{ requiresApproval: boolean; route: unknown; sql: string } | undefined> {
     if (typeof id !== 'string' || !UUID.test(id)) return undefined;
     if (typeof userId !== 'string' || !UUID.test(userId)) return undefined;
     const [row] = await this.db
-      .select({ userId: plans.userId, requiresApproval: plans.requiresApproval })
+      .select({
+        userId: plans.userId,
+        requiresApproval: plans.requiresApproval,
+        capability: plans.capability,
+        sql: plans.sql,
+      })
       .from(plans)
       .where(eq(plans.id, id))
       .limit(1);
     if (!row || row.userId !== userId) return undefined;
-    return { requiresApproval: row.requiresApproval };
+    const route = (row.capability as { route?: unknown } | null)?.route;
+    return { requiresApproval: row.requiresApproval, route, sql: row.sql };
   }
 
   /**

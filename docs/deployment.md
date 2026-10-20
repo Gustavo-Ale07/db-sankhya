@@ -83,6 +83,9 @@ reverse proxy at it; the container keeps listening on 3001 internally.
 Mutations are not available yet; `SAFE_MODE`, `GLOBAL_WRITE_ENABLED` and `WRITE_TO_SANKHYA` keep
 their safe defaults.
 
+> Superseded by Stage 11: writes run as previewed plans once the switches allow them; see
+> docs/architecture.md ("Business actions").
+
 ## Reverse proxy
 
 ### Caddy (automatic HTTPS)

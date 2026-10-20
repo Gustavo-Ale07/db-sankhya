@@ -987,6 +987,12 @@ export class MutationService {
         ...(ctx.idempotencyKey !== undefined ? { idempotencyKey: ctx.idempotencyKey } : {}),
       };
       const peek = await this.deps.plans.peek(ctx.planId, auth.user.id);
+      // A plan sent to the wrong route (an action plan to /api/query/execute, a SQL plan or
+      // another action's plan to an action route) is refused before it is consumed, so it can
+      // still run on its own route. RE-AUTHORIZE checks it again on the consumed plan.
+      if (peek && !routeMatches(peek, ctx.actionId)) {
+        throw invalidPlan('This plan cannot be executed here.');
+      }
       consumed = peek?.requiresApproval
         ? await this.deps.approvals.consumeForPlan(input)
         : await this.deps.plans.consume(input);
@@ -1496,6 +1502,15 @@ export class MutationService {
       },
     });
   }
+}
+
+/** Whether a plan (its route and statement) belongs to the route it was sent to. */
+function routeMatches(
+  plan: { route: unknown; sql: string },
+  actionId: string | undefined,
+): boolean {
+  if (plan.route !== 'SANKHYA_ACTION') return actionId === undefined;
+  return actionId !== undefined && parseActionStatement(plan.sql)?.action.id === actionId;
 }
 
 /**

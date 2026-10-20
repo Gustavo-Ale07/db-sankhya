@@ -5,6 +5,8 @@ import { PGlite } from '@electric-sql/pglite';
 import { findTableByEntity, seedMockDataset, type MockTable } from './dataset';
 import { gateMockQuery } from './gate';
 
+type Tx = Parameters<Parameters<PGlite['transaction']>[0]>[0];
+
 /**
  * Fictitious Sankhya gateway for tests and demo mode. It speaks the documented request and
  * envelope shapes (audit §3.1–3.2) over an in-memory PGlite database seeded with invented data.
@@ -28,8 +30,10 @@ export type MockFault =
   /** Applies the call, then drops the response, so a write's outcome is unknown to the caller. */
   | { type: 'responseLost' }
   /**
-   * DatasetSP.save only: answers success, echoes the requested values, but does not persist the
-   * listed `fields` (default: every non-key field of the record). Other fields are saved normally.
+   * A write that answers success but is not (fully) applied. DatasetSP.save echoes the requested
+   * values but does not persist the listed `fields` (default: every non-key field of the record);
+   * other fields are saved normally. Any other write service (a business action) answers its
+   * normal success response, but its change is rolled back (`fields` is ignored).
    */
   | { type: 'ignoreWrite'; fields?: string[] };
 
@@ -291,7 +295,12 @@ export async function createMockSankhya(opts: MockSankhyaOptions = {}): Promise<
           );
         }
         case 'CACSP.cancelarNota':
-          return envelope(serviceName, await cancelarNota(body));
+          return envelope(
+            serviceName,
+            fault?.type === 'ignoreWrite'
+              ? await discarded((tx) => cancelarNota(body, tx))
+              : await cancelarNota(body),
+          );
       }
       return serviceError(serviceName, 'Serviço não encontrado');
     } catch (err) {
@@ -481,17 +490,30 @@ export async function createMockSankhya(opts: MockSankhyaOptions = {}): Promise<
   }
 
   /** Mock-only: marks the note as cancelled (STATUSNOTA = 'C'). Not the real service contract. */
-  async function cancelarNota(body: unknown) {
+  async function cancelarNota(body: unknown, q: Tx | PGlite = db) {
     const nunota = findNunota(body);
     if (nunota === undefined) throw new MockServiceError('NUNOTA ausente');
-    const res = await db.query(`UPDATE TGFCAB SET STATUSNOTA = 'C' WHERE NUNOTA = $1`, [nunota]);
+    const res = await q.query(`UPDATE TGFCAB SET STATUSNOTA = 'C' WHERE NUNOTA = $1`, [nunota]);
     if (res.affectedRows !== 1) throw new MockServiceError('Nota não encontrada');
     return { notasCanceladas: { nunota: [{ $: String(nunota) }] } };
   }
 
-  function readOnly<T>(
-    fn: (tx: Parameters<Parameters<PGlite['transaction']>[0]>[0]) => Promise<T>,
-  ) {
+  /** Runs a write and rolls it back, returning what it answered (the ignoreWrite fault). */
+  async function discarded<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
+    let out: { value: T } | undefined;
+    const rollback = new Error('mock ignoreWrite rollback');
+    try {
+      await db.transaction(async (tx) => {
+        out = { value: await fn(tx) };
+        throw rollback;
+      });
+    } catch (err) {
+      if (err !== rollback) throw err;
+    }
+    return out!.value;
+  }
+
+  function readOnly<T>(fn: (tx: Tx) => Promise<T>) {
     return db
       .transaction(async (tx) => {
         await tx.exec('SET TRANSACTION READ ONLY');

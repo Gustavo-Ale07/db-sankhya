@@ -316,6 +316,30 @@ describe('mock Sankhya gateway', () => {
       expect(await nameOf(7)).toBe('Persistido');
     });
 
+    it('ignoreWrite on a business action answers success but rolls the change back', async () => {
+      const open = await mock.db.query<{ nunota: number }>(
+        "SELECT NUNOTA FROM TGFCAB WHERE STATUSNOTA <> 'C' ORDER BY NUNOTA LIMIT 1",
+      );
+      const nunota = String(open.rows[0]!.nunota);
+      const status = async () =>
+        (
+          await mock.db.query<{ statusnota: string }>(
+            'SELECT STATUSNOTA FROM TGFCAB WHERE NUNOTA = $1',
+            [nunota],
+          )
+        ).rows[0]!.statusnota;
+      const original = await status();
+      expect(original).not.toBe('C');
+      mock.inject({ type: 'ignoreWrite' }, { service: 'CACSP.cancelarNota' });
+      const cancel = () =>
+        call('CACSP.cancelarNota', { notasCanceladas: { nunota: [{ $: nunota }] } }, 'mgecom');
+      const { body } = await cancel();
+      expect(body.status).toBe('1');
+      expect(await status()).toBe(original);
+      expect((await cancel()).body.status).toBe('1');
+      expect(await status()).toBe('C');
+    });
+
     it('ignoreWrite with fields only drops the listed fields', async () => {
       mock.inject({ type: 'ignoreWrite', fields: ['NOMEPARC'] }, { service: 'DatasetSP.save' });
       const original = await nameOf(8);

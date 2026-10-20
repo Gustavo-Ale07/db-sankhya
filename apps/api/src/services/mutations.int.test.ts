@@ -1309,11 +1309,12 @@ describe('business actions', () => {
     cookie: string,
     planned: { planId: string; token: string },
     url = BASE,
+    idempotencyKey = randomUUID(),
   ) =>
     h.call(cookie, {
       method: 'POST',
       url: `${url}/execute`,
-      payload: { planId: planned.planId, token: planned.token, idempotencyKey: randomUUID() },
+      payload: { planId: planned.planId, token: planned.token, idempotencyKey },
     });
 
   it('prepare plans without calling the action; execute calls it once and verifies', async () => {
@@ -1466,19 +1467,16 @@ describe('business actions', () => {
     expect(actionCalls(h.mock)).toEqual([]);
   });
 
-  it('an action plan never runs through /api/query/execute, nor a SQL plan through an action', async () => {
+  it('a plan sent to the wrong route is refused without being used up', async () => {
     const h = await setup(WRITES);
     await allowActions(h);
     const { cookie } = await h.userWith([...ACTOR, 'DATA.UPDATE']);
     const planned = await prepareAction(h, cookie);
+    const action = planned.json() as { planId: string; token: string };
     const viaQuery = await h.call(cookie, {
       method: 'POST',
       url: '/api/query/execute',
-      payload: {
-        planId: planned.json().planId as string,
-        token: planned.json().token as string,
-        idempotencyKey: randomUUID(),
-      },
+      payload: { planId: action.planId, token: action.token, idempotencyKey: randomUUID() },
     });
     expect(viaQuery.json().error.code).toBe('CONFIRMATION_INVALID');
     expect(actionCalls(h.mock)).toEqual([]);
@@ -1486,12 +1484,133 @@ describe('business actions', () => {
     const sqlPlan = await h.call(cookie, {
       method: 'POST',
       url: '/api/query/preview',
-      payload: { sql: "UPDATE TGFPAR SET NOMEPARC = 'X' WHERE CODPARC = 2" },
+      payload: { sql: "UPDATE TGFPAR SET NOMEPARC = 'Rota certa' WHERE CODPARC = 2" },
     });
     expect(sqlPlan.statusCode, sqlPlan.body).toBe(200);
-    const viaAction = await executeAction(h, cookie, sqlPlan.json());
+    const sql = sqlPlan.json() as { planId: string; token: string };
+    const viaAction = await executeAction(h, cookie, sql);
     expect(viaAction.json().error.code).toBe('CONFIRMATION_INVALID');
     expect(saves(h.mock)).toEqual([]);
+
+    // Both refusals are audited as denied, and neither plan was consumed.
+    const denied = await h.audit('write.denied');
+    expect(denied.filter((d) => d.errorCode === 'CONFIRMATION_INVALID')).toHaveLength(2);
+    expect(await h.audit('PLAN_DENIED')).toEqual([]);
+
+    const ran = await executeAction(h, cookie, action);
+    expect(ran.statusCode, ran.body).toBe(200);
+    expect(ran.json()).toMatchObject({ verification: 'VERIFIED' });
+    expect(actionCalls(h.mock)).toHaveLength(1);
+    const sqlRan = await h.call(cookie, {
+      method: 'POST',
+      url: '/api/query/execute',
+      payload: { planId: sql.planId, token: sql.token, idempotencyKey: randomUUID() },
+    });
+    expect(sqlRan.statusCode, sqlRan.body).toBe(200);
+    expect(sqlRan.json()).toMatchObject({ verification: 'VERIFIED' });
+    expect(await partner(h.mock, 2)).toBe('Rota certa');
+  });
+
+  it('a lost response on the action is never VERIFIED and is not retried', async () => {
+    const h = await setup(WRITES);
+    await allowActions(h);
+    const { cookie } = await h.userWith(ACTOR);
+    const planned = await prepareAction(h, cookie);
+    h.mock.inject({ type: 'responseLost' }, { service: 'CACSP.cancelarNota' });
+    const res = await executeAction(h, cookie, planned.json());
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json().verification).not.toBe('VERIFIED');
+    expect(res.json().steps).toMatchObject([{ outcome: 'unknown' }]);
+    expect(actionCalls(h.mock)).toHaveLength(1);
+  });
+
+  it('an action the gateway accepted but did not apply reads back FAILED', async () => {
+    const h = await setup(WRITES);
+    await allowActions(h);
+    const { cookie } = await h.userWith(ACTOR);
+    const before = await statusOf(h.mock, 7);
+    const planned = await prepareAction(h, cookie);
+    h.mock.inject({ type: 'ignoreWrite' }, { service: 'CACSP.cancelarNota' });
+    const res = await executeAction(h, cookie, planned.json());
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json()).toMatchObject({
+      verification: 'FAILED',
+      steps: [{ outcome: 'ok', verified: false }],
+    });
+    expect(await statusOf(h.mock, 7)).toBe(before);
+    expect(actionCalls(h.mock)).toHaveLength(1);
+  });
+
+  it('concurrent executes, or one idempotency key sent again, call the action once', async () => {
+    const h = await setup(WRITES);
+    await allowActions(h);
+    const { cookie } = await h.userWith(ACTOR);
+    const first = (await prepareAction(h, cookie)).json() as { planId: string; token: string };
+    const racing = await Promise.all([
+      executeAction(h, cookie, first),
+      executeAction(h, cookie, first),
+      executeAction(h, cookie, first),
+    ]);
+    expect(racing.filter((r) => r.statusCode === 200)).toHaveLength(1);
+    expect(actionCalls(h.mock)).toHaveLength(1);
+
+    const second = (await prepareAction(h, cookie, { ...INPUT, nunota: 8 })).json() as {
+      planId: string;
+      token: string;
+    };
+    const key = randomUUID();
+    const same = await Promise.all([
+      executeAction(h, cookie, second, BASE, key),
+      executeAction(h, cookie, second, BASE, key),
+    ]);
+    const later = await executeAction(h, cookie, second, BASE, key);
+    const reports = [...same, later].map((r) => {
+      expect(r.statusCode, r.body).toBe(200);
+      return r.json().verification as string;
+    });
+    expect(reports).toEqual(['VERIFIED', 'VERIFIED', 'VERIFIED']);
+    expect(actionCalls(h.mock)).toHaveLength(2);
+  });
+
+  it('an action plan that requires approval runs only after a second person approves', async () => {
+    const h = await setup(WRITES);
+    await allowActions(h);
+    await h.policy({
+      name: 'actions need approval',
+      effect: 'ALLOW',
+      actions: ['SANKHYA.BUSINESS_ACTION.EXECUTE'],
+      limits: { requireApproval: true },
+    });
+    const { cookie } = await h.userWith(ACTOR);
+    const approver = await h.userWith([...ACTOR, 'APPROVAL.DECIDE']);
+    const planned = await prepareAction(h, cookie);
+    expect(planned.statusCode, planned.body).toBe(200);
+    expect(planned.json().requires).toMatchObject({ approval: true });
+    const plan = planned.json() as { planId: string; token: string };
+
+    const early = await executeAction(h, cookie, plan);
+    expect(early.json().error.code).toBe('FORBIDDEN');
+    expect(actionCalls(h.mock)).toEqual([]);
+
+    const requested = await h.call(cookie, {
+      method: 'POST',
+      url: '/api/approvals',
+      payload: { planId: plan.planId },
+    });
+    expect(requested.statusCode, requested.body).toBe(201);
+    const approvalId = (requested.json() as { approval: { id: string } }).approval.id;
+    const decided = await h.call(approver.cookie, {
+      method: 'POST',
+      url: `/api/approvals/${approvalId}/decision`,
+      payload: { decision: 'APPROVE', reason: 'ok' },
+    });
+    expect(decided.statusCode, decided.body).toBe(200);
+
+    const res = await executeAction(h, cookie, plan);
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json()).toMatchObject({ verification: 'VERIFIED' });
+    expect(actionCalls(h.mock)).toHaveLength(1);
+    expect(await statusOf(h.mock, 7)).toBe('C');
   });
 });
 
