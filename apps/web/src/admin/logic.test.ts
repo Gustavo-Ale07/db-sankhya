@@ -77,6 +77,29 @@ describe('policyPayload', () => {
       enabled: false,
     });
   });
+
+  it('keeps auditSnapshots=false when a rule is edited (no form control turns it back on)', () => {
+    const form = formFromRule({
+      id: 'p2',
+      name: 'Sem snapshots',
+      effect: 'ALLOW',
+      subjectType: 'everyone',
+      subjectId: null,
+      environments: [],
+      connectionIds: [],
+      actions: ['DATA.UPDATE'],
+      entities: ['TGFPAR'],
+      columns: [],
+      limits: { auditSnapshots: false },
+      overrideWhereRequired: false,
+      enabled: true,
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    });
+    expect(policyPayload(form).body!.limits).toEqual({ auditSnapshots: false });
+    expect(
+      policyPayload({ ...EMPTY_POLICY, name: 'x', actions: ['DATA.UPDATE'] }).body!.limits,
+    ).toEqual({});
+  });
 });
 
 describe('describeSecurity', () => {

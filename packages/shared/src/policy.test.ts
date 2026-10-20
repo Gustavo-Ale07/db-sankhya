@@ -971,6 +971,26 @@ describe('evaluatePolicy', () => {
     expect(d.matchedRuleIds.sort()).toEqual(['allow-upd', 'r2', 'r3']);
   });
 
+  it('auditSnapshots defaults to true and false wins across matching rules', () => {
+    expect(evaluatePolicy(update(), [rule(allowUpdate)], ALL).limits.auditSnapshots).toBe(true);
+    const d = evaluatePolicy(
+      update(),
+      [
+        rule({ ...allowUpdate, limits: { auditSnapshots: true } }),
+        rule({ id: 'r2', actions: ['DATA.*'], limits: { auditSnapshots: false } }),
+      ],
+      ALL,
+    );
+    expect(d.effect).toBe('ALLOW');
+    expect(d.limits.auditSnapshots).toBe(false);
+    expect(validatePolicyRule(rule({ id: 'a', limits: { auditSnapshots: false } }))).toEqual([]);
+    expect(
+      validatePolicyRule(
+        rule({ id: 'b', limits: { auditSnapshots: 'no' } as unknown as PolicyRule['limits'] }),
+      ).join('; '),
+    ).toMatch(/auditSnapshots must be a boolean/);
+  });
+
   it('the defaults are ceilings: rules can only lower the row limits', () => {
     const d = evaluatePolicy(
       update(),

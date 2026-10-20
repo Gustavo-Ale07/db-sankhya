@@ -14,14 +14,18 @@
  *   must be unchanged, and the targets are read again (TARGETS_CHANGED when they moved). Then the
  *   write switches: GLOBAL_WRITE_ENABLED (env AND runtime kill switch), WRITE_TO_SANKHYA (Sankhya
  *   plans) and SAFE_MODE (PRODUCTION plans), each failing closed with READ_ONLY_MODE.
- * - EXECUTE sends one save per target, in order, never retried. A definite failure stops the run
- *   (the rest is `not_attempted`); a timeout is `unknown` (WRITE_OUTCOME_UNKNOWN).
+ * - EXECUTE sends one save per target, in order, never retried. Before each save the switches and
+ *   the policy version are checked again, so an emergency stop halts a run in progress. A definite
+ *   failure or a stop ends the run (the rest is `not_attempted`); a timeout is `unknown`
+ *   (WRITE_OUTCOME_UNKNOWN). Keys must be complete: a null key value is never saved.
  * - VERIFY reads every target back by key and labels the run VERIFIED, PARTIALLY_VERIFIED,
  *   UNVERIFIED or FAILED (see `verification.ts`).
  * - AUDIT records PLAN_EXECUTED (with the report, for replays) and VERIFICATION; every refusal
- *   after the consume is a PLAN_DENIED, every refusal of the consume a `write.denied`.
+ *   after the consume is a PLAN_DENIED, every refusal of the consume a `write.denied`. The
+ *   `auditSnapshots` policy limit (false wins) leaves only counts and keys in the audit. If the
+ *   audit cannot be written after a save was sent, the answer is WRITE_OUTCOME_UNKNOWN.
  */
-import { AppError, isAppError } from '@dbx/shared';
+import { AppError, SNAPSHOT_MAX_ROWS, isAppError } from '@dbx/shared';
 import type { Environment, ErrorCode, Permission, PolicyColumn, PolicyDecision } from '@dbx/shared';
 import { classifyStatement, resolveCapability } from '@dbx/sql-engine';
 import type {
@@ -119,6 +123,8 @@ export interface MutationDeps {
   maxReadRows: number;
   /** SCRATCH_MAX_ROWS: read ceiling of the scratch policy decisions. */
   scratchMaxReadRows?: number;
+  /** Errors that cannot reach the audit (only ids and codes are logged, never values). */
+  logger?: { error(obj: Record<string, unknown>, msg: string): void };
 }
 
 type WriteClassified = Extract<Classified, { kind: 'INSERT' | 'UPDATE' | 'DELETE' }>;
@@ -131,6 +137,11 @@ const PERMISSION: Record<WriteClassified['kind'], Permission> = {
 
 const SCRATCH_TABLE = /^tmp_/i;
 const IDENT = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+/** Every primary-key column has a value (a null key could match or create any row). */
+function keyComplete(key: Record<string, unknown>, pk: string[]): boolean {
+  return pk.length > 0 && pk.every((k) => key[k] !== null && key[k] !== undefined);
+}
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** A refusal with the stage that produced it and audit-only details (never sent to the user). */
@@ -361,6 +372,18 @@ export class MutationService {
       previewKind = 'IMPACT_ANALYSIS';
       previewLabels = ['IMPACT_ANALYSIS', 'SIMULATED_PREVIEW'];
     }
+    if (stmt.type === 'update') {
+      const pk = table.columns.filter((c) => c.pk).map((c) => c.name.toUpperCase());
+      if (!targets.every((t) => keyComplete(t.key, pk))) {
+        throw refuse(
+          'PREVIEW',
+          new AppError(
+            'OPERATION_NOT_SUPPORTED',
+            `${table.name.toUpperCase()}: a row to change has no complete primary key; it cannot be saved by key.`,
+          ),
+        );
+      }
+    }
     if (targets.length > maxWriteRows) {
       throw refuse(
         'PREVIEW',
@@ -451,7 +474,18 @@ export class MutationService {
       {
         statement: sql,
         policyDecision: policySummary(decision),
-        details: { operation: write.kind, resource: entity, affected, previewKind, previewLabels },
+        details: {
+          operation: write.kind,
+          resource: entity,
+          affected,
+          previewKind,
+          previewLabels,
+          // Without snapshots the audit keeps only the count and the keys.
+          ...(decision.limits.auditSnapshots
+            ? {}
+            : { keys: targets.slice(0, SNAPSHOT_MAX_ROWS).map((t) => t.key) }),
+        },
+        auditSnapshots: decision.limits.auditSnapshots,
         before: targets.flatMap((t) => (t.before ? [t.before] : [])),
         after: targets.map((t) => t.after),
       },
@@ -781,7 +815,7 @@ export class MutationService {
     try {
       steps =
         'sankhya' in resolved
-          ? await this.runSankhya(plan, write, resolved.sankhya)
+          ? await this.runSankhya(plan, write, resolved.sankhya, () => this.stillAllowed(plan))
           : await this.runScratch(resolved.scratch);
     } catch (err) {
       // Nothing was sent (the runtime could not be built, for example): a failed execution.
@@ -805,34 +839,65 @@ export class MutationService {
       steps,
     };
     const firstError = steps.find((s) => s.errorCode !== undefined);
-    const attempted = targets.filter((_, i) => {
-      const o = steps[i]?.outcome;
-      return o === 'ok' || o === 'unknown';
-    });
-    await this.deps.audit.recordPlanExecuted(lctx, {
-      outcome: report.status,
-      affectedRows: steps.filter((s) => s.outcome === 'ok').length,
-      durationMs: Date.now() - started,
-      errorCode: firstError?.errorCode ?? null,
-      errorMessage: firstError ? `Step ${steps.indexOf(firstError) + 1} failed.` : null,
-      statement: plan.sql,
-      policyDecision: policySummary(decision),
-      details: { operation: write.kind, resource: entity, report },
-      before: attempted.flatMap((t) => (t.before ? [t.before] : [])),
-      after: attempted.map((t) => t.after),
-      auditSnapshots:
-        (decision.limits as unknown as Record<string, unknown>).auditSnapshots !== false,
-    });
-    await this.deps.audit.recordVerification(lctx, {
-      passed: report.verification === 'VERIFIED',
-      verification: {
-        label: report.verification,
-        verified: steps.filter((s) => s.verified === true).length,
-        mismatched: steps.filter((s) => s.verified === false).length,
-        unverified: steps.filter((s) => s.verified === undefined).length,
-      },
-    });
+    const sent = (o: ExecutionStep['outcome'] | undefined) => o === 'ok' || o === 'unknown';
+    const attempted = targets.filter((_, i) => sent(steps[i]?.outcome));
+    try {
+      await this.deps.audit.recordPlanExecuted(lctx, {
+        outcome: report.status,
+        affectedRows: steps.filter((s) => s.outcome === 'ok').length,
+        durationMs: Date.now() - started,
+        errorCode: firstError?.errorCode ?? null,
+        errorMessage: firstError
+          ? firstError.outcome === 'not_attempted'
+            ? `Stopped before step ${steps.indexOf(firstError) + 1}.`
+            : `Step ${steps.indexOf(firstError) + 1} failed.`
+          : null,
+        statement: plan.sql,
+        policyDecision: policySummary(decision),
+        details: { operation: write.kind, resource: entity, report },
+        before: attempted.flatMap((t) => (t.before ? [t.before] : [])),
+        after: attempted.map((t) => t.after),
+        auditSnapshots: decision.limits.auditSnapshots,
+      });
+      await this.deps.audit.recordVerification(lctx, {
+        passed: report.verification === 'VERIFIED',
+        verification: {
+          label: report.verification,
+          verified: steps.filter((s) => s.verified === true).length,
+          mismatched: steps.filter((s) => s.verified === false).length,
+          unverified: steps.filter((s) => s.verified === undefined).length,
+        },
+      });
+    } catch (err) {
+      this.deps.logger?.error(
+        { planId: plan.id, errorName: err instanceof Error ? err.name : typeof err },
+        'The execution could not be audited',
+      );
+      if (!steps.some((st) => sent(st.outcome))) throw err;
+      // Writes were sent: the caller must not read this as "nothing happened" and retry.
+      throw new AppError(
+        'WRITE_OUTCOME_UNKNOWN',
+        'The change was sent, but its audit record could not be written. Check the records ' +
+          'before doing anything else; do not repeat the change.',
+        { planId: plan.id, status: report.status, verification: report.verification },
+      );
+    }
     return report;
+  }
+
+  /**
+   * Checked before every save: the kill switch (and the other write switches) and the policy
+   * version. An emergency stop or a rule change halts a run in progress.
+   */
+  private async stillAllowed(plan: PlanRow): Promise<AppError | null> {
+    try {
+      await this.assertSwitches(plan, false);
+      await this.assertPolicyVersion(plan);
+      return null;
+    } catch (err) {
+      if (isAppError(err)) return new AppError(err.code, err.message, err.details);
+      return new AppError('READ_ONLY_MODE', 'The write switches could not be read.');
+    }
   }
 
   /** One save per target, in order, never retried; then the read-back. */
@@ -840,10 +905,16 @@ export class MutationService {
     plan: PlanRow,
     write: WriteClassified,
     r: SankhyaResolution,
+    guard: () => Promise<AppError | null>,
   ): Promise<ExecutionStep[]> {
     const runtime = await this.deps.connections.getRuntime(plan.connectionId);
     const entityName = r.table.entityName!;
     const update = write.kind === 'UPDATE';
+    const pk = r.table.columns.filter((c) => c.pk).map((c) => c.name.toUpperCase());
+    // Defence in depth (also refused at PREVIEW): a save by an incomplete key could hit any row.
+    if (update && !r.targets.every((t) => keyComplete(t.key, pk))) {
+      throw new AppError('OPERATION_NOT_SUPPORTED', 'A row to change has no complete primary key.');
+    }
     const steps: ExecutionStep[] = r.targets.map((t) => ({
       key: t.key,
       outcome: 'not_attempted',
@@ -854,6 +925,12 @@ export class MutationService {
     });
     for (let i = 0; i < r.targets.length; i++) {
       const t = r.targets[i]!;
+      const stop = await guard();
+      if (stop) {
+        // This step and the rest stay not_attempted; the reason is on the first of them.
+        steps[i] = { key: t.key, outcome: 'not_attempted', errorCode: stop.code };
+        break;
+      }
       const values = Object.fromEntries(Object.entries(expected[i]!).map(([f, v]) => [f, wire(v)]));
       const record = update
         ? {
@@ -877,7 +954,6 @@ export class MutationService {
     }
 
     // VERIFY: the steps that ran (or may have run) are read back by key.
-    const pk = r.table.columns.filter((c) => c.pk).map((c) => c.name.toUpperCase());
     const check = steps
       .map((s, i) => ({ s, i }))
       .filter(({ s }) => s.outcome === 'ok' || s.outcome === 'unknown');

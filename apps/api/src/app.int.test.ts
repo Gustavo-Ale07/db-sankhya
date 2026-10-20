@@ -882,9 +882,45 @@ describe('admin', () => {
     expect(res.json()).toMatchObject({
       database: { status: 'ok' },
       sankhya: { state: 'READY', mode: 'mock', readyConnections: 1 },
-      writes: { safeMode: true, globalWriteEnabled: false, available: false },
+      // Fail-closed defaults: nothing can be written.
+      writes: {
+        safeMode: true,
+        globalWriteEnabled: false,
+        globalWrite: { env: false, runtime: true, effective: false },
+        writeToSankhya: false,
+        available: false,
+        productionAvailable: false,
+        scratchAvailable: false,
+      },
     });
     expect(res.json()).not.toHaveProperty('ai');
+  });
+
+  it('reports write availability from the effective switches, kill switch included', async () => {
+    const h = await setup({ GLOBAL_WRITE_ENABLED: 'true', WRITE_TO_SANKHYA: 'true' });
+    const admin = await h.login();
+    const status = async () =>
+      (await h.call(admin, { method: 'GET', url: '/api/status' })).json().writes as Record<
+        string,
+        unknown
+      >;
+    expect(await status()).toMatchObject({
+      safeMode: true,
+      globalWriteEnabled: true,
+      writeToSankhya: true,
+      available: true,
+      productionAvailable: false,
+      scratchAvailable: true,
+    });
+    // The runtime kill switch wins over the env value.
+    await h.app.services.security.setGlobalWrite(false, null);
+    expect(await status()).toMatchObject({
+      globalWriteEnabled: false,
+      globalWrite: { env: true, runtime: false, effective: false },
+      available: false,
+      productionAvailable: false,
+      scratchAvailable: false,
+    });
   });
 
   it('grants permissions through groups and revokes them when the group is disabled', async () => {

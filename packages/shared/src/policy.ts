@@ -70,7 +70,8 @@
  *    limits are min(ceiling, every rule value): the rule-7 defaults (or `options.defaults`) are
  *    ceilings that rules can only lower. `options.defaults` is trusted operator configuration and
  *    may raise the ceilings, but never above `POLICY_HARD_MAX_LIMITS`. Flags are OR-ed; `requirePreview` and
- *    `requireConfirmation` are always true.
+ *    `requireConfirmation` are always true. `auditSnapshots` (default true) is AND-ed: any
+ *    matching ALLOW rule that sets it false wins.
  * 5. In PRODUCTION a write forces `requireConfirmation` and `requireStrongConfirmation`.
  * 6. UPDATE/DELETE without WHERE: DENY, unless one matching ALLOW rule with
  *    `overrideWhereRequired` covers every requested entity on its own and no matching rule sets
@@ -94,6 +95,8 @@ export interface EffectiveLimits {
   requireConfirmation: boolean;
   requireStrongConfirmation: boolean;
   requireApproval: boolean;
+  /** Whether the audit stores before/after row values of a write; false keeps counts and keys. */
+  auditSnapshots: boolean;
 }
 
 export const DEFAULT_LIMITS: Readonly<EffectiveLimits> = Object.freeze({
@@ -104,6 +107,7 @@ export const DEFAULT_LIMITS: Readonly<EffectiveLimits> = Object.freeze({
   requireConfirmation: true,
   requireStrongConfirmation: false,
   requireApproval: false,
+  auditSnapshots: true,
 });
 
 export interface PolicyRule {
@@ -247,6 +251,7 @@ interface CompiledRule {
   columns: ColumnPattern[];
   rows: Partial<Record<RowLimit, number>>;
   flags: Partial<Record<FlagLimit, boolean>>;
+  auditSnapshots?: boolean;
   overrideWhereRequired: boolean;
 }
 interface NormalizedRequest {
@@ -361,6 +366,8 @@ function evaluate(
   }
   limits.requirePreview = true;
   limits.requireConfirmation = true;
+  // The restrictive value of auditSnapshots is false: any matching ALLOW rule turning it off wins.
+  limits.auditSnapshots = !allows.some((r) => r.auditSnapshots === false);
 
   if (denies.length > 0) {
     return deny(...denies.map((r) => `denied by rule ${r.id} (${r.name})`));
@@ -632,6 +639,7 @@ function compileRule(r: unknown): { rule: CompiledRule | null; problems: string[
 
   const rows: CompiledRule['rows'] = {};
   const flags: CompiledRule['flags'] = {};
+  let auditSnapshots: boolean | undefined;
   if (typeof limits !== 'object' || limits === null || Array.isArray(limits)) {
     problems.push('limits must be an object');
   } else {
@@ -645,6 +653,9 @@ function compileRule(r: unknown): { rule: CompiledRule | null; problems: string[
       } else if ((FLAG_LIMITS as readonly string[]).includes(key)) {
         if (typeof value !== 'boolean') problems.push(`${key} must be a boolean`);
         else flags[key as FlagLimit] = value;
+      } else if (key === 'auditSnapshots') {
+        if (typeof value !== 'boolean') problems.push(`${key} must be a boolean`);
+        else auditSnapshots = value;
       } else {
         problems.push(`unknown limit ${key}`);
       }
@@ -667,6 +678,7 @@ function compileRule(r: unknown): { rule: CompiledRule | null; problems: string[
       columns: columnPatterns,
       rows,
       flags,
+      ...(auditSnapshots !== undefined ? { auditSnapshots } : {}),
       overrideWhereRequired: override as boolean,
     },
   };

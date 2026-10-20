@@ -40,6 +40,8 @@ export interface PolicyForm {
   requireConfirmation: boolean;
   requireStrongConfirmation: boolean;
   requireApproval: boolean;
+  /** Kept as loaded (no form control yet), so editing a rule never turns snapshots back on. */
+  auditSnapshots: boolean;
   overrideWhereRequired: boolean;
   enabled: boolean;
 }
@@ -61,6 +63,7 @@ export const EMPTY_POLICY: PolicyForm = {
   requireConfirmation: false,
   requireStrongConfirmation: false,
   requireApproval: false,
+  auditSnapshots: true,
   overrideWhereRequired: false,
   enabled: true,
 };
@@ -91,6 +94,7 @@ export function formFromRule(r: PolicyRule): PolicyForm {
     requireConfirmation: r.limits.requireConfirmation === true,
     requireStrongConfirmation: r.limits.requireStrongConfirmation === true,
     requireApproval: r.limits.requireApproval === true,
+    auditSnapshots: r.limits.auditSnapshots !== false,
     overrideWhereRequired: r.overrideWhereRequired,
     enabled: r.enabled,
   };
@@ -119,6 +123,7 @@ export function policyPayload(f: PolicyForm): {
   if (typeof read === 'number') limits.maxReadRows = read;
   if (typeof write === 'number') limits.maxWriteRows = write;
   for (const [k] of LIMIT_FLAGS) if (f[k]) limits[k] = true;
+  if (!f.auditSnapshots) limits.auditSnapshots = false;
   return {
     problems,
     body: {

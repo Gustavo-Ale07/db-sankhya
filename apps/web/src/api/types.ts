@@ -194,10 +194,14 @@ export interface SystemStatus {
   };
   writes: {
     safeMode: boolean;
+    /** Effective kill switch: env GLOBAL_WRITE_ENABLED AND the runtime switch. */
     globalWriteEnabled: boolean;
+    globalWrite: { env: boolean; runtime: boolean; effective: boolean };
     writeToSankhya: boolean;
-    /** Mutations are not available yet: always false. */
+    /** Sankhya writes pass the switches (PRODUCTION connections only with SAFE_MODE off). */
     available: boolean;
+    productionAvailable: boolean;
+    scratchAvailable: boolean;
   };
   limits: { maxRows: number; timeoutMs: number };
   roles: string[];
@@ -224,6 +228,8 @@ export interface PolicyLimits {
   requireConfirmation?: boolean;
   requireStrongConfirmation?: boolean;
   requireApproval?: boolean;
+  /** false: the audit keeps no before/after row values of writes. */
+  auditSnapshots?: boolean;
 }
 
 export interface PolicyRule {

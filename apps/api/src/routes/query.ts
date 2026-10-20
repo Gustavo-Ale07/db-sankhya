@@ -115,6 +115,7 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
     switches: { safeMode: config.safeMode, writeToSankhya: config.writeToSankhya },
     maxReadRows: ceilings.sankhyaMaxReadRows,
     scratchMaxReadRows: ceilings.scratchMaxReadRows,
+    logger: app.log,
   });
 
   const safeHistory = async (

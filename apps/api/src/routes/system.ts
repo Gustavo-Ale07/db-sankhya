@@ -17,8 +17,18 @@ const schemaQuery = z.object({ connectionId: connectionIdSchema.optional() }).st
 const READY_TIMEOUT_MS = 2000;
 
 export async function systemRoutes(app: FastifyInstance): Promise<void> {
-  const { config, database, startedAt, metadata, connections, redact, policies, authz, audit } =
-    app.services;
+  const {
+    config,
+    database,
+    startedAt,
+    metadata,
+    connections,
+    redact,
+    policies,
+    authz,
+    audit,
+    security,
+  } = app.services;
 
   // Probes hit these every few seconds; keep them out of the info-level request log.
   const probe = { logLevel: 'warn' } as const;
@@ -109,6 +119,9 @@ export async function systemRoutes(app: FastifyInstance): Promise<void> {
     } catch {
       databaseStatus = 'error';
     }
+    // The same switches /api/query/execute checks (it re-checks them itself on every execute).
+    const globalWrite = await security.globalWriteState();
+    const sankhyaWrites = globalWrite.effective && config.writeToSankhya;
     return {
       version: config.version,
       commit: config.commit,
@@ -118,10 +131,16 @@ export async function systemRoutes(app: FastifyInstance): Promise<void> {
       sankhya: await connections.overview(),
       writes: {
         safeMode: config.safeMode,
-        globalWriteEnabled: config.globalWriteEnabled,
+        /** Effective kill switch: env GLOBAL_WRITE_ENABLED AND the runtime switch. */
+        globalWriteEnabled: globalWrite.effective,
+        globalWrite,
         writeToSankhya: config.writeToSankhya,
-        /** Mutations are not available yet: every write fails closed. */
-        available: false,
+        /** Sankhya writes pass the switches (on PRODUCTION connections only with SAFE_MODE off). */
+        available: sankhyaWrites,
+        /** Sankhya writes pass the switches on PRODUCTION connections too. */
+        productionAvailable: sankhyaWrites && !config.safeMode,
+        /** Scratch writes only need the global switch. */
+        scratchAvailable: globalWrite.effective,
       },
       limits: {
         maxRows: config.sankhya.maxRows,

@@ -100,8 +100,8 @@ interface LifecycleCommon {
   policyDecision?: Record<string, unknown> | null;
   details?: Record<string, unknown> | null;
   /**
-   * The policy limit `auditSnapshots` (default true). EffectiveLimits has no such field yet, so
-   * the caller passes the resolved value. When false, no before/after rows are stored.
+   * The policy limit `auditSnapshots` (default true; any matching rule setting it false wins),
+   * resolved by the caller from the decision. When false, no before/after rows are stored.
    */
   auditSnapshots?: boolean;
   before?: SnapshotRows;
