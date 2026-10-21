@@ -942,9 +942,9 @@ describe('a dictionary bigger than the gateway row cap', () => {
     const res = await query(h, cookie, { sql: 'SELECT * FROM TGFPAR WHERE CODPARC = 1' });
     expect(res.statusCode, res.body).toBe(200);
     expect(res.json().columns.map((c: { name: string }) => c.name)).toContain('NOMEPARC');
-    expect(reads(h.mock, "WHERE NOMETAB = 'TGFPAR'")).toBe(3);
+    expect(reads(h.mock, "WHERE NOMETAB = 'TGFPAR'")).toBe(4);
     expect((await query(h, cookie, { sql: 'SELECT * FROM TGFPAR' })).statusCode).toBe(200);
-    expect(reads(h.mock, "WHERE NOMETAB = 'TGFPAR'")).toBe(3);
+    expect(reads(h.mock, "WHERE NOMETAB = 'TGFPAR'")).toBe(4);
   });
 
   it('reads no table metadata for a read without a star', async () => {

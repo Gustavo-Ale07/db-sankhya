@@ -32,6 +32,7 @@ async function setup(
     queryRowCap?: number;
     dictionaryPadding?: number;
     unpagedDictionary?: boolean;
+    silentCut?: boolean;
   } = {},
 ) {
   const config = loadConfig({
@@ -49,6 +50,7 @@ async function setup(
     ...(opts.queryRowCap ? { queryRowCap: opts.queryRowCap } : {}),
     ...(opts.dictionaryPadding ? { dictionaryPadding: opts.dictionaryPadding } : {}),
     ...(opts.unpagedDictionary ? { unpagedDictionary: true } : {}),
+    ...(opts.silentCut ? { silentCut: true } : {}),
   });
   const conns = new ConnectionsService(database.db, config, {
     resolve: () => Promise.resolve(['203.0.113.10']),
@@ -152,7 +154,8 @@ describe('MetadataService', () => {
     const { service, conn, mock } = await setup();
     const svc = service();
     await Promise.all([svc.get(conn.id), svc.get(conn.id), svc.get(conn.id)]);
-    expect(queries(mock)).toBe(4);
+    // TDDTAB, TDDCAM, TDDINS and PK once each, every one with its count.
+    expect(queries(mock)).toBe(8);
   });
 
   it('returns tables without columns when the TDDCAM query fails', async () => {
@@ -224,13 +227,15 @@ describe('MetadataService', () => {
     expect(await database.db.select().from(metadataCache)).toHaveLength(1);
   });
 
-  it('marks truncated reads as degraded and keeps the partial tables', async () => {
-    const { service, conn, database } = await setup({ queryRowCap: 3, unpagedDictionary: true });
+  it('marks cut reads as degraded and keeps what they read; the table list is paged whole', async () => {
+    const { service, conn, mock, database } = await setup({
+      queryRowCap: 3,
+      unpagedDictionary: true,
+    });
     const catalog = await service().get(conn.id);
-    expect(catalog.tables).toHaveLength(3);
-    expect(catalog.degraded).toEqual(
-      expect.arrayContaining(['TDDTAB:truncated', 'TDDCAM:truncated', 'PK:truncated']),
-    );
+    const { rows } = await mock.db.query<{ n: number }>('SELECT COUNT(*)::int AS n FROM TDDTAB');
+    expect(catalog.tables).toHaveLength(rows[0]!.n);
+    expect(catalog.degraded).toEqual(['TDDCAM:truncated', 'TDDINS:truncated', 'PK:truncated']);
     expect(await database.db.select().from(metadataCache)).toHaveLength(0);
   });
 
@@ -305,7 +310,7 @@ describe('MetadataService, a dictionary bigger than the gateway row cap', () => 
     expect(read.length).toBeGreaterThan(1);
     expect(read[0]).not.toContain('NUCAMPO >');
     expect(read.slice(1).every((q) => /WHERE NUCAMPO > \d+ ORDER BY NUCAMPO$/.test(q))).toBe(true);
-    expect(sqls(mock).filter((q) => q.includes('COUNT(*)'))).toHaveLength(1);
+    expect(sqls(mock).filter((q) => q.includes('COUNT(*) AS TOTAL FROM TDDCAM'))).toHaveLength(1);
     // No column is read twice or lost: the catalog matches the dictionary row for row.
     const total = catalog.tables.reduce((n, t) => n + t.columns.length, 0);
     const { rows } = await mock.db.query<{ n: number }>(
@@ -323,7 +328,7 @@ describe('MetadataService, a dictionary bigger than the gateway row cap', () => 
 
   it('reports the read as cut when the pages do not add up to the dictionary count', async () => {
     const { service, conn, mock, database } = await setup(PAGED);
-    mock.inject({ type: 'malformed' }, { sqlIncludes: 'COUNT(*)' });
+    mock.inject({ type: 'malformed' }, { sqlIncludes: 'COUNT(*) AS TOTAL FROM TDDCAM' });
     const catalog = await service().get(conn.id);
     expect(catalog.degraded).toEqual(['TDDCAM:truncated']);
     expect(await database.db.select().from(metadataCache)).toHaveLength(0);
@@ -353,6 +358,64 @@ describe('MetadataService, a dictionary bigger than the gateway row cap', () => 
   });
 });
 
+describe('MetadataService, a gateway that cuts at its row cap without saying so', () => {
+  const count = async (
+    mock: { db: { query: <T>(sql: string) => Promise<{ rows: T[] }> } },
+    sql: string,
+  ) => (await mock.db.query<{ n: number }>(sql)).rows[0]!.n;
+
+  it('pages TDDTAB and TDDCAM on until they add up to their counts; TDDINS and PK cut by count', async () => {
+    const { service, conn, mock, database } = await setup({ queryRowCap: 3, silentCut: true });
+    const catalog = await service().get(conn.id);
+
+    // Never flagged as cut, yet each read is checked against its own count.
+    expect(catalog.tables).toHaveLength(await count(mock, 'SELECT COUNT(*)::int AS n FROM TDDTAB'));
+    const total = catalog.tables.reduce((n, t) => n + t.columns.length, 0);
+    expect(total).toBe(
+      await count(
+        mock,
+        'SELECT COUNT(*)::int AS n FROM TDDCAM WHERE NOMETAB IN (SELECT NOMETAB FROM TDDTAB)',
+      ),
+    );
+    expect(catalog.tables.find((t) => t.name === 'TGFPAR')?.columns.map((c) => c.name)).toContain(
+      'NOMEPARC',
+    );
+    expect(
+      sqls(mock).some((q) => /FROM TDDTAB WHERE NOMETAB > '[A-Z0-9_]+' ORDER BY NOMETAB$/.test(q)),
+    ).toBe(true);
+    expect(catalog.degraded).toEqual(['TDDINS:truncated', 'PK:truncated']);
+    expect(await database.db.select().from(metadataCache)).toHaveLength(0);
+  });
+
+  it('reports a single read that does not add up to its count as cut', async () => {
+    const { service, conn } = await setup({ ...CUT_DICTIONARY, silentCut: true });
+    const catalog = await service().get(conn.id);
+    expect(catalog.degraded).toEqual(['TDDCAM:truncated']);
+  });
+
+  it('reports a read whose count cannot be read as cut, never as whole', async () => {
+    const { service, conn, mock } = await setup();
+    mock.inject({ type: 'malformed' }, { sqlIncludes: 'COUNT(*) AS TOTAL FROM TDDINS' });
+    const catalog = await service().get(conn.id);
+    expect(catalog.degraded).toEqual(['TDDINS:truncated']);
+  });
+
+  it('fails closed on one table whose columns do not add up to its count', async () => {
+    const { service, conn, mock } = await setup({ queryRowCap: 3, silentCut: true });
+    const err = await service()
+      .table(conn.id, 'TGFPAR')
+      .then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+    expect(err).toMatchObject({
+      code: 'SANKHYA_API_ERROR',
+      details: { table: 'TGFPAR', read: 'TDDCAM:truncated' },
+    });
+    expect(sqls(mock)).toContain("SELECT COUNT(*) AS TOTAL FROM TDDCAM WHERE NOMETAB = 'TGFPAR'");
+  });
+});
+
 describe('MetadataService instances (TDDINS)', () => {
   it('lists every instance of a table in name order, the first as entityName, in both reads', async () => {
     const { service, conn, mock } = await setup();
@@ -371,7 +434,7 @@ describe('MetadataService instances (TDDINS)', () => {
       entityNames: ['AEstoque', 'Estoque', 'EstoqueLocal'],
     });
     expect((await svc.table(conn.id, 'TGFPAR'))?.entityNames).toEqual(['Parceiro']);
-    expect(sqls(mock).filter((q) => q.includes('FROM TDDINS'))).toEqual([
+    expect(sqls(mock).filter((q) => q.includes('NOMEINSTANCIA FROM TDDINS'))).toEqual([
       'SELECT NOMETAB, NOMEINSTANCIA FROM TDDINS ORDER BY NOMETAB, NOMEINSTANCIA',
       "SELECT NOMETAB, NOMEINSTANCIA FROM TDDINS WHERE NOMETAB = 'TGFEST' ORDER BY NOMEINSTANCIA",
       "SELECT NOMETAB, NOMEINSTANCIA FROM TDDINS WHERE NOMETAB = 'TGFPAR' ORDER BY NOMEINSTANCIA",
@@ -404,7 +467,7 @@ describe('MetadataService.table (one table, read on demand)', () => {
     expect(par?.columns.some((c) => c.name.startsWith('CAMPO'))).toBe(false);
     // Every read was filtered by the table; none read the whole dictionary again.
     const reads = sqls(mock).slice(before);
-    expect(reads).toHaveLength(4);
+    expect(reads).toHaveLength(5);
     for (const sql of reads) expect(sql).toContain("= 'TGFPAR'");
   });
 
@@ -417,7 +480,7 @@ describe('MetadataService.table (one table, read on demand)', () => {
     expect(queries(mock)).toBe(before);
     advance(TABLE_TTL_MS);
     expect(await svc.table(conn.id, 'TGFPAR')).toEqual(first);
-    expect(queries(mock)).toBe(before + 4);
+    expect(queries(mock)).toBe(before + 5);
   });
 
   it('drops the tables of a connection on invalidate and on a refreshed get', async () => {
@@ -427,11 +490,11 @@ describe('MetadataService.table (one table, read on demand)', () => {
     let before = queries(mock);
     await svc.invalidate(conn.id);
     await svc.table(conn.id, 'TGFPAR');
-    expect(queries(mock)).toBe(before + 4);
+    expect(queries(mock)).toBe(before + 5);
     await svc.get(conn.id, { refresh: true });
     before = queries(mock);
     await svc.table(conn.id, 'TGFPAR');
-    expect(queries(mock)).toBe(before + 4);
+    expect(queries(mock)).toBe(before + 5);
   });
 
   it('never keeps a lookup that was still running when the connection was invalidated', async () => {
@@ -443,7 +506,7 @@ describe('MetadataService.table (one table, read on demand)', () => {
     // The lookup started before the invalidation answered its caller but was not kept.
     const before = queries(mock);
     await svc.table(conn.id, 'TGFPAR');
-    expect(queries(mock)).toBe(before + 4);
+    expect(queries(mock)).toBe(before + 5);
 
     // A caller arriving after an invalidation never joins a lookup started before it.
     await svc.invalidate(conn.id);
