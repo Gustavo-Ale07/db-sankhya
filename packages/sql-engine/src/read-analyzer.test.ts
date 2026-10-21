@@ -146,6 +146,23 @@ describe('analyzeRead', () => {
     });
   });
 
+  describe('a join on DUAL', () => {
+    it.each([
+      'SELECT P.NOMEPARC FROM TGFPAR P JOIN DUAL USING (CODPARC)',
+      'SELECT P.NOMEPARC FROM TGFPAR P JOIN DUAL',
+    ])('is checked like any other join: %s', (sql) => {
+      expect(errorOf(() => analyzeRead(sql)).code).toBe('SQL_UNSUPPORTED');
+    });
+
+    it('reads the tables and columns of its ON', () => {
+      const r = analyzeRead(
+        'SELECT P.NOMEPARC FROM TGFPAR P JOIN DUAL ON P.CODPARC IN (SELECT C.CODCID FROM TSICID C)',
+      );
+      expect(r.tables.map((t) => t.name)).toEqual(['TGFPAR', 'TSICID']);
+      expect(r.columns.map((c) => c.name)).toContain('CODCID');
+    });
+  });
+
   describe('keyword first argument of CONVERT / DATEADD / DATEDIFF', () => {
     it.each([
       'SELECT DATEADD(SENHA, 1, DTNEG) FROM TGFPAR',

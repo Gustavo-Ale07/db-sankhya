@@ -354,7 +354,6 @@ class Walker {
   private from(item: unknown): void {
     if (!isNode(item)) throw unsupported('Unrecognised FROM item.');
     if (!isNil(item.operator)) throw unsupported('PIVOT / UNPIVOT is not allowed.');
-    if (item.type === 'dual') return;
     // The grammar reads `NATURAL` as an alias of the left table and the join
     // that follows as one with no ON, so the implicit join columns would never
     // be checked. Fail closed on both shapes.
@@ -369,6 +368,11 @@ class Walker {
       if (item.join.toUpperCase() !== 'CROSS JOIN' && isNil(item.on)) {
         throw unsupported(`${item.join.toUpperCase()} without ON is not allowed.`);
       }
+    }
+    // DUAL reads nothing, but a join on it still has its USING / ON checked and its ON read.
+    if (item.type === 'dual') {
+      this.expr(item.on);
+      return;
     }
     if (!isNil(item.table_hint)) this.tableHint(item.table_hint);
     if (!isNil(item.temporal_table)) throw unsupported('Temporal tables are not allowed.');
