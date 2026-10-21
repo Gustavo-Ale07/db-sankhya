@@ -129,6 +129,9 @@ describe('MutationDialog', () => {
       vi.advanceTimersByTime(3_000);
     });
     expect(screen.getByTestId('plan-countdown').textContent).toContain('expirado');
+    expect(screen.getByTestId('plan-countdown').parentElement!.textContent).toMatch(
+      /^Plano expirado/,
+    );
     expect(execButton().disabled).toBe(true);
   });
 
@@ -212,6 +215,7 @@ describe('MutationDialog', () => {
     fireEvent.click(execButton());
     await screen.findByTestId('execution-report');
     expect(screen.getByTestId('verification-status').textContent).toBe('PARTIALLY_VERIFIED');
+    expect(screen.getByTestId('plan-countdown').parentElement!.textContent).toBe('Plano utilizado');
     const steps = screen.getAllByTestId('execution-step').map((r) => r.textContent);
     expect(steps[0]).toContain('CODPARC = 1');
     expect(steps[0]).toContain('gravado');

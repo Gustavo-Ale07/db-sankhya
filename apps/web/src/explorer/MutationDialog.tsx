@@ -932,13 +932,13 @@ export function MutationDialog({
               {environment}
             </span>
             <span className="ml-auto text-muted">
-              Plano expira em{' '}
+              {report || expired ? 'Plano' : 'Plano expira em'}{' '}
               <span
                 data-testid="plan-countdown"
                 className={expired ? 'font-semibold text-danger' : 'text-fg'}
               >
                 {report
-                  ? 'plano utilizado'
+                  ? 'utilizado'
                   : expired
                     ? outcomeUnknown
                       ? 'expirado (o reenvio com a mesma chave continua possível)'
