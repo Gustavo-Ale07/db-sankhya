@@ -835,7 +835,7 @@ describe('a dictionary bigger than the gateway row cap', () => {
    * ends the whole-dictionary read at TGFPAR.CODPARC, so the global catalog lists TGFPAR with
    * that one column. A star must not be expanded from such a list.
    */
-  const CUT = { dictionaryPadding: 50, queryRowCap: 54 };
+  const CUT = { dictionaryPadding: 50, queryRowCap: 54, unpagedDictionary: true };
   const cut = async (h: Harness) => {
     const catalog = await h.app.services.metadata.get('env-default');
     expect(catalog.degraded).toContain('TDDCAM:truncated');

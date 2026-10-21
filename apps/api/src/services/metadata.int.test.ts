@@ -6,7 +6,13 @@ import { createMockSankhya } from '@dbx/sankhya-client/mock';
 import { isAppError } from '@dbx/shared';
 import { loadConfig } from '../config';
 import { ConnectionsService } from './connections';
-import { DEGRADED_TTL_MS, METADATA_TTL_MS, MetadataService, TABLE_TTL_MS } from './metadata';
+import {
+  DEGRADED_TTL_MS,
+  MAX_FIELD_PAGES,
+  METADATA_TTL_MS,
+  MetadataService,
+  TABLE_TTL_MS,
+} from './metadata';
 
 // Fictitious credentials, used only by these tests.
 const SECRETS = {
@@ -21,7 +27,12 @@ afterEach(async () => {
 });
 
 async function setup(
-  opts: { dialect?: 'oracle' | 'mssql'; queryRowCap?: number; dictionaryPadding?: number } = {},
+  opts: {
+    dialect?: 'oracle' | 'mssql';
+    queryRowCap?: number;
+    dictionaryPadding?: number;
+    unpagedDictionary?: boolean;
+  } = {},
 ) {
   const config = loadConfig({
     NODE_ENV: 'test',
@@ -37,6 +48,7 @@ async function setup(
     ...SECRETS,
     ...(opts.queryRowCap ? { queryRowCap: opts.queryRowCap } : {}),
     ...(opts.dictionaryPadding ? { dictionaryPadding: opts.dictionaryPadding } : {}),
+    ...(opts.unpagedDictionary ? { unpagedDictionary: true } : {}),
   });
   const conns = new ConnectionsService(database.db, config, {
     resolve: () => Promise.resolve(['203.0.113.10']),
@@ -78,7 +90,7 @@ const sqls = (mock: { calls: Array<{ serviceName: string; requestBody?: unknown 
  * come first, then TSICID's 3 columns, then TGFPAR's. The cap (54 rows) ends the whole-dictionary
  * read at TGFPAR.CODPARC, so it never sees TGFPAR.NOMEPARC. Every filtered read fits.
  */
-const CUT_DICTIONARY = { dictionaryPadding: 50, queryRowCap: 54 };
+const CUT_DICTIONARY = { dictionaryPadding: 50, queryRowCap: 54, unpagedDictionary: true };
 
 describe('MetadataService', () => {
   it('builds the catalog from the dictionary with primary keys and entities', async () => {
@@ -145,6 +157,8 @@ describe('MetadataService', () => {
 
   it('returns tables without columns when the TDDCAM query fails', async () => {
     const { service, conn, mock } = await setup();
+    // Both the paged read and the single read it falls back to.
+    mock.inject({ type: 'malformed' }, { sqlIncludes: 'FROM TDDCAM' });
     mock.inject({ type: 'malformed' }, { sqlIncludes: 'FROM TDDCAM' });
     const catalog = await service().get(conn.id);
 
@@ -191,6 +205,7 @@ describe('MetadataService', () => {
   it('keeps a degraded catalog in memory for 60 s only and never persists it', async () => {
     const { service, conn, mock, database, advance } = await setup();
     mock.inject({ type: 'malformed' }, { sqlIncludes: 'FROM TDDCAM' });
+    mock.inject({ type: 'malformed' }, { sqlIncludes: 'FROM TDDCAM' });
     const svc = service();
     const degraded = await svc.get(conn.id);
     expect(degraded.degraded).toEqual(['TDDCAM:failed']);
@@ -210,7 +225,7 @@ describe('MetadataService', () => {
   });
 
   it('marks truncated reads as degraded and keeps the partial tables', async () => {
-    const { service, conn, database } = await setup({ queryRowCap: 3 });
+    const { service, conn, database } = await setup({ queryRowCap: 3, unpagedDictionary: true });
     const catalog = await service().get(conn.id);
     expect(catalog.tables).toHaveLength(3);
     expect(catalog.degraded).toEqual(
@@ -267,6 +282,74 @@ describe('MetadataService', () => {
     expect(await database.db.select().from(metadataCache)).toHaveLength(1);
     await database.db.delete(connections).where(eq(connections.id, conn.id));
     expect(await database.db.select().from(metadataCache)).toHaveLength(0);
+  });
+});
+
+describe('MetadataService, a dictionary bigger than the gateway row cap', () => {
+  /** The same dictionary as CUT_DICTIONARY, on a gateway that can serve it in pages. */
+  const PAGED = { dictionaryPadding: 50, queryRowCap: 54 };
+  const pages = (mock: Parameters<typeof sqls>[0]) =>
+    sqls(mock).filter((q) => q.includes('ORDER BY NUCAMPO'));
+
+  it('reads TDDCAM in pages into a whole catalog, persisted and kept for the full TTL', async () => {
+    const { service, conn, mock, database, advance } = await setup(PAGED);
+    const svc = service();
+    const catalog = await svc.get(conn.id);
+
+    expect(catalog.degraded).toBeUndefined();
+    const par = catalog.tables.find((t) => t.name === 'TGFPAR');
+    expect(par?.columns.map((c) => c.name)).toContain('NOMEPARC');
+    expect(par?.columns.find((c) => c.name === 'CODPARC')?.pk).toBe(true);
+    // Each page starts after the last key of the one before, and the total is checked.
+    const read = pages(mock);
+    expect(read.length).toBeGreaterThan(1);
+    expect(read[0]).not.toContain('NUCAMPO >');
+    expect(read.slice(1).every((q) => /WHERE NUCAMPO > \d+ ORDER BY NUCAMPO$/.test(q))).toBe(true);
+    expect(sqls(mock).filter((q) => q.includes('COUNT(*)'))).toHaveLength(1);
+    // No column is read twice or lost: the catalog matches the dictionary row for row.
+    const total = catalog.tables.reduce((n, t) => n + t.columns.length, 0);
+    const { rows } = await mock.db.query<{ n: number }>(
+      'SELECT COUNT(*)::int AS n FROM TDDCAM WHERE NOMETAB IN (SELECT NOMETAB FROM TDDTAB)',
+    );
+    expect(total).toBe(rows[0]!.n);
+    expect(await database.db.select().from(metadataCache)).toHaveLength(1);
+
+    // Whole, so it is not read again after the minute a cut catalog is kept.
+    advance(DEGRADED_TTL_MS + 1);
+    const before = sqls(mock).length;
+    expect(await svc.get(conn.id)).toBe(catalog);
+    expect(sqls(mock).length).toBe(before);
+  });
+
+  it('reports the read as cut when the pages do not add up to the dictionary count', async () => {
+    const { service, conn, mock, database } = await setup(PAGED);
+    mock.inject({ type: 'malformed' }, { sqlIncludes: 'COUNT(*)' });
+    const catalog = await service().get(conn.id);
+    expect(catalog.degraded).toEqual(['TDDCAM:truncated']);
+    expect(await database.db.select().from(metadataCache)).toHaveLength(0);
+  });
+
+  it('reports a page that fails after the first as a failed read, never as whole', async () => {
+    const { service, conn, mock, database } = await setup(PAGED);
+    mock.inject({ type: 'malformed' }, { sqlIncludes: 'ORDER BY NUCAMPO', after: 1 });
+    const catalog = await service().get(conn.id);
+    expect(catalog.degraded).toEqual(['TDDCAM:failed']);
+    expect(await database.db.select().from(metadataCache)).toHaveLength(0);
+  });
+
+  it('falls back to the single read, reported as cut, when the gateway cannot page', async () => {
+    const { service, conn, mock } = await setup(CUT_DICTIONARY);
+    const catalog = await service().get(conn.id);
+    expect(catalog.degraded).toEqual(['TDDCAM:truncated']);
+    expect(sqls(mock).filter((q) => q.includes('NUCAMPO'))).toHaveLength(1);
+    expect(sqls(mock)).toContain('SELECT NOMETAB, NOMECAMPO, DESCRCAMPO, TIPCAMPO FROM TDDCAM');
+  });
+
+  it(`stops after ${MAX_FIELD_PAGES} pages and reports the read as cut`, async () => {
+    const { service, conn, mock } = await setup({ dictionaryPadding: 400, queryRowCap: 3 });
+    const catalog = await service().get(conn.id);
+    expect(catalog.degraded).toContain('TDDCAM:truncated');
+    expect(pages(mock)).toHaveLength(MAX_FIELD_PAGES);
   });
 });
 

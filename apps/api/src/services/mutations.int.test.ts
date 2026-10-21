@@ -2292,7 +2292,7 @@ describe('a dictionary bigger than the gateway row cap', () => {
    * ends the whole-dictionary read at TGFPAR.CODPARC, so the global catalog never has NOMEPARC.
    * Every read the preview itself makes fits under the cap.
    */
-  const CUT = { mock: { dictionaryPadding: 50, queryRowCap: 54 } };
+  const CUT = { mock: { dictionaryPadding: 50, queryRowCap: 54, unpagedDictionary: true } };
   const SQL = "UPDATE TGFPAR SET NOMEPARC = 'Prévia' WHERE CODPARC = 1";
   const previewHttp = (h: Harness, cookie: string, sql: string) =>
     h.call(cookie, { method: 'POST', url: '/api/query/preview', payload: { sql } });

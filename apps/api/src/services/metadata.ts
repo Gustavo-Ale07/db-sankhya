@@ -67,6 +67,19 @@ const TABLES_SQL = 'SELECT NOMETAB, DESCRTAB FROM TDDTAB';
 const FIELDS_SQL = 'SELECT NOMETAB, NOMECAMPO, DESCRCAMPO, TIPCAMPO FROM TDDCAM';
 const ENTITIES_SQL = 'SELECT NOMETAB, NOMEINSTANCIA FROM TDDINS';
 
+/**
+ * TDDCAM one page at a time, by its numeric key: the whole dictionary outgrows the gateway row
+ * cap. A number compares the same way in every database and collation (a name may not), so each
+ * page starts right after the last key of the one before. `after` is a checked safe integer.
+ */
+const fieldsPageSql = (after?: number) =>
+  'SELECT NUCAMPO, NOMETAB, NOMECAMPO, DESCRCAMPO, TIPCAMPO FROM TDDCAM' +
+  (after === undefined ? '' : ` WHERE NUCAMPO > ${after}`) +
+  ' ORDER BY NUCAMPO';
+const FIELDS_COUNT_SQL = 'SELECT COUNT(*) AS TOTAL FROM TDDCAM';
+/** At most this many pages of TDDCAM are read; a bigger dictionary is reported as cut. */
+export const MAX_FIELD_PAGES = 100;
+
 /** The dictionary reads of one table; `name` is a validated TABLE_NAME, never caller text. */
 const tableSql = (name: string) => ({
   table: `${TABLES_SQL} WHERE NOMETAB = '${name}'`,
@@ -296,7 +309,7 @@ export class MetadataService {
       else if (result.truncated) degraded.push(`${label}:truncated`);
       return result;
     };
-    const fields = await read('TDDCAM', FIELDS_SQL);
+    const fields = (await this.readFields(run, degraded)) ?? (await read('TDDCAM', FIELDS_SQL));
     const entities = await read('TDDINS', ENTITIES_SQL);
     const keys = await read('PK', pkSql(runtime.dialect));
 
@@ -336,6 +349,58 @@ export class MetadataService {
     this.memory.set(connectionId, catalog);
     if (!degraded.length) await this.store(connectionId, catalog);
     return catalog;
+  }
+
+  /**
+   * The whole of TDDCAM, read in pages (see fieldsPageSql), so the catalog holds every column and
+   * is cached for the full TTL instead of being read again every minute. A read of more than one
+   * page is only taken as whole when every page came back in key order and the rows add up to the
+   * dictionary's own count; otherwise it is reported as cut (or failed) and the tables it lost
+   * columns of are read on their own where it matters (see `table`). `undefined` when not even
+   * the first page could be read (a dictionary or gateway without NUCAMPO): the caller falls back
+   * to the single read.
+   */
+  private async readFields(
+    run: (sql: string) => Promise<QueryResult>,
+    degraded: string[],
+  ): Promise<QueryResult | undefined> {
+    let columns: string[] = [];
+    const rows: unknown[][] = [];
+    let after: number | undefined;
+    for (let page = 0; page < MAX_FIELD_PAGES; page++) {
+      const result = await optional(() => run(fieldsPageSql(after)));
+      if (!result) {
+        if (page === 0) return undefined;
+        degraded.push('TDDCAM:failed');
+        return { columns, rows, truncated: false };
+      }
+      const keys = records(result).map((r) => (text(r.NUCAMPO) ? Number(text(r.NUCAMPO)) : NaN));
+      const ordered = keys.every(
+        (k, i) => Number.isSafeInteger(k) && k > (i ? keys[i - 1]! : (after ?? -Infinity)),
+      );
+      // A gateway that ignores the order cannot be paged at all: the single read is used.
+      if (page === 0 && !ordered) return undefined;
+      if (!ordered || (page > 0 && !sameColumns(columns, result.columns))) break;
+      columns = result.columns;
+      rows.push(...result.rows);
+      if (!result.truncated) {
+        if (page > 0 && !(await this.countMatches(run, rows.length))) break;
+        return { columns, rows, truncated: false };
+      }
+      if (!keys.length) break;
+      after = keys[keys.length - 1];
+    }
+    degraded.push('TDDCAM:truncated');
+    return { columns, rows, truncated: true };
+  }
+
+  private async countMatches(
+    run: (sql: string) => Promise<QueryResult>,
+    rows: number,
+  ): Promise<boolean> {
+    const result = await optional(() => run(FIELDS_COUNT_SQL));
+    const total = Number(text(records(result)[0]?.TOTAL));
+    return Number.isSafeInteger(total) && total === rows;
   }
 
   // Persistence is an optimisation: the env connection has no row to hang a cache entry on, and
@@ -382,6 +447,10 @@ function catalogColumn(row: Record<string, unknown>, name: string, pk: boolean):
     ...(description ? { description } : {}),
     pk,
   };
+}
+
+function sameColumns(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((c, i) => c.toUpperCase() === b[i]!.toUpperCase());
 }
 
 /** Cache key of one table of one connection; neither part contains the separator. */

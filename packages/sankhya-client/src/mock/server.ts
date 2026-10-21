@@ -67,6 +67,11 @@ export interface MockSankhyaOptions {
   pageSize?: number;
   /** Row cap of executeQuery; larger results are cut and flagged with `burstLimit`. */
   queryRowCap?: number;
+  /**
+   * Refuses the paged dictionary read (TDDCAM by NUCAMPO), as a gateway or dictionary that cannot
+   * serve it would: the whole-dictionary read is then the only one, and the row cap cuts it.
+   */
+  unpagedDictionary?: boolean;
   /** Fictitious TDDCAM rows ahead of the demo tables' rows (see seedMockDataset). */
   dictionaryPadding?: number;
   now?: () => number;
@@ -318,6 +323,9 @@ export async function createMockSankhya(opts: MockSankhyaOptions = {}): Promise<
     if (!sql) throw new MockServiceError('Parâmetro sql ausente');
     const gate = gateMockQuery(sql);
     if (!gate.ok) throw new MockServiceError(`Consulta recusada: ${gate.reason}`);
+    if (opts.unpagedDictionary && /\bTDDCAM\b/i.test(sql) && /\bNUCAMPO\b/i.test(sql)) {
+      throw new MockServiceError('ORA-00904: "NUCAMPO": identificador inválido');
+    }
     const pgSql = emulateRowCap(sql.trim().replace(/;$/, ''));
     const res = await readOnly((tx) => tx.query<unknown[]>(pgSql, [], { rowMode: 'array' }));
     const rows = res.rows.slice(0, rowCap).map((r) => r.map(toWire));
