@@ -108,6 +108,9 @@ export function analyzeScratchSql(input: string): ScratchStatement {
 
   // Execute exactly what was checked: regenerate the SQL from the AST, then check the regenerated
   // text again and require the same statement, so a lossy sqlify cannot smuggle in something else.
+  // Every scratch table is already temporary (it lives in the user's workspace until it expires);
+  // TEMPORARY / TEMP would only hide it in a session schema, so it is dropped.
+  if (first.ast.type === 'create' && first.ast.temporary) first.ast.temporary = null;
   let sql: string;
   try {
     sql = parser.sqlify(first.ast as never, OPTIONS);

@@ -58,6 +58,18 @@ describe('analyzeScratchSql', () => {
     expect(stmt.tables).toEqual(['tmp_a', 'tmp_b']);
   });
 
+  it('creates a plain scratch table for CREATE TEMPORARY / TEMP TABLE', () => {
+    for (const sql of [
+      'CREATE TEMPORARY TABLE tmp_x AS SELECT id FROM tmp_a',
+      'CREATE TEMP TABLE tmp_x (id int)',
+    ]) {
+      const stmt = analyzeScratchSql(sql);
+      expect(stmt.command).toBe('CREATE TABLE');
+      expect(stmt.target).toBe('tmp_x');
+      expect(stmt.sql).not.toMatch(/TEMP/i);
+    }
+  });
+
   it('executes the regenerated SQL, not the input', () => {
     const stmt = analyzeScratchSql('select   1  -- comment');
     expect(stmt.sql).not.toContain('comment');
