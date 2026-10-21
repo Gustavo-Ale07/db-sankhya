@@ -14,6 +14,11 @@ interface Props {
    * A new function (another connection) drops what the previous one answered.
    */
   loadTable?: (name: string) => Promise<CatalogTable>;
+  /** What the dictionary read lost (`TDDCAM:truncated`, ...); a non-empty list is shown. */
+  degraded?: string[];
+  /** Reads the catalog again (POST /api/schema/refresh). */
+  onRefresh?: () => void;
+  refreshing?: boolean;
 }
 
 type Detail = { status: 'loading' } | { status: 'ok'; table: CatalogTable } | { status: 'error' };
@@ -24,7 +29,16 @@ export function selectTemplate(t: CatalogTable): string {
   return `SELECT *\nFROM ${t.name}`;
 }
 
-export function SchemaTree({ tables, loading, onSelectQuery, onInsertText, loadTable }: Props) {
+export function SchemaTree({
+  tables,
+  loading,
+  onSelectQuery,
+  onInsertText,
+  loadTable,
+  degraded,
+  onRefresh,
+  refreshing = false,
+}: Props) {
   const [filter, setFilter] = useState('');
   const [open, setOpen] = useState<Record<string, boolean>>({});
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
@@ -61,16 +75,23 @@ export function SchemaTree({ tables, loading, onSelectQuery, onInsertText, loadT
   const filtering = filter.trim() !== '';
   const groups = useMemo(() => {
     const f = filter.trim().toLowerCase();
+    // With a cut column list, only the columns of a table read on its own are matched: matching
+    // the partial list would hide the tables whose list lost the column.
+    const columnsOf = (t: CatalogTable) => {
+      if (!loadTable) return t.columns;
+      const detail = byName[t.name];
+      return detail?.status === 'ok' ? detail.table.columns : [];
+    };
     return groupByPrefix(
       (tables ?? []).filter(
         (t) =>
           !f ||
           t.name.toLowerCase().includes(f) ||
           (t.description ?? '').toLowerCase().includes(f) ||
-          t.columns.some((c) => c.name.toLowerCase().includes(f)),
+          columnsOf(t).some((c) => c.name.toLowerCase().includes(f)),
       ),
     );
-  }, [tables, filter]);
+  }, [tables, filter, loadTable, byName]);
 
   function renderTable(t: CatalogTable) {
     const isOpen = open[t.name] ?? false;
@@ -175,6 +196,30 @@ Clique para inserir no editor`}
           </span>
         )}
       </div>
+      {degraded && degraded.length > 0 && (
+        <div className="flex items-center gap-1.5 border-b border-line px-2 py-1 text-[11px]">
+          <span
+            className="badge border-warn/60 text-warn"
+            data-testid="schema-degraded"
+            title={`O dicionário não foi lido por inteiro (${degraded.join(', ')}). Tabelas e colunas que faltam são lidas uma a uma quando usadas.`}
+          >
+            Catálogo incompleto
+          </span>
+          {onRefresh && (
+            <button
+              type="button"
+              className="ml-auto flex items-center gap-1 rounded px-1 text-accent hover:underline disabled:opacity-50"
+              onClick={onRefresh}
+              disabled={refreshing}
+              aria-label="Recarregar catálogo"
+              title="Ler o dicionário de dados de novo"
+            >
+              <Icon name="refresh" size={12} />
+              {refreshing ? 'Lendo…' : 'Recarregar'}
+            </button>
+          )}
+        </div>
+      )}
       <div className="relative border-b border-line p-1.5">
         <label className="sr-only" htmlFor="schema-filter">
           Filtrar tabelas
@@ -187,7 +232,11 @@ Clique para inserir no editor`}
         <input
           id="schema-filter"
           className="input input-search w-full"
-          placeholder="Filtrar tabelas e colunas…"
+          placeholder={
+            loadTable
+              ? 'Filtrar tabelas (colunas só das tabelas abertas)…'
+              : 'Filtrar tabelas e colunas…'
+          }
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
         />

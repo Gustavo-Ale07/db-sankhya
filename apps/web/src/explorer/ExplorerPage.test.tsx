@@ -203,6 +203,99 @@ describe('ExplorerPage pending plans', () => {
   });
 });
 
+describe('ExplorerPage connection switch', () => {
+  it('cancels the running query and ignores its late answer when the connection changes', async () => {
+    let answer!: (r: unknown) => void;
+    let signal: AbortSignal | undefined;
+    vi.mocked(api.post).mockImplementation((path, _body, opts) => {
+      if (path === '/api/query') {
+        signal = opts?.signal;
+        return new Promise((resolve) => (answer = resolve));
+      }
+      return Promise.resolve({});
+    });
+    const view = renderPage({
+      connectionId: 'a',
+      openRequest: { sql: 'SELECT CODPARC FROM TGFPAR', run: true, nonce: 1 },
+    });
+    await waitFor(() => expect(signal).toBeDefined());
+    view.rerenderWith({
+      connectionId: 'b',
+      openRequest: { sql: 'SELECT CODPARC FROM TGFPAR', run: true, nonce: 1 },
+    });
+    await waitFor(() => expect(signal!.aborted).toBe(true));
+    await act(async () => {
+      answer({
+        type: 'result',
+        kind: 'SELECT',
+        connectionId: 'a',
+        columns: [{ name: 'CODPARC', type: 'number' }],
+        rows: [['valor-da-conexao-a']],
+        rowCount: 1,
+        truncated: false,
+        durationMs: 1,
+        executionId: 'e1',
+        resource: 'TGFPAR',
+        apiCalls: 1,
+        messages: [],
+      });
+    });
+    expect(screen.queryByText('valor-da-conexao-a')).toBeNull();
+    expect(screen.queryByText(/Cancelled by the user/)).toBeNull();
+  });
+
+  it('ignores an answer for another connection', async () => {
+    vi.mocked(api.post).mockImplementation((path) =>
+      path === '/api/query'
+        ? Promise.resolve({
+            type: 'result',
+            kind: 'SELECT',
+            connectionId: 'outra',
+            columns: [{ name: 'CODPARC', type: 'number' }],
+            rows: [['valor-de-outra']],
+            rowCount: 1,
+            truncated: false,
+            durationMs: 1,
+            executionId: 'e1',
+            resource: 'TGFPAR',
+            apiCalls: 1,
+            messages: [],
+          })
+        : Promise.resolve({}),
+    );
+    renderPage({
+      connectionId: 'a',
+      openRequest: { sql: 'SELECT CODPARC FROM TGFPAR', run: true, nonce: 1 },
+    });
+    await waitFor(() =>
+      expect(vi.mocked(api.post).mock.calls.some((c) => c[0] === '/api/query')).toBe(true),
+    );
+    await act(async () => {});
+    expect(screen.queryByText('valor-de-outra')).toBeNull();
+  });
+
+  it('reads an incomplete catalog again from the schema tree', async () => {
+    vi.mocked(api.get).mockResolvedValue({
+      connectionId: 'env',
+      catalog: { tables: [], degraded: ['TDDTAB:truncated'] },
+    });
+    vi.mocked(api.post).mockResolvedValue({
+      connectionId: 'env',
+      catalog: { tables: [{ name: 'TGFPAR', columns: [], foreignKeys: [] }] },
+    });
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Recarregar catálogo' }));
+    await waitFor(() =>
+      expect(api.post).toHaveBeenCalledWith(
+        '/api/schema/refresh',
+        {},
+        expect.objectContaining({ query: { connectionId: 'env' } }),
+      ),
+    );
+    await waitFor(() => expect(screen.queryByTestId('schema-degraded')).toBeNull());
+  });
+});
+
 describe('ExplorerPage server-prepared plan (assisted rollback)', () => {
   const request = (over: Partial<OpenPlanRequest> = {}): OpenPlanRequest => ({
     plan: prepared({ planId: '00000000-0000-4000-8000-0000000000aa', token: 'rollback-token' }),

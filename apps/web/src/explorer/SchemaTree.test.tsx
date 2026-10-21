@@ -89,6 +89,49 @@ describe('SchemaTree', () => {
     expect(screen.queryByTestId('schema-count')).toBeNull();
     expect(screen.getByText('Nenhuma tabela encontrada.')).toBeTruthy();
   });
+  describe('an incomplete catalog', () => {
+    it('says so, lists what was lost in the title and reads the catalog again on demand', () => {
+      const onRefresh = vi.fn();
+      render(
+        <SchemaTree
+          tables={TABLES}
+          loading={false}
+          onSelectQuery={vi.fn()}
+          onInsertText={vi.fn()}
+          degraded={['TDDCAM:truncated', 'PK:failed']}
+          onRefresh={onRefresh}
+        />,
+      );
+      const badge = screen.getByTestId('schema-degraded');
+      expect(badge.textContent).toContain('Catálogo incompleto');
+      expect(badge.getAttribute('title')).toContain('TDDCAM:truncated');
+      expect(badge.getAttribute('title')).toContain('PK:failed');
+      fireEvent.click(screen.getByRole('button', { name: 'Recarregar catálogo' }));
+      expect(onRefresh).toHaveBeenCalledTimes(1);
+    });
+
+    it('disables the refresh button while the catalog is read again', () => {
+      render(
+        <SchemaTree
+          tables={TABLES}
+          loading={false}
+          onSelectQuery={vi.fn()}
+          onInsertText={vi.fn()}
+          degraded={['TDDTAB:truncated']}
+          onRefresh={vi.fn()}
+          refreshing
+        />,
+      );
+      const button = screen.getByRole('button', { name: 'Recarregar catálogo' });
+      expect((button as HTMLButtonElement).disabled).toBe(true);
+    });
+
+    it('shows nothing when the catalog is whole', () => {
+      renderTree();
+      expect(screen.queryByTestId('schema-degraded')).toBeNull();
+    });
+  });
+
   describe('with a catalog that lost columns (loadTable)', () => {
     const CUT: CatalogTable[] = [
       {
@@ -133,6 +176,22 @@ describe('SchemaTree', () => {
         expect(screen.getByText('Não foi possível ler as colunas desta tabela.')).toBeTruthy(),
       );
       expect(screen.queryByTestId('schema-columns-TGFPAR')).toBeNull();
+    });
+
+    it('filters by the columns read on their own only, never by the partial list', async () => {
+      render(tree(() => Promise.resolve(FULL)));
+      const input = screen.getByLabelText('Filtrar tabelas') as HTMLInputElement;
+      expect(input.placeholder).toMatch(/colunas só das tabelas abertas/);
+      // CODPARC is in the partial list: matching it would hide the tables whose list lost theirs.
+      fireEvent.change(input, { target: { value: 'CODPARC' } });
+      expect(screen.queryByTestId('schema-table-TGFPAR')).toBeNull();
+      fireEvent.change(input, { target: { value: 'tgfp' } });
+      fireEvent.click(screen.getByTestId('schema-table-TGFPAR'));
+      await waitFor(() =>
+        expect(screen.getByTestId('schema-columns-TGFPAR').textContent).toContain('NOMEPARC'),
+      );
+      fireEvent.change(input, { target: { value: 'NOMEPARC' } });
+      expect(screen.getByTestId('schema-table-TGFPAR')).toBeTruthy();
     });
 
     it('never shows the columns another connection answered', async () => {

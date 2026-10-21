@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, ApiError, newExecutionId } from '../api/client';
 import { previewMutation } from '../api/mutations';
 import type { PreparedPlan } from '../api/mutations';
@@ -116,6 +116,8 @@ export function ExplorerPage({
   const [mutation, setMutation] = useState<PendingPlan | null>(null);
   const editorApi = useRef<EditorApi | null>(null);
   const aborts = useRef<Record<string, AbortController>>({});
+  // Controllers aborted by a connection switch, not by the user.
+  const dropped = useRef(new WeakSet<AbortController>());
   // Tabs whose mutation preview is being prepared: a second run (Ctrl+Enter, F5) is ignored
   // until it answers, so two plans never race for the same dialog.
   const previewing = useRef(new Set<string>());
@@ -143,6 +145,28 @@ export function ExplorerPage({
         : undefined,
     [columnsCut, connectionId],
   );
+  const refresh = useMutation({
+    mutationFn: (id: string) =>
+      api.post<SchemaResponse>('/api/schema/refresh', {}, { query: { connectionId: id } }),
+    onSuccess: (res, id) => qc.setQueryData(['schema', id], res),
+    onError: () => flash('Não foi possível recarregar o catálogo.'),
+  });
+  // Another connection: what runs is aborted and every result, error or run of the previous one
+  // is cleared, so an answer of one connection is never shown under another. Plans stay: they
+  // carry their own connection and refuse to reopen elsewhere.
+  const shownConnection = useRef(connectionId);
+  useEffect(() => {
+    if (shownConnection.current === connectionId) return;
+    shownConnection.current = connectionId;
+    for (const controller of Object.values(aborts.current)) {
+      dropped.current.add(controller);
+      controller.abort();
+    }
+    aborts.current = {};
+    setRuns((all) =>
+      Object.fromEntries(Object.entries(all).filter(([, r]) => r.status === 'mutation')),
+    );
+  }, [connectionId]);
   useEffect(() => {
     // Cleared while another connection's dictionary loads: no suggestions from the wrong one.
     setCompletionSchema(schema.data?.catalog.tables ?? [], loadTable);
@@ -193,16 +217,32 @@ export function ExplorerPage({
       aborts.current[tabId] = controller;
       const executionId = newExecutionId();
       setRun(tabId, { status: 'running', sql, executionId, startedAt: Date.now() });
+      // Superseded by another run, or dropped by a connection switch: the answer is not shown.
+      const stale = () => aborts.current[tabId] !== controller || controller.signal.aborted;
       try {
         const res = await api.post<QueryResult>(
           '/api/query',
           { sql, executionId, ...(connectionId ? { connectionId } : {}) },
           { signal: controller.signal },
         );
+        if (stale()) return;
+        if (res.connectionId !== connectionId) {
+          setRun(tabId, {
+            status: 'error',
+            sql,
+            error: new ApiError(499, {
+              code: 'QUERY_CANCELLED',
+              message: 'A resposta veio de outra conexão e foi descartada.',
+            }),
+          });
+          return;
+        }
         setRun(tabId, { status: 'result', sql, result: res });
         setResultTab((m) => ({ ...m, [tabId]: 'results' }));
       } catch (err) {
-        if (err instanceof DOMException && err.name === 'AbortError') {
+        if (dropped.current.has(controller)) {
+          // Aborted by a connection switch: the run was already cleared.
+        } else if (err instanceof DOMException && err.name === 'AbortError') {
           setRun(tabId, {
             status: 'error',
             sql,
@@ -543,6 +583,9 @@ export function ExplorerPage({
                     onSelectQuery={openTableQuery}
                     onInsertText={(text) => editorApi.current?.insertText(text)}
                     loadTable={loadTable}
+                    degraded={schema.data?.catalog.degraded}
+                    onRefresh={connectionId ? () => refresh.mutate(connectionId) : undefined}
+                    refreshing={refresh.isPending}
                   />
                 </div>
                 {schema.isError && <ErrorBox error={schema.error} className="m-2" />}

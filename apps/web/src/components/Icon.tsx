@@ -14,7 +14,8 @@ export type IconName =
   | 'chevron-right'
   | 'chevron-down'
   | 'close'
-  | 'search';
+  | 'search'
+  | 'refresh';
 
 const PATHS: Record<IconName, string> = {
   play: 'M5 3.5v9l7-4.5z',
@@ -31,6 +32,7 @@ const PATHS: Record<IconName, string> = {
   'chevron-down': 'M4 6l4 4 4-4',
   close: 'M4.5 4.5l7 7M11.5 4.5l-7 7',
   search: 'M7 11.5a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9zM10.25 10.25l3.25 3.25',
+  refresh: 'M13 8a5 5 0 1 1-1.46-3.54M13 2.5v3h-3',
 };
 
 const FILLED: ReadonlySet<IconName> = new Set(['play', 'stop']);
