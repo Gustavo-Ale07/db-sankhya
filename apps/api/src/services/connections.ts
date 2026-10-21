@@ -305,7 +305,8 @@ export class ConnectionsService {
 
   private mockGateway(): Promise<MockGateway> {
     if (!this.mock) {
-      const start = this.deps.mockGateway ?? (() => createMockSankhya());
+      const start =
+        this.deps.mockGateway ?? (() => createMockSankhya(this.config.sankhya.mockGateway));
       const mock = start();
       this.mock = mock;
       // A failed start must not stay cached.

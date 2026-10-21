@@ -249,6 +249,29 @@ describe('Sankhya runtime configuration', () => {
     expect(demo.demoMode).toBe(true);
   });
 
+  it('reads the test-only SANKHYA_MOCK_* switches, and only for a mock gateway outside production', () => {
+    expect(loadConfig({}).sankhya.mockGateway).toEqual({});
+    expect(
+      loadConfig({
+        SANKHYA_MODE: 'mock',
+        SANKHYA_MOCK_ROW_CAP: '50',
+        SANKHYA_MOCK_SILENT_CUT: 'true',
+        SANKHYA_MOCK_DICTIONARY_PADDING: '120',
+      }).sankhya.mockGateway,
+    ).toEqual({ queryRowCap: 50, silentCut: true, dictionaryPadding: 120 });
+    expect(problemsOf({ SANKHYA_MODE: 'live', SANKHYA_MOCK_SILENT_CUT: 'true' }).join()).toMatch(
+      /SANKHYA_MOCK_\* .*SANKHYA_MODE=mock/,
+    );
+    expect(
+      problemsOf({
+        ...PROD,
+        SANKHYA_MODE: 'mock',
+        DEMO_MODE: 'true',
+        SANKHYA_MOCK_ROW_CAP: '50',
+      }).join(),
+    ).toMatch(/SANKHYA_MOCK_\*/);
+  });
+
   it('rejects a rate above 1000 calls per minute', () => {
     expect(problemsOf({ SANKHYA_RATE_PER_MINUTE: '5000' }).join()).toMatch(
       /SANKHYA_RATE_PER_MINUTE/,

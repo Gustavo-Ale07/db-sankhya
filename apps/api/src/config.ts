@@ -40,6 +40,20 @@ const int = (fallback: number, min: number, max: number) =>
       return n;
     });
 
+const optionalInt = (min: number, max: number) =>
+  z
+    .string()
+    .optional()
+    .transform((v, ctx) => {
+      if (v === undefined || v.trim() === '') return undefined;
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < min || n > max) {
+        ctx.addIssue({ code: 'custom', message: `must be an integer between ${min} and ${max}` });
+        return z.NEVER;
+      }
+      return n;
+    });
+
 const optionalText = z
   .string()
   .optional()
@@ -139,6 +153,14 @@ const envSchema = z.object({
   SANKHYA_TIMEOUT_MS: int(60_000, 1000, 600_000),
   SANKHYA_RATE_PER_MINUTE: int(300, 1, 1000),
   SANKHYA_MAX_ROWS: int(1000, 1, 100_000),
+  /**
+   * Test-only switches of the built-in mock gateway (row cap, silent cut, dictionary padding), to
+   * reproduce a gateway that cuts the data dictionary. Refused unless SANKHYA_MODE=mock outside
+   * production.
+   */
+  SANKHYA_MOCK_ROW_CAP: optionalInt(1, 100_000),
+  SANKHYA_MOCK_SILENT_CUT: bool(false),
+  SANKHYA_MOCK_DICTIONARY_PADDING: optionalInt(0, 100_000),
   SCRATCH_MAX_WORKSPACES: int(20, 1, 1000),
   SCRATCH_MAX_ROWS: int(100_000, 100, 10_000_000),
   SCRATCH_MAX_TABLES: int(20, 1, 500),
@@ -172,6 +194,8 @@ export interface SankhyaConfig {
   ratePerMinute: number;
   /** Rows a read returns at most (the result is flagged as truncated beyond it). */
   maxRows: number;
+  /** SANKHYA_MOCK_*: options of the built-in mock gateway, empty unless a test sets them. */
+  mockGateway: { queryRowCap?: number; silentCut?: boolean; dictionaryPadding?: number };
   /** Set only when every SANKHYA_* credential is present. */
   envConnection?: EnvSankhyaConnection;
   /**
@@ -315,6 +339,17 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
   } else if (e.ENCRYPTION_KEY && !encryptionKey) {
     problems.push('ENCRYPTION_KEY must be base64 of 32 bytes');
   }
+  const mockGateway = {
+    ...(e.SANKHYA_MOCK_ROW_CAP !== undefined ? { queryRowCap: e.SANKHYA_MOCK_ROW_CAP } : {}),
+    ...(e.SANKHYA_MOCK_SILENT_CUT ? { silentCut: true } : {}),
+    ...(e.SANKHYA_MOCK_DICTIONARY_PADDING !== undefined
+      ? { dictionaryPadding: e.SANKHYA_MOCK_DICTIONARY_PADDING }
+      : {}),
+  };
+  if (Object.keys(mockGateway).length && (isProduction || sankhyaMode !== 'mock'))
+    problems.push(
+      'SANKHYA_MOCK_* are test-only: set them only with SANKHYA_MODE=mock outside production',
+    );
   const envConnection = readEnvConnection(e);
   const trust = parseTrustProxy(e.TRUST_PROXY);
   if (typeof trust === 'string' && /^\d+$/.test(trust)) {
@@ -382,6 +417,7 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
       timeoutMs: e.SANKHYA_TIMEOUT_MS,
       ratePerMinute: e.SANKHYA_RATE_PER_MINUTE,
       maxRows: e.SANKHYA_MAX_ROWS,
+      mockGateway,
       ...(envConnection.connection ? { envConnection: envConnection.connection } : {}),
       envConnectionProblems: envConnection.problems,
     },

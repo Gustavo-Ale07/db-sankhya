@@ -146,6 +146,35 @@ describe('mock Sankhya gateway', () => {
     }
   }, 60_000);
 
+  it('executeQuery with silentCut cuts at the row cap without saying so', async () => {
+    const capped = await createMockSankhya({ queryRowCap: 5, silentCut: true });
+    try {
+      const res = await capped.handle({
+        method: 'POST',
+        url: '/authenticate',
+        headers: { 'x-token': MOCK_CREDENTIALS.xToken },
+        body: new URLSearchParams({
+          client_id: MOCK_CREDENTIALS.clientId,
+          client_secret: MOCK_CREDENTIALS.clientSecret,
+          grant_type: 'client_credentials',
+        }).toString(),
+      });
+      const t =
+        res.kind === 'response' ? (JSON.parse(res.body) as { access_token: string }) : undefined;
+      const out = await capped.handle({
+        method: 'POST',
+        url: '/gateway/v1/mge/service.sbr?serviceName=DbExplorerSP.executeQuery',
+        headers: { authorization: `Bearer ${t!.access_token}` },
+        body: JSON.stringify({ requestBody: { sql: 'SELECT CODPROD FROM TGFPRO' } }),
+      });
+      const body = out.kind === 'response' ? (JSON.parse(out.body) as any) : undefined; // eslint-disable-line @typescript-eslint/no-explicit-any
+      expect(body.responseBody.rows).toHaveLength(5);
+      expect(body.responseBody.burstLimit).toBe(false);
+    } finally {
+      await capped.close();
+    }
+  }, 60_000);
+
   it('loadRecords pages with criteria and f0..fn values', async () => {
     const { body } = await call('CRUDServiceProvider.loadRecords', {
       dataSet: {

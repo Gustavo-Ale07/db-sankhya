@@ -68,6 +68,11 @@ export interface MockSankhyaOptions {
   /** Row cap of executeQuery; larger results are cut and flagged with `burstLimit`. */
   queryRowCap?: number;
   /**
+   * Cuts executeQuery results at the row cap without flagging them (`burstLimit` false), as a
+   * gateway that silently drops rows would: only a count tells such a result from a whole one.
+   */
+  silentCut?: boolean;
+  /**
    * Refuses the paged dictionary read (TDDCAM by NUCAMPO), as a gateway or dictionary that cannot
    * serve it would: the whole-dictionary read is then the only one, and the row cap cuts it.
    */
@@ -335,7 +340,7 @@ export async function createMockSankhya(opts: MockSankhyaOptions = {}): Promise<
         userType: userType(f.dataTypeID),
       })),
       rows,
-      burstLimit: res.rows.length > rowCap,
+      burstLimit: !opts.silentCut && res.rows.length > rowCap,
     };
   }
 
