@@ -152,9 +152,14 @@ connection list holds connection uuids only, so `env-default` and `scratch` can 
 there: they are targeted by environment, or by a rule with no connection list. A rule scoped to
 `SANDBOX` therefore applies both to real SANDBOX connections and to every scratch workspace.
 
-- A read is evaluated with the tables and columns it touches. A star is expanded from the catalog,
-  so a column DENY refuses `SELECT *`; `COUNT(*)` reads no column and is not expanded, while
-  `COUNT(col)` references `col`.
+- A read is evaluated with the tables and columns it touches. A star counts as `*`, which every
+  column rule on its table hits, and is also expanded from the catalog, so a column DENY refuses
+  `SELECT *` even for a column the dictionary does not list; `COUNT(*)` reads no column and is not
+  expanded, while `COUNT(col)` references `col`. On Oracle, a quoted table or CTE name that is not
+  upper case is refused: `"tgfpar"` names another object than `TGFPAR`, and a CTE so named could
+  hide a read of the real table.
+- A write is checked against the policy for its table before the table's dictionary is read, so
+  the answer for a table the caller may not change does not depend on whether it exists.
 - A scratch `SELECT` is evaluated with the columns it reads. Scratch has no catalog, so a star or
   a whole-row reference (`row_to_json(t)`) or a `NATURAL JOIN` counts as `*`, which every column
   rule on that table hits, and a `JOIN … USING (c)` column counts on every table of the statement.
