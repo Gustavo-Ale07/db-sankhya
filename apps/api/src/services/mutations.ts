@@ -287,6 +287,7 @@ export class MutationService {
         decision: r.decision,
         targets: r.targets,
         entity: r.table.name.toUpperCase(),
+        entityName: r.table.entityName,
         previewKind: r.previewKind,
         previewLabels: r.previewLabels,
       });
@@ -444,6 +445,7 @@ export class MutationService {
       );
     }
     const table = catalogTable(catalog, write.table);
+    writeInstance(table);
 
     const decision = await evaluateFor({
       policies,
@@ -539,6 +541,8 @@ export class MutationService {
       decision: PolicyDecision;
       targets: PreviewTarget[];
       entity: string;
+      /** The TDDINS instance a Sankhya plan saves through, frozen in the plan (see execute). */
+      entityName?: string | undefined;
       previewKind: PreviewKind;
       previewLabels: PreviewKind[];
     },
@@ -547,7 +551,7 @@ export class MutationService {
     const { operation, permission, environment, capability, decision, targets, entity } = o;
     const { previewKind, previewLabels } = o;
     const affected = targets.length;
-    const preview = { targets, affected };
+    const preview = { targets, affected, ...(o.entityName ? { entityName: o.entityName } : {}) };
     const created = await this.deps.plans.create({
       userId: auth.user.id,
       sessionId: auth.session.id,
@@ -646,6 +650,7 @@ export class MutationService {
           decision: a.decision,
           targets: a.targets,
           entity: a.table.name.toUpperCase(),
+          entityName: a.table.entityName,
           previewKind: 'IMPACT_ANALYSIS',
           previewLabels: ['IMPACT_ANALYSIS', 'SIMULATED_PREVIEW'],
         },
@@ -714,6 +719,7 @@ export class MutationService {
 
     const catalog = await tableCatalog(metadata, connectionId, action.entity);
     const table = catalogTable(catalog, action.entity);
+    writeInstance(table);
     const entity = table.name.toUpperCase();
     const known = new Set(table.columns.map((c) => c.name.toUpperCase()));
     const pk = table.columns.filter((c) => c.pk).map((c) => c.name.toUpperCase());
@@ -1174,6 +1180,20 @@ export class MutationService {
         throw refuse(
           'RE-AUTHORIZE',
           invalidPlan('The policy now requires more than the preview did; preview it again.'),
+        );
+      }
+      // The instance the preview was made for is part of the plan; a dictionary that now names
+      // another one for the table makes it a different change.
+      const instance =
+        'sankhya' in resolved
+          ? resolved.sankhya.table.entityName
+          : 'action' in resolved
+            ? resolved.action.table.entityName
+            : undefined;
+      if (instance !== (plan.preview as { entityName?: unknown } | null)?.entityName) {
+        throw refuse(
+          'RE-AUTHORIZE',
+          invalidPlan('The entity of the table changed after the preview; preview it again.'),
         );
       }
       if (targetsHashOf(targets) !== plan.targetsHash) {
@@ -1834,6 +1854,26 @@ async function tableCatalog(
     fetchedAt: new Date().toISOString(),
     source: 'dictionary',
   };
+}
+
+/**
+ * Refuses a Sankhya write to a table TDDINS lists with more than one instance: which of them the
+ * change is meant for cannot be guessed, and each may save differently. A per-table choice of
+ * instance (configuration) would be read here; there is none yet, so such a table is refused.
+ */
+function writeInstance(table: CatalogTable): void {
+  const names = table.entityNames ?? [];
+  if (names.length > 1) {
+    const name = table.name.toUpperCase();
+    throw refuse(
+      'PLAN',
+      new AppError(
+        'OPERATION_NOT_SUPPORTED',
+        `${name} has ${names.length} instances in the data dictionary (${names.join(', ')}); configure the instance to use before changing it.`,
+        { instances: names },
+      ),
+    );
+  }
 }
 
 function catalogTable(catalog: Catalog, name: string): CatalogTable {

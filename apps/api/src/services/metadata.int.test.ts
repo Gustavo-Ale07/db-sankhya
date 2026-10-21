@@ -353,6 +353,32 @@ describe('MetadataService, a dictionary bigger than the gateway row cap', () => 
   });
 });
 
+describe('MetadataService instances (TDDINS)', () => {
+  it('lists every instance of a table in name order, the first as entityName, in both reads', async () => {
+    const { service, conn, mock } = await setup();
+    // Inserted ahead of the real ones: the order of the rows must not choose the instance.
+    await mock.db.query(
+      "INSERT INTO tddins (nomeinstancia, nometab, descrinstancia) VALUES ('AEstoque', 'TGFEST', 'x')",
+    );
+    const svc = service();
+    const est = (await svc.get(conn.id)).tables.find((t) => t.name === 'TGFEST');
+    expect(est).toMatchObject({
+      entityName: 'AEstoque',
+      entityNames: ['AEstoque', 'Estoque', 'EstoqueLocal'],
+    });
+    expect(await svc.table(conn.id, 'TGFEST')).toMatchObject({
+      entityName: 'AEstoque',
+      entityNames: ['AEstoque', 'Estoque', 'EstoqueLocal'],
+    });
+    expect((await svc.table(conn.id, 'TGFPAR'))?.entityNames).toEqual(['Parceiro']);
+    expect(sqls(mock).filter((q) => q.includes('FROM TDDINS'))).toEqual([
+      'SELECT NOMETAB, NOMEINSTANCIA FROM TDDINS ORDER BY NOMETAB, NOMEINSTANCIA',
+      "SELECT NOMETAB, NOMEINSTANCIA FROM TDDINS WHERE NOMETAB = 'TGFEST' ORDER BY NOMEINSTANCIA",
+      "SELECT NOMETAB, NOMEINSTANCIA FROM TDDINS WHERE NOMETAB = 'TGFPAR' ORDER BY NOMEINSTANCIA",
+    ]);
+  });
+});
+
 describe('MetadataService.table (one table, read on demand)', () => {
   it('finds a column the cut whole-dictionary read never saw (TGFPAR.NOMEPARC regression)', async () => {
     const { service, conn, mock } = await setup(CUT_DICTIONARY);

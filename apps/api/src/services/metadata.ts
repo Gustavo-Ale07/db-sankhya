@@ -24,7 +24,13 @@ export interface CatalogForeignKey {
 export interface CatalogTable {
   name: string;
   description?: string;
+  /** The first instance of the table in TDDINS, by name. */
   entityName?: string;
+  /**
+   * Every instance TDDINS lists for the table, sorted by name. With more than one, which of them
+   * a write goes through cannot be guessed and writes refuse the table (see mutations).
+   */
+  entityNames?: string[];
   columns: CatalogColumn[];
   /** Only foreign keys the dictionary exposes; none are discovered today, so this is empty. */
   foreignKeys: CatalogForeignKey[];
@@ -66,6 +72,7 @@ const TABLE_NAME = /^[A-Z_][A-Z0-9_$#]{0,127}$/;
 const TABLES_SQL = 'SELECT NOMETAB, DESCRTAB FROM TDDTAB';
 const FIELDS_SQL = 'SELECT NOMETAB, NOMECAMPO, DESCRCAMPO, TIPCAMPO FROM TDDCAM';
 const ENTITIES_SQL = 'SELECT NOMETAB, NOMEINSTANCIA FROM TDDINS';
+const ENTITIES_ORDER = ' ORDER BY NOMETAB, NOMEINSTANCIA';
 
 /**
  * TDDCAM one page at a time, by its numeric key: the whole dictionary outgrows the gateway row
@@ -84,7 +91,7 @@ export const MAX_FIELD_PAGES = 100;
 const tableSql = (name: string) => ({
   table: `${TABLES_SQL} WHERE NOMETAB = '${name}'`,
   fields: `${FIELDS_SQL} WHERE NOMETAB = '${name}'`,
-  entities: `${ENTITIES_SQL} WHERE NOMETAB = '${name}'`,
+  entities: `${ENTITIES_SQL} WHERE NOMETAB = '${name}' ORDER BY NOMEINSTANCIA`,
 });
 
 /**
@@ -236,10 +243,7 @@ export class MetadataService {
     const keys = await run('PK', pkSql(runtime.dialect, name));
 
     const description = text(found.DESCRTAB);
-    const entityName = records(entities)
-      .filter((r) => text(r.NOMETAB) === name)
-      .map((r) => text(r.NOMEINSTANCIA))
-      .find(Boolean);
+    const instances = instancesOf(records(entities).filter((r) => text(r.NOMETAB) === name));
     const pks = new Set(
       records(keys)
         .filter((r) => text(r.TABLE_NAME).toUpperCase() === name)
@@ -256,7 +260,7 @@ export class MetadataService {
     const table: CatalogTable = {
       name,
       ...(description ? { description } : {}),
-      ...(entityName ? { entityName } : {}),
+      ...instances,
       columns,
       foreignKeys: [],
     };
@@ -310,7 +314,7 @@ export class MetadataService {
       return result;
     };
     const fields = (await this.readFields(run, degraded)) ?? (await read('TDDCAM', FIELDS_SQL));
-    const entities = await read('TDDINS', ENTITIES_SQL);
+    const entities = await read('TDDINS', ENTITIES_SQL + ENTITIES_ORDER);
     const keys = await read('PK', pkSql(runtime.dialect));
 
     const tables = new Map<string, CatalogTable>();
@@ -325,10 +329,14 @@ export class MetadataService {
         foreignKeys: [],
       });
     }
+    const byTable = new Map<string, Array<Record<string, unknown>>>();
     for (const row of records(entities)) {
-      const table = tables.get(text(row.NOMETAB));
-      const entityName = text(row.NOMEINSTANCIA);
-      if (table && entityName && !table.entityName) table.entityName = entityName;
+      const name = text(row.NOMETAB);
+      byTable.set(name, [...(byTable.get(name) ?? []), row]);
+    }
+    for (const [name, rows] of byTable) {
+      const table = tables.get(name);
+      if (table) Object.assign(table, instancesOf(rows));
     }
     const pks = new Set<string>();
     for (const row of records(keys))
@@ -447,6 +455,14 @@ function catalogColumn(row: Record<string, unknown>, name: string, pk: boolean):
     ...(description ? { description } : {}),
     pk,
   };
+}
+
+/** `entityName` and `entityNames` of a table from its TDDINS rows, in name order whatever their order. */
+function instancesOf(
+  rows: Array<Record<string, unknown>>,
+): Pick<CatalogTable, 'entityName' | 'entityNames'> {
+  const names = [...new Set(rows.map((r) => text(r.NOMEINSTANCIA)).filter(Boolean))].sort();
+  return names.length ? { entityName: names[0]!, entityNames: names } : {};
 }
 
 function sameColumns(a: string[], b: string[]): boolean {

@@ -29,6 +29,11 @@ export interface MockTable {
   columns: MockColumn[];
   /** Primary key columns. Single integer keys are generated on insert as max + 1. */
   pk: string[];
+  /**
+   * More instances of the table in TDDINS, as a real dictionary may list. Only `entity` can be
+   * loaded or saved.
+   */
+  moreInstances?: string[];
 }
 
 const col = (name: string, type: MockFieldType, description: string, size?: number): MockColumn =>
@@ -112,6 +117,7 @@ export const MOCK_TABLES: readonly MockTable[] = [
     entity: 'Estoque',
     description: 'Estoque (demo)',
     pk: ['CODEMP', 'CODPROD', 'CODLOCAL'],
+    moreInstances: ['EstoqueLocal'],
     columns: [
       col('CODEMP', 'I', 'Empresa'),
       col('CODPROD', 'I', 'Produto'),
@@ -234,6 +240,7 @@ export async function seedMockDataset(
   for (const t of MOCK_TABLES) {
     tddtab.push([t.table, t.description]);
     tddins.push([t.entity, t.table, t.description]);
+    for (const other of t.moreInstances ?? []) tddins.push([other, t.table, t.description]);
     t.columns.forEach((c, i) => {
       tddcam.push([nucampo++, t.table, c.name, c.description, c.type, c.size ?? null, i + 1]);
     });

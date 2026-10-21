@@ -310,6 +310,7 @@ describe('MutationService.prepare', () => {
     expect(p.previewLabels).toEqual(['SIMULATED_PREVIEW']);
     expect(p.preview).toEqual({
       affected: 1,
+      entityName: 'Parceiro',
       targets: [
         {
           key: { CODPARC: 9999 },
@@ -438,6 +439,24 @@ describe('MutationService.prepare', () => {
       prepare(h, auth, "UPDATE TGFPRO SET DESCRPROD = 'X' WHERE CODPROD = 1"),
     ).rejects.toMatchObject({ code: 'FORBIDDEN' });
     expect(h.mock.calls.slice(before)).toEqual([]);
+    expect(writeCalls(h.mock)).toEqual([]);
+  });
+
+  it('a table TDDINS lists with two instances is refused at preview, naming both', async () => {
+    const h = await setup();
+    const { auth } = await h.userWith(WRITER);
+    await expect(
+      prepare(
+        h,
+        auth,
+        'UPDATE TGFEST SET ESTOQUE = 1 WHERE CODEMP = 1 AND CODPROD = 1 AND CODLOCAL = 1',
+      ),
+    ).rejects.toMatchObject({
+      code: 'OPERATION_NOT_SUPPORTED',
+      message: expect.stringContaining(
+        'TGFEST has 2 instances in the data dictionary (Estoque, EstoqueLocal)',
+      ),
+    });
     expect(writeCalls(h.mock)).toEqual([]);
   });
 
@@ -853,6 +872,31 @@ describe('MutationService.execute', () => {
     expect(await partner(h.mock, 1)).toBe('Mudou');
     const [denied] = await h.audit('PLAN_DENIED');
     expect(denied).toMatchObject({ errorCode: 'TARGETS_CHANGED', planId: p.planId });
+  });
+
+  it('the instance of the table changed after the preview: CONFIRMATION_INVALID, nothing saved', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    const p = await prepare(h, auth, SQL);
+    expect((p.preview as { entityName?: string }).entityName).toBe('Parceiro');
+    await h.mock.db.query("UPDATE tddins SET nomeinstancia = 'ParceiroB' WHERE nometab = 'TGFPAR'");
+    await h.app.services.metadata.invalidate(ENV_CONNECTION_ID);
+    await expect(execute(h, auth, p)).rejects.toMatchObject({ code: 'CONFIRMATION_INVALID' });
+    expect(saves(h.mock)).toEqual([]);
+    const [denied] = await h.audit('PLAN_DENIED');
+    expect(denied).toMatchObject({ errorCode: 'CONFIRMATION_INVALID', planId: p.planId });
+  });
+
+  it('a second instance of the table listed after the preview: refused, nothing saved', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    const p = await prepare(h, auth, SQL);
+    await h.mock.db.query(
+      "INSERT INTO tddins (nomeinstancia, nometab, descrinstancia) VALUES ('ParceiroB', 'TGFPAR', 'x')",
+    );
+    await h.app.services.metadata.invalidate(ENV_CONNECTION_ID);
+    await expect(execute(h, auth, p)).rejects.toMatchObject({ code: 'OPERATION_NOT_SUPPORTED' });
+    expect(saves(h.mock)).toEqual([]);
   });
 
   it('DATA.UPDATE removed after the preview: FORBIDDEN, nothing saved, audited as denied', async () => {
