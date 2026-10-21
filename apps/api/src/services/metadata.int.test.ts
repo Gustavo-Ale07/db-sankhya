@@ -239,7 +239,7 @@ describe('MetadataService', () => {
     const catalog = await service().get(conn.id);
     const { rows } = await mock.db.query<{ n: number }>('SELECT COUNT(*)::int AS n FROM TDDTAB');
     expect(catalog.tables).toHaveLength(rows[0]!.n);
-    expect(catalog.degraded).toEqual(['TDDCAM:truncated', 'TDDINS:truncated', 'PK:truncated']);
+    expect(catalog.degraded).toEqual(['TDDCAM:truncated', 'TDDINS:truncated']);
     expect(await database.db.select().from(metadataCache)).toHaveLength(0);
   });
 
@@ -447,7 +447,7 @@ describe('MetadataService, a gateway that cuts at its row cap without saying so'
     sql: string,
   ) => (await mock.db.query<{ n: number }>(sql)).rows[0]!.n;
 
-  it('pages TDDTAB and TDDCAM on until they add up to their counts; TDDINS and PK cut by count', async () => {
+  it('pages TDDTAB, TDDCAM and the keys on until they add up to their counts; TDDINS cut by count', async () => {
     const { service, conn, mock, database } = await setup({ queryRowCap: 3, silentCut: true });
     const catalog = await service().get(conn.id);
 
@@ -466,8 +466,44 @@ describe('MetadataService, a gateway that cuts at its row cap without saying so'
     expect(
       sqls(mock).some((q) => /FROM TDDTAB WHERE NOMETAB > '[A-Z0-9_]+' ORDER BY NOMETAB$/.test(q)),
     ).toBe(true);
-    expect(catalog.degraded).toEqual(['TDDINS:truncated', 'PK:truncated']);
+    expect(catalog.degraded).toEqual(['TDDINS:truncated']);
     expect(await database.db.select().from(metadataCache)).toHaveLength(0);
+  });
+
+  it('pages the primary keys by table and column name; every key is marked', async () => {
+    const { service, conn, mock } = await setup({ queryRowCap: 3, silentCut: true });
+    const catalog = await service().get(conn.id);
+    expect(catalog.degraded ?? []).not.toContain('PK:truncated');
+    const keys = catalog.tables.flatMap((t) =>
+      t.columns.filter((c) => c.pk).map((c) => `${t.name}.${c.name}`),
+    );
+    const { rows } = await mock.db.query<{ k: string }>(
+      "SELECT upper(tc.table_name) || '.' || upper(k.column_name) AS k FROM information_schema.table_constraints tc " +
+        'JOIN information_schema.key_column_usage k ON k.constraint_name = tc.constraint_name ' +
+        "WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = 'public' " +
+        'AND upper(tc.table_name) IN (SELECT NOMETAB FROM TDDTAB)',
+    );
+    expect(rows.length).toBeGreaterThan(3);
+    expect(keys.sort()).toEqual(rows.map((r) => r.k).sort());
+    const paged = sqls(mock).filter((q) => q.includes('ORDER BY K.TABLE_NAME, K.COLUMN_NAME'));
+    expect(paged.length).toBeGreaterThan(1);
+    expect(paged[0]).not.toContain('K.TABLE_NAME >');
+    expect(
+      paged
+        .slice(1)
+        .every((q) =>
+          /WHERE K.TABLE_NAME > '[A-Z0-9_$#]+' OR (K.TABLE_NAME = '[A-Z0-9_$#]+' AND K.COLUMN_NAME > '[A-Z0-9_$#]+') ORDER BY K.TABLE_NAME, K.COLUMN_NAME$/.test(
+            q,
+          ),
+        ),
+    ).toBe(true);
+  });
+
+  it('reports the keys as cut when a later page of them fails', async () => {
+    const { service, conn, mock } = await setup({ queryRowCap: 3, silentCut: true });
+    mock.inject({ type: 'malformed' }, { sqlIncludes: 'ORDER BY K.TABLE_NAME', after: 1 });
+    const catalog = await service().get(conn.id);
+    expect(catalog.degraded).toContain('PK:failed');
   });
 
   it('reports a single read that does not add up to its count as cut', async () => {

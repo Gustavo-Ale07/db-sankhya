@@ -173,6 +173,40 @@ function pkSql(dialect: Dialect, table?: string): string {
   );
 }
 
+/** A key of the primary key read: `TABLE.COLUMN`, both plain database names. */
+const PK_KEY = /^([A-Za-z0-9_$#]{1,128}).([A-Za-z0-9_$#]{1,128})$/;
+
+/**
+ * The primary key columns of every table, by table and column name: a big schema outgrows the
+ * gateway row cap. As with TDDTAB, the database orders and compares the names with the same
+ * collation, so the order is not checked here; a key read twice or a total that does not add up
+ * still shows a cut.
+ */
+function pkRead(dialect: Dialect): PagedRead {
+  const keys = `(${pkSql(dialect)}) K`;
+  return {
+    label: 'PK',
+    page: (after) => {
+      const [, table, column] = (after !== undefined && PK_KEY.exec(after)) || [];
+      return (
+        `SELECT K.TABLE_NAME, K.COLUMN_NAME FROM ${keys}` +
+        (table === undefined
+          ? ''
+          : ` WHERE K.TABLE_NAME > '${table}' OR (K.TABLE_NAME = '${table}' AND K.COLUMN_NAME > '${column}')`) +
+        ' ORDER BY K.TABLE_NAME, K.COLUMN_NAME'
+      );
+    },
+    key: (r) => {
+      const table = text(r.TABLE_NAME);
+      const column = text(r.COLUMN_NAME);
+      return table && column ? `${table}.${column}` : '';
+    },
+    ordered: () => true,
+    inlinable: (key) => PK_KEY.test(key),
+    count: countSql(keys),
+  };
+}
+
 /** Dictionary field type codes (TIPCAMPO) mapped to the names the explorer shows. */
 const FIELD_TYPES: Record<string, string> = {
   I: 'integer',
@@ -417,8 +451,10 @@ export class MetadataService {
       (await readPaged(run, degraded, FIELDS_READ, this.maxPages).catch(() => undefined)) ??
       (await read('TDDCAM', FIELDS_SQL, FIELDS_READ.count));
     const entities = await read('TDDINS', ENTITIES_SQL + ENTITIES_ORDER, countSql('TDDINS'));
-    const pk = pkSql(runtime.dialect);
-    const keys = await read('PK', pk, countSql(`(${pk}) K`));
+    const pk = pkRead(runtime.dialect);
+    const keys =
+      (await readPaged(run, degraded, pk, this.maxPages).catch(() => undefined)) ??
+      (await read('PK', pkSql(runtime.dialect), pk.count));
 
     const tables = new Map<string, CatalogTable>();
     for (const row of records(tablesResult)) {
