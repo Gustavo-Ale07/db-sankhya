@@ -116,6 +116,12 @@ export interface SchemaResponse {
   catalog: Catalog;
 }
 
+/** GET /api/schema/tables/:name: one table with every column the reader may see. */
+export interface SchemaTableResponse {
+  connectionId: string;
+  table: CatalogTable;
+}
+
 export interface ResultColumn {
   name: string;
   type: string;

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import type { CatalogTable } from '../api/types';
 import { SchemaTree } from './SchemaTree';
 
@@ -88,5 +88,64 @@ describe('SchemaTree', () => {
     renderTree(undefined);
     expect(screen.queryByTestId('schema-count')).toBeNull();
     expect(screen.getByText('Nenhuma tabela encontrada.')).toBeTruthy();
+  });
+  describe('with a catalog that lost columns (loadTable)', () => {
+    const CUT: CatalogTable[] = [
+      {
+        name: 'TGFPAR',
+        columns: [{ name: 'CODPARC', type: 'NUMBER', pk: true }],
+        foreignKeys: [],
+      },
+    ];
+    const FULL: CatalogTable = { ...TABLES[0]!, foreignKeys: [] };
+    const expand = () => {
+      fireEvent.click(screen.getByTestId('schema-group-TGF'));
+      fireEvent.click(screen.getByTestId('schema-table-TGFPAR'));
+    };
+    const tree = (loadTable: (name: string) => Promise<CatalogTable>) => (
+      <SchemaTree
+        tables={CUT}
+        loading={false}
+        onSelectQuery={vi.fn()}
+        onInsertText={vi.fn()}
+        loadTable={loadTable}
+      />
+    );
+
+    it('reads the columns of an expanded table on demand, once', async () => {
+      const loadTable = vi.fn(() => Promise.resolve(FULL));
+      render(tree(loadTable));
+      expand();
+      expect(screen.getByText('Carregando colunas…')).toBeTruthy();
+      await waitFor(() =>
+        expect(screen.getByTestId('schema-columns-TGFPAR').textContent).toContain('NOMEPARC'),
+      );
+      expect(loadTable).toHaveBeenCalledWith('TGFPAR');
+      fireEvent.click(screen.getByTestId('schema-table-TGFPAR'));
+      fireEvent.click(screen.getByTestId('schema-table-TGFPAR'));
+      expect(loadTable).toHaveBeenCalledTimes(1);
+    });
+
+    it('shows an error instead of the partial column list when the read fails', async () => {
+      render(tree(() => Promise.reject(new Error('boom'))));
+      expand();
+      await waitFor(() =>
+        expect(screen.getByText('Não foi possível ler as colunas desta tabela.')).toBeTruthy(),
+      );
+      expect(screen.queryByTestId('schema-columns-TGFPAR')).toBeNull();
+    });
+
+    it('never shows the columns another connection answered', async () => {
+      let answer!: (t: CatalogTable) => void;
+      const first = vi.fn(() => new Promise<CatalogTable>((resolve) => (answer = resolve)));
+      const { rerender } = render(tree(first));
+      expand();
+      const second = vi.fn(() => Promise.resolve({ ...FULL, columns: [FULL.columns[0]!] }));
+      rerender(tree(second));
+      answer(FULL);
+      await waitFor(() => expect(second).toHaveBeenCalledWith('TGFPAR'));
+      await waitFor(() => expect(screen.queryByText('Carregando colunas…')).toBeNull());
+      expect(screen.getByTestId('schema-columns-TGFPAR').textContent).not.toContain('NOMEPARC');
+    });
   });
 });

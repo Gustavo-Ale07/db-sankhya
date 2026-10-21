@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, ApiError, newExecutionId } from '../api/client';
 import { previewMutation } from '../api/mutations';
 import type { PreparedPlan } from '../api/mutations';
-import type { QueryResult, SavedQuery, SchemaResponse } from '../api/types';
+import type { QueryResult, SavedQuery, SchemaResponse, SchemaTableResponse } from '../api/types';
 import type { Theme } from '../app/theme';
 import { useSession } from '../app/session';
 import { setCompletionSchema } from '../editor/monaco';
@@ -128,6 +128,21 @@ export function ExplorerPage({
     enabled: connectionReady && Boolean(connectionId),
     staleTime: 5 * 60_000,
   });
+  // A dictionary cut at the gateway row cap may list only some columns of a table: the tree then
+  // reads the columns of an expanded table on their own.
+  const columnsCut = schema.data?.catalog.degraded?.some((d) => d.startsWith('TDDCAM:')) ?? false;
+  const loadTable = useMemo(
+    () =>
+      columnsCut && connectionId
+        ? (name: string) =>
+            api
+              .get<SchemaTableResponse>(`/api/schema/tables/${encodeURIComponent(name)}`, {
+                query: { connectionId },
+              })
+              .then((r) => r.table)
+        : undefined,
+    [columnsCut, connectionId],
+  );
   useEffect(() => {
     // Cleared while another connection's dictionary loads: no suggestions from the wrong one.
     setCompletionSchema(schema.data?.catalog.tables ?? []);
@@ -527,6 +542,7 @@ export function ExplorerPage({
                     loading={schema.isPending && connectionReady}
                     onSelectQuery={openTableQuery}
                     onInsertText={(text) => editorApi.current?.insertText(text)}
+                    loadTable={loadTable}
                   />
                 </div>
                 {schema.isError && <ErrorBox error={schema.error} className="m-2" />}
