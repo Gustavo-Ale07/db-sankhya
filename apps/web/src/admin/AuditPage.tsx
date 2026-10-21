@@ -42,6 +42,7 @@ const ACTIONS = [
   'approval.request',
   'approval.decide',
   'approval.execute',
+  'schema.refresh',
   'ddl.generate',
   'ddl.denied',
   'read.denied',

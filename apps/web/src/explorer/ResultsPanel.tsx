@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { translateMessage } from '../api/errors';
 import { ErrorBox } from '../components/ErrorBox';
 import { JsonView } from '../components/JsonView';
 import {
@@ -128,7 +129,7 @@ export function ResultsPanel({ run, tab, onTab, reopen }: Props) {
 
   const messages: string[] = [];
   if (run.status === 'result') {
-    messages.push(...run.result.messages);
+    messages.push(...run.result.messages.map(translateMessage));
     if (run.result.truncated)
       messages.push(
         `Resultado truncado: exibindo ${run.result.rowCount} linha(s) pelo limite de linhas. Use filtros para refinar.`,

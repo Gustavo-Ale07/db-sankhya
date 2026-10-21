@@ -60,6 +60,53 @@ export function translateCode(code: string): string {
   return ERROR_MESSAGES[code] ?? 'Erro inesperado.';
 }
 
+/**
+ * pt-BR for the server messages a user sees (result notes, error details). The server answers in
+ * English and its codes never change; a message not listed here is shown as it came.
+ */
+const MESSAGES: [RegExp, (...m: string[]) => string][] = [
+  [
+    /^Result truncated to (\d+) rows\. Add filters or an explicit LIMIT\/OFFSET to page through the data\.$/,
+    (n) =>
+      `Resultado limitado a ${n} linhas. Adicione filtros ou um LIMIT/OFFSET explícito para paginar.`,
+  ],
+  [/^Result truncated to (\d+) rows\.$/, (n) => `Resultado limitado a ${n} linhas.`],
+  [
+    /^Result truncated by the gateway at (\d+) rows\.$/,
+    (n) => `O gateway cortou o resultado em ${n} linhas.`,
+  ],
+  [/^Table not found$/, () => 'Tabela não encontrada.'],
+  [
+    /^Table (\S+) is not in the catalog of this connection; the catalog is incomplete, refresh it and try again$/,
+    (t) =>
+      `A tabela ${t} não está no catálogo desta conexão; o catálogo está incompleto: recarregue-o e tente de novo.`,
+  ],
+  [
+    /^Table (\S+) is not in the catalog of this connection$/,
+    (t) => `A tabela ${t} não está no catálogo desta conexão.`,
+  ],
+  [
+    /^Unknown table "([^"]*)"\.(?: Did you mean "([^"]*)"\?)?$/,
+    (t, hint) => `Tabela desconhecida "${t}".${hint ? ` Você quis dizer "${hint}"?` : ''}`,
+  ],
+  [
+    /^Unknown column "([^"]*)"\.(?: Did you mean "([^"]*)"\?)?$/,
+    (c, hint) => `Coluna desconhecida "${c}".${hint ? ` Você quis dizer "${hint}"?` : ''}`,
+  ],
+  [
+    /^Unknown table or alias "([^"]*)"\.(?: Did you mean "([^"]*)"\?)?$/,
+    (t, hint) => `Tabela ou alias desconhecido "${t}".${hint ? ` Você quis dizer "${hint}"?` : ''}`,
+  ],
+];
+
+export function translateMessage(message: string): string {
+  for (const [pattern, render] of MESSAGES) {
+    const m = pattern.exec(message);
+    if (m) return render(...m.slice(1).map((g) => g ?? ''));
+  }
+  return message;
+}
+
 export interface DisplayError {
   code: string;
   title: string;
@@ -74,7 +121,7 @@ export function describeError(err: unknown): DisplayError {
     return {
       code: err.code,
       title,
-      detail: err.message && err.message !== title ? err.message : undefined,
+      detail: err.message && err.message !== title ? translateMessage(err.message) : undefined,
       requestId: err.requestId,
     };
   }
