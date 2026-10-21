@@ -27,7 +27,7 @@ import {
   requireAuth,
 } from '../http';
 import { ENV_CONNECTION_ID } from '../services/connections';
-import type { Catalog, CatalogColumn, CatalogTable } from '../services/metadata';
+import type { CatalogColumn, CatalogTable } from '../services/metadata';
 import { connectionDenied, evaluateFor } from '../services/read-policy';
 
 const PERMISSION: Permission = 'DDL.CUSTOM.GENERATE';
@@ -102,22 +102,6 @@ function currentModel(table: CatalogTable, desired: TableModel): TableModel {
     primaryKey: table.columns.filter((c) => c.pk).map((c) => c.name.toUpperCase()),
     fields,
   };
-}
-
-function existingTable(catalog: Catalog, name: string): CatalogTable | undefined {
-  const degraded = catalog.degraded ?? [];
-  const found = catalog.tables.find((t) => t.name.toUpperCase() === name);
-  // The table list cut short or failed: absence proves nothing. Columns or keys missing: the
-  // current model would be wrong. Either way a diff would mislead, so refuse (fail closed).
-  const listBroken = degraded.some((d) => d.startsWith('TDDTAB:'));
-  const detailBroken = degraded.some((d) => d.startsWith('TDDCAM:') || d.startsWith('PK:'));
-  if (listBroken || (found && detailBroken)) {
-    throw new AppError(
-      'SQL_UNSUPPORTED',
-      'The data dictionary could not be read completely, so the current table cannot be compared. Try again later.',
-    );
-  }
-  return found;
 }
 
 /**
@@ -240,7 +224,10 @@ export async function ddlRoutes(app: FastifyInstance): Promise<void> {
           });
         }
 
-        const table = existingTable(await metadata.get(connectionId), desired.name);
+        // The table's own dictionary rows, read for it alone, never the whole-dictionary catalog
+        // (which the gateway may cut). A read that fails or is cut throws: a diff against fewer
+        // columns or keys than the table has would mislead, so nothing is generated.
+        const table = await metadata.table(connectionId, desired.name);
         const current = table
           ? validateTableModel(currentModel(table, desired), { customPrefixes: prefixes })
           : null;

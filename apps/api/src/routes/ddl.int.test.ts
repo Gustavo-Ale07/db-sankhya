@@ -9,7 +9,7 @@ import type { Permission } from '@dbx/shared';
 import { buildApp } from '../app';
 import { loadConfig, secretValues } from '../config';
 import { loggerOptions } from '../logger';
-import type { Catalog } from '../services/metadata';
+import type { Catalog, CatalogTable } from '../services/metadata';
 import type { PolicyInput } from '../services/policy';
 
 const ORIGIN = 'http://localhost:5173';
@@ -170,24 +170,22 @@ const auditOf = async (h: Harness, action: string) => {
   return res.json() as { total: number; items: Array<Record<string, unknown>> };
 };
 
-/** The catalog of an existing custom table (the dictionary exposes no sizes or nullability). */
-const existing = (h: Harness, degraded?: string[]) =>
-  vi.spyOn(h.app.services.metadata, 'get').mockResolvedValue({
-    tables: [
-      {
-        name: 'AD_EXEMPLO',
-        columns: [
-          { name: 'ID', type: 'integer', pk: true },
-          { name: 'NOME', type: 'string', pk: false },
-          { name: 'OBS', type: 'string', pk: false },
-        ],
-        foreignKeys: [],
-      },
-    ],
-    fetchedAt: new Date().toISOString(),
-    source: 'dictionary',
-    ...(degraded ? { degraded } : {}),
-  } satisfies Catalog);
+/** An existing custom table, as its own dictionary rows describe it (no sizes or nullability). */
+const AD_EXEMPLO: CatalogTable = {
+  name: 'AD_EXEMPLO',
+  columns: [
+    { name: 'ID', type: 'integer', pk: true },
+    { name: 'NOME', type: 'string', pk: false },
+    { name: 'OBS', type: 'string', pk: false },
+  ],
+  foreignKeys: [],
+};
+const existing = (h: Harness) =>
+  vi
+    .spyOn(h.app.services.metadata, 'table')
+    .mockImplementation((_connectionId, name) =>
+      Promise.resolve(name.toUpperCase() === 'AD_EXEMPLO' ? AD_EXEMPLO : undefined),
+    );
 
 describe('POST /api/ddl/artifact', () => {
   it('requires a session and DDL.CUSTOM.GENERATE, and audits the denial', async () => {
@@ -360,13 +358,54 @@ describe('POST /api/ddl/artifact', () => {
     expect((await auditOf(h, 'ddl.denied')).total).toBe(1);
   });
 
-  it('refuses to diff against a degraded catalog', async () => {
+  it('diffs an existing table even when the whole-dictionary catalog was cut', async () => {
     const h = await setup();
     const cookie = await h.generator();
-    existing(h, ['TDDCAM:failed']);
+    existing(h);
+    const whole = vi.spyOn(h.app.services.metadata, 'get').mockResolvedValue({
+      tables: [{ ...AD_EXEMPLO, columns: AD_EXEMPLO.columns.slice(0, 1) }],
+      fetchedAt: new Date().toISOString(),
+      source: 'dictionary',
+      degraded: ['TDDTAB:truncated', 'TDDCAM:truncated', 'PK:failed'],
+    } satisfies Catalog);
+    // NOME and OBS exist (the cut catalog lost them): keeping them is no DROP_FIELD.
+    const sql =
+      'CREATE TABLE AD_EXEMPLO (ID INT PRIMARY KEY, NOME VARCHAR(40), OBS VARCHAR(40), EXTRA INT)';
+    const res = await h.ddl(cookie, { sql, confirm: 'DESTRUCTIVE AD_EXEMPLO' });
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json().changes.map((c: { kind: string }) => c.kind)).not.toContain('DROP_FIELD');
+    expect(whole).not.toHaveBeenCalled();
+  });
+
+  it('generates nothing when the dictionary of the table cannot be read completely', async () => {
+    const h = await setup();
+    const cookie = await h.generator();
+    h.mock.inject(
+      { type: 'malformed' },
+      { sqlIncludes: "FROM TDDCAM WHERE NOMETAB = 'AD_EXEMPLO'" },
+    );
+    // AD_EXEMPLO is in the mock dictionary; its columns cannot be read.
     const res = await h.ddl(cookie, { sql: 'CREATE TABLE AD_EXEMPLO (ID INT PRIMARY KEY)' });
-    expect(res.statusCode).toBe(400);
-    expect(codeOf(res)).toBe('SQL_UNSUPPORTED');
+    expect(res.statusCode, res.body).toBe(502);
+    expect(codeOf(res)).toBe('SANKHYA_API_ERROR');
+    expect(res.json()).not.toHaveProperty('artifacts');
+    expect((await auditOf(h, 'ddl.denied')).items[0]).toMatchObject({
+      errorCode: 'SANKHYA_API_ERROR',
+    });
+    expect((await auditOf(h, 'ddl.generate')).total).toBe(0);
+  });
+
+  it('reads the table on its own and treats one the dictionary lacks as new', async () => {
+    const h = await setup();
+    const cookie = await h.generator();
+    const res = await h.ddl(cookie, { sql: CREATE });
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json().changes.every((c: { kind: string }) => c.kind !== 'DROP_FIELD')).toBe(true);
+    const reads = h.mock.calls
+      .filter((c) => c.serviceName === 'DbExplorerSP.executeQuery')
+      .map((c) => String((c.requestBody as { sql?: unknown } | undefined)?.sql ?? ''));
+    expect(reads.some((q) => q.includes('FROM TDDTAB WHERE NOMETAB ='))).toBe(true);
+    expect(reads.some((q) => q === 'SELECT NOMETAB, DESCRTAB FROM TDDTAB')).toBe(false);
   });
 
   it('never echoes secrets', async () => {
