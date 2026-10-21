@@ -121,6 +121,8 @@ export class MetadataService {
   /** On-demand table metadata, keyed by connection and table (see tableKey). */
   private readonly tables = new Map<string, { table: CatalogTable; at: number }>();
   private readonly tablesInflight = new Map<string, Promise<CatalogTable | undefined>>();
+  /** Bumped when a connection's tables are forgotten: a lookup started earlier is not kept. */
+  private readonly tablesGeneration = new Map<string, number>();
   private readonly now: () => number;
   private readonly ttlMs: number;
 
@@ -166,9 +168,9 @@ export class MetadataService {
     }
     let running = this.tablesInflight.get(key);
     if (!running) {
-      running = this.discoverTable(connectionId, upper).finally(() =>
-        this.tablesInflight.delete(key),
-      );
+      const started = (running = this.discoverTable(connectionId, upper).finally(() => {
+        if (this.tablesInflight.get(key) === started) this.tablesInflight.delete(key);
+      }));
       this.tablesInflight.set(key, running);
     }
     return running;
@@ -189,12 +191,17 @@ export class MetadataService {
   private forgetTables(connectionId: string): void {
     const prefix = tableKey(connectionId, '');
     for (const key of this.tables.keys()) if (key.startsWith(prefix)) this.tables.delete(key);
+    for (const key of this.tablesInflight.keys()) {
+      if (key.startsWith(prefix)) this.tablesInflight.delete(key);
+    }
+    this.tablesGeneration.set(connectionId, (this.tablesGeneration.get(connectionId) ?? 0) + 1);
   }
 
   private async discoverTable(
     connectionId: string,
     name: string,
   ): Promise<CatalogTable | undefined> {
+    const generation = this.tablesGeneration.get(connectionId) ?? 0;
     const runtime = await this.deps.getRuntime(connectionId);
     const sql = tableSql(name);
     // Every read must be complete: a partial answer would pass for the whole table.
@@ -240,8 +247,12 @@ export class MetadataService {
       columns,
       foreignKeys: [],
     };
-    // A table without columns is answered but not kept: nothing about it can be confirmed.
-    if (columns.length) this.tables.set(tableKey(connectionId, name), { table, at: this.now() });
+    // A table without columns is answered but not kept: nothing about it can be confirmed. Nor is
+    // one read before the connection was invalidated (its credentials may have changed since).
+    const current = (this.tablesGeneration.get(connectionId) ?? 0) === generation;
+    if (columns.length && current) {
+      this.tables.set(tableKey(connectionId, name), { table, at: this.now() });
+    }
     return table;
   }
 

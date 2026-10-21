@@ -325,6 +325,26 @@ describe('MetadataService.table (one table, read on demand)', () => {
     expect(queries(mock)).toBe(before + 4);
   });
 
+  it('never keeps a lookup that was still running when the connection was invalidated', async () => {
+    const { service, conn, mock } = await setup();
+    const svc = service();
+    const stale = svc.table(conn.id, 'TGFPAR');
+    await svc.invalidate(conn.id);
+    await stale;
+    // The lookup started before the invalidation answered its caller but was not kept.
+    const before = queries(mock);
+    await svc.table(conn.id, 'TGFPAR');
+    expect(queries(mock)).toBe(before + 4);
+
+    // A caller arriving after an invalidation never joins a lookup started before it.
+    await svc.invalidate(conn.id);
+    const running = svc.table(conn.id, 'TGFPAR');
+    await svc.invalidate(conn.id);
+    const fresh = svc.table(conn.id, 'TGFPAR');
+    expect(fresh).not.toBe(running);
+    await Promise.all([running, fresh]);
+  });
+
   it('answers undefined for a table the connection does not have, reading only TDDTAB', async () => {
     const { service, conn, mock } = await setup();
     const before = queries(mock);
