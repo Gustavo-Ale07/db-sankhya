@@ -255,7 +255,8 @@ Metadata is cached in the app database per connection, with a TTL and a manual r
 | `UPDATE … WHERE`                                                      | Sankhya | **SUPPORTED** (policy-gated, off by default, row cap)                                    | target resolution via SELECT, then `DatasetSP.save` with pk per record |
 | `UPDATE`/`DELETE` without `WHERE`                                     | any     | **BLOCKED** even for admins, unless an explicit policy override plus strong confirmation | —                                                                      |
 | `DELETE`                                                              | Sankhya | **UNSUPPORTED** (no documented generic service)                                          | —                                                                      |
-| Note/item actions (include, change, remove item, cancel, invoice)     | Sankhya | **SUPPORTED** as typed business actions, never from free SQL                             | `CACSP.*`, `SelecaoDocumentoSP.faturar`                                |
+| Cancel a note                                                         | Sankhya | **SUPPORTED** as a typed business action, never from free SQL                            | `CACSP.cancelarNota` (the only registered action)                      |
+| Other note/item actions (include, change, remove item, invoice)       | Sankhya | **UNSUPPORTED** until registered as typed business actions                               | candidates: other `CACSP.*`, `SelecaoDocumentoSP.faturar`              |
 | `CREATE/ALTER/DROP TABLE` on custom tables (allowed prefixes)         | Sankhya | **SUPPORTED VIA GENERATED ARTIFACT**                                                     | AutoDDL XML / dbscript XML (Oracle + MSSQL)                            |
 | DDL on native tables                                                  | Sankhya | **UNSUPPORTED** (forbidden)                                                              | —                                                                      |
 | `CREATE/DROP/ALTER TEMP TABLE`, `INSERT/UPDATE/DELETE` on temp tables | Scratch | **SCRATCH ONLY**                                                                         | PGlite workspace                                                       |
@@ -267,7 +268,7 @@ Metadata is cached in the app database per connection, with a TTL and a manual r
 2. **Dictionary column names** (`TDDTAB`/`TDDCAM`/`TDDINS`) vary by version, so the metadata adapter must tolerate differences.
 3. **`DatasetSP.save` field semantics** (index-based `values` map, `standAlone`) come from the official examples. Every write is verified afterwards with a PK read, and a verification mismatch is reported, never hidden.
 4. **Rate and concurrency:** 1000 requests/min and serial `executeQuery` per session. Mitigations: a per-connection queue and budget, and batching of verification reads.
-5. **No transactions** across `DatasetSP.save` calls, so multi-row updates can end partially. This is reported as PARTIAL, with assisted rollback that is itself a new planned mutation.
+5. **No transactions** across `DatasetSP.save` calls, so multi-row updates can end partially. This is reported as `PARTIALLY_VERIFIED`. Assisted rollback, itself a new planned mutation, is offered only for a `VERIFIED` UPDATE; a partial, unverified or failed run must be checked in the ERP and corrected by hand (see `apps/api/src/services/rollback.ts`).
 6. **dompurify/esbuild advisories:** bump through dependabot or overrides during the hardening stage.
 
 ## 8. Next step

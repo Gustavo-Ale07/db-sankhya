@@ -232,8 +232,16 @@ A write runs only as a plan (see [architecture.md](architecture.md#writes)):
   and registered business actions can reach Sankhya. Everything else is `UNSUPPORTED` (see
   [capabilities.md](capabilities.md)).
 - **Immutable plans.** The previewed plan is stored with a hash; the token is an HMAC over the
-  plan id, its hash and the session, signed with `AUTH_SECRET`, valid for `PLAN_TTL_SECONDS`,
-  and consumed at most once. What runs is exactly what was previewed.
+  plan id, its hash and the session, signed with `AUTH_SECRET`, valid for `PLAN_TTL_SECONDS`
+  (a plan that needs approval: `APPROVAL_TTL_MINUTES`, its approval expiring with it), and
+  consumed at most once. What runs is exactly what was previewed.
+- **Plan retention.** A settled plan (used, expired or invalidated) keeps its before values and
+  preview for `PLAN_REDACT_HOURS` (default 24); an hourly job then replaces them with
+  `{"redacted":true}`, and a replay of that plan is refused as altered. After
+  `PLAN_RETENTION_DAYS` (default 30) the row is deleted, unless an approval request names it.
+  The rollback reads the execution report in the audit log, not the plan, so neither step affects
+  it. Both defaults are a pending decision (_decisão pendente_); the audit log has its own
+  retention.
 - **Typed confirmation.** `PRODUCTION` writes, and rules that ask for it, need the exact phrase
   `<ENVIRONMENT> <ACTION> <N> <ENTITY>`.
 - **Four-eyes approval.** A rule with `requireApproval` (and every `WHERE` override) needs a second
@@ -244,7 +252,8 @@ A write runs only as a plan (see [architecture.md](architecture.md#writes)):
   switches are checked again at execution, and the switches and policy version again before every
   gateway call.
 - **Kill switches.** `GLOBAL_WRITE_ENABLED` (default `false`, with a runtime half that an
-  administrator with `ADMIN.SECURITY` can turn off without a restart), `WRITE_TO_SANKHYA` (default
+  administrator with `ADMIN.SECURITY` can turn off without a restart; turning it back on never
+  goes beyond the environment value, since the effective switch is both halves), `WRITE_TO_SANKHYA` (default
   `false`) and `SAFE_MODE` (default `true`, blocks `PRODUCTION` writes). Business actions also
   need their id in `BUSINESS_ACTIONS_ENABLED` on live connections.
 - **No retries.** A write is sent once. An unclear outcome is reported as `WRITE_OUTCOME_UNKNOWN`,
@@ -310,6 +319,19 @@ tokens, passwords, cookies or authorization headers.
   read-only.
 
 ## Known limitations
+
+- **Segregation of duties against `ADMIN.USERS` + `ADMIN.ROLES`.** The rules above stop an
+  administrator from granting what they do not hold, and the policy and approval permissions are
+  kept apart from writing. They do not stop one person who holds `ADMIN.USERS` and `ADMIN.ROLES`
+  together with every permission of a write from creating a second account with those
+  permissions and approving their own plan through it (the sock puppet of the residual risk
+  above). Keep those two permissions with people who hold no `DATA.*` and no `APPROVAL.DECIDE`,
+  and review `user.create` and `approval.decide` in the audit log.
+- **A column DENY over-denies `SELECT *`** (_decisão pendente_). The star is expanded from the
+  catalog and also counts as `*`, so a DENY on any one column refuses `SELECT *` of the whole
+  table, even when the catalog no longer lists the denied column; the user must name the other
+  columns. This fails closed on purpose. Tests: `apps/api/src/policy-enforcement.int.test.ts`
+  ("a column DENY refuses SELECT * …", three cases) and `e2e/tests/cut-dictionary.spec.ts`.
 
 - Open editor tabs are kept in the browser's `localStorage` so drafts survive a reload. They are
   removed on logout; closing the browser without logging out leaves them on that device.

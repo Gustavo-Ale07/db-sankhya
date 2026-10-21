@@ -68,6 +68,8 @@ connection credentials cannot be decrypted; replace them". The environment conne
 | `BUSINESS_ACTIONS_ENABLED` | empty   | comma-separated action ids allowed on live connections  |
 | `PLAN_TTL_SECONDS`         | `300`   | how long a previewed plan can be confirmed (30 to 3600) |
 | `APPROVAL_TTL_MINUTES`     | `60`    | how long a plan waiting for approval stays valid        |
+| `PLAN_REDACT_HOURS`        | `24`    | settled plans lose their before values and preview      |
+| `PLAN_RETENTION_DAYS`      | `30`    | settled plans without an approval request are deleted   |
 
 With the defaults no write reaches the ERP. To allow writes on a homologation connection set
 `GLOBAL_WRITE_ENABLED=true` and `WRITE_TO_SANKHYA=true`; production writes also need
@@ -86,7 +88,9 @@ curl -X PUT https://app.example.com/api/admin/security \
 ```
 
 It takes effect before the next gateway save, including the remaining rows of a plan already
-running, and is audited as `security.update`. The runtime switch can only turn writes off; while
+running, and is audited as `security.update`. This is the only switch that acts without a restart:
+`WRITE_TO_SANKHYA`, `SAFE_MODE` and the environment half of `GLOBAL_WRITE_ENABLED` change only with
+the environment and a restart. The runtime switch can only turn writes off; while
 `GLOBAL_WRITE_ENABLED` is `false` in the environment, turning it on again changes nothing.
 
 `GET /api/status` (signed in) shows the current state:
@@ -170,6 +174,19 @@ These are known behaviours to keep in mind when reading results and audit record
 
 `LOG_LEVEL` is `info` by default; `debug` and `trace` are refused in production. Secrets are
 redacted from logs.
+
+**`GIT_COMMIT` is mandatory for a release build.** Without it the footer and `GET /api/meta` show
+`dev`, and nobody can tell which commit runs. Always build with
+`GIT_COMMIT=$(git rev-parse --short HEAD)` (see Upgrades) and check `GET /api/meta` after the start.
+
+### Fixed scratch limits
+
+Besides `SCRATCH_MAX_WORKSPACES`, `SCRATCH_MAX_ROWS`, `SCRATCH_MAX_TABLES`, `SCRATCH_TTL_MINUTES`,
+`SCRATCH_STATEMENT_TIMEOUT_MS` and `MATERIALIZE_MAX_ROWS`, a scratch workspace has limits that are
+set in code (`SCRATCH_DEFAULTS` in `apps/api/src/services/scratch.ts`) and cannot be changed by
+environment: 64 MiB of storage per workspace, 16 MiB per result, 1 GiB of WASM memory, 4 queued
+statements per workspace, 200 preview rows per side of a dry run, and 100 000 characters per
+statement. Changing them needs a new build.
 
 ## Accounts
 
