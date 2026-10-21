@@ -73,8 +73,8 @@ export async function readCatalog(
  * Entities and columns of an analyzed read, for the policy request. Attribution fails closed: a
  * column (or star) whose qualifier names no base table or alias (a CTE, a derived table) and an
  * unqualified column are attributed to every base table of the statement. A star is expanded
- * from the catalog; when the catalog has no columns for a table, it stays `*`, which every column
- * DENY on that table hits. `COUNT(*)` is not expanded (it reads no column value); `COUNT(col)` is
+ * from the catalog and also kept as `*`, which every column DENY on that table hits, so a column
+ * the dictionary does not list cannot escape a DENY. `COUNT(*)` is not expanded (it reads no column value); `COUNT(col)` is
  * an ordinary column reference. Callers must have checked every table against the catalog.
  */
 export function readTargets(analysis: ReadAnalysis, catalog: Catalog): ReadTargets {
@@ -112,9 +112,10 @@ export function readTargets(analysis: ReadAnalysis, catalog: Catalog): ReadTarge
     // COUNT(*) counts rows and reads no column value; any other star is expanded.
     if (s.inAggregate) continue;
     for (const t of owners(s.table)) {
-      const cols = catalogColumns.get(t) ?? [];
-      if (cols.length === 0) push(t, '*');
-      else for (const name of cols) push(t, name);
+      // The star itself stays too: the database returns every physical column, including one
+      // the dictionary lacks or that was added after the catalog was cached.
+      push(t, '*');
+      for (const name of catalogColumns.get(t) ?? []) push(t, name);
     }
   }
   return { entities, columns };

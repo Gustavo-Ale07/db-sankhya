@@ -237,6 +237,21 @@ describe('policies on the Sankhya read path', () => {
     expect(reads(h.mock, 'email')).toBe(0);
   });
 
+  it('a column DENY refuses SELECT * even when the dictionary does not list the column', async () => {
+    const h = await setup();
+    // A physical column TDDCAM lacks, or one added after the catalog was cached, still comes back
+    // from SELECT *: the star itself is checked, not only the columns the dictionary knows.
+    await h.policy({ columns: ['TGFPAR.AD_SEGREDO'] });
+    const { cookie } = await h.viewer();
+    for (const sqlText of ['SELECT * FROM TGFPAR', 'SELECT p.* FROM TGFPAR p']) {
+      const res = await query(h, cookie, { sql: sqlText });
+      expect(res.statusCode, sqlText).toBe(403);
+    }
+    const ok = await query(h, cookie, { sql: 'SELECT CODPARC, NOMEPARC FROM TGFPAR' });
+    expect(ok.statusCode, ok.body).toBe(200);
+    expect(reads(h.mock, '* FROM TGFPAR')).toBe(0);
+  });
+
   it('a table DENY refuses COUNT(*) and a CTE over the table', async () => {
     const h = await setup();
     await h.policy({ entities: ['TGFPAR'] });

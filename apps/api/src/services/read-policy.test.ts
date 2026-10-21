@@ -70,8 +70,9 @@ describe('readTargets', () => {
     ]);
   });
 
-  it('expands SELECT * from the catalog', () => {
+  it('expands SELECT * from the catalog and keeps the * for columns the dictionary lacks', () => {
     expect(names('SELECT * FROM TGFPAR')).toEqual([
+      'TGFPAR.*',
       'TGFPAR.CODPARC',
       'TGFPAR.EMAIL',
       'TGFPAR.NOMEPARC',
@@ -80,6 +81,7 @@ describe('readTargets', () => {
 
   it('expands a qualified star through its alias only', () => {
     expect(names('SELECT c.* FROM TGFPAR p JOIN TSICID c ON 1 = 1')).toEqual([
+      'TSICID.*',
       'TSICID.CODCID',
       'TSICID.NOMECID',
     ]);
