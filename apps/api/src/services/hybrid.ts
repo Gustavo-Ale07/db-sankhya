@@ -17,6 +17,8 @@ export const isScratchName = (table: string): boolean => /^tmp_/i.test(table);
 
 /** Sankhya parts a hybrid read may have; more is refused before any gateway call. */
 export const MAX_HYBRID_PARTS = 4;
+/** Subqueries a hybrid read may contain in all (each is parsed to find the parts). */
+export const MAX_HYBRID_SUBQUERIES = 32;
 
 const MATERIALIZE_FIRST =
   'Put each Sankhya part in a WITH or a subquery that reads Sankhya tables only, or materialize ' +
@@ -44,11 +46,17 @@ export interface ScratchRead {
  */
 export function planScratchRead(sql: string, hybrid: boolean): ScratchRead {
   if (!hybrid) return { parts: [], statement: selectOnly(analyzeScratchSql(sql)) };
-  const split = splitHybrid(sql, isScratchName);
-  if (split.parts.length === 0) throw unsupported('no Sankhya part could be separated');
-  if (split.parts.length > MAX_HYBRID_PARTS) {
-    throw unsupported(`more than ${MAX_HYBRID_PARTS} Sankhya parts`);
+  // Bounded before any parse: each candidate subquery costs one.
+  const split = splitHybrid(sql, isScratchName, {
+    maxParts: MAX_HYBRID_PARTS,
+    maxGroups: MAX_HYBRID_SUBQUERIES,
+  });
+  if (split.overflow) {
+    throw unsupported(
+      `more than ${MAX_HYBRID_PARTS} Sankhya parts or ${MAX_HYBRID_SUBQUERIES} subqueries`,
+    );
   }
+  if (split.parts.length === 0) throw unsupported('no Sankhya part could be separated');
   const run = randomBytes(5).toString('hex');
   const parts = split.parts.map((p, i) => ({
     sql: p.sql,

@@ -43,7 +43,10 @@ interface Harness {
   database: DatabaseHandle;
   mock: MockSankhya;
   userWith(permissions: Permission[]): Promise<string>;
-  call(cookie: string, opts: InjectOptions): ReturnType<FastifyInstance['inject']>;
+  call(
+    cookie: string,
+    opts: InjectOptions,
+  ): Promise<Awaited<ReturnType<FastifyInstance['inject']>>>;
   policy(input: Partial<PolicyInput>): Promise<void>;
 }
 

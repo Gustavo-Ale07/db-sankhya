@@ -20,7 +20,7 @@ describe('splitHybrid', () => {
 
   it('takes derived tables and IN subqueries, and nothing that reads a scratch table', () => {
     const sql =
-      'SELECT * FROM tmp_a a JOIN (SELECT CODPARC FROM TGFPAR WHERE ATIVO = \'S\') p ON p.codparc = a.id ' +
+      "SELECT * FROM tmp_a a JOIN (SELECT CODPARC FROM TGFPAR WHERE ATIVO = 'S') p ON p.codparc = a.id " +
       'WHERE a.id IN (SELECT CODCID FROM TSICID WHERE UF = 1) AND a.id IN (SELECT id FROM tmp_b)';
     const split = splitHybrid(sql, scratch);
     expect(split.parts.map((p) => p.tables)).toEqual([['TGFPAR'], ['TSICID']]);
@@ -48,7 +48,21 @@ describe('splitHybrid', () => {
   });
 
   it('ignores parentheses inside strings and quoted names', () => {
-    const sql = "SELECT '(SELECT 1 FROM TGFPAR)' AS x, \"(\" FROM tmp_a";
+    const sql = 'SELECT \'(SELECT 1 FROM TGFPAR)\' AS x, "(" FROM tmp_a';
     expect(splitHybrid(sql, scratch).parts).toEqual([]);
+  });
+
+  it('stops early past maxParts or maxGroups', () => {
+    const sql =
+      'SELECT * FROM tmp_a WHERE id IN (SELECT A FROM T1) AND id IN (SELECT B FROM T2) ' +
+      'AND id IN (SELECT C FROM T3)';
+    expect(splitHybrid(sql, scratch, { maxParts: 2 })).toMatchObject({ parts: [], overflow: true });
+    expect(splitHybrid(sql, scratch, { maxGroups: 2 })).toMatchObject({
+      parts: [],
+      overflow: true,
+    });
+    const ok = splitHybrid(sql, scratch, { maxParts: 3, maxGroups: 3 });
+    expect(ok.overflow).toBe(false);
+    expect(ok.parts).toHaveLength(3);
   });
 });

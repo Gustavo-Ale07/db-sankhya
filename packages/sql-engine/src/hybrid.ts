@@ -22,6 +22,11 @@ export interface HybridPart {
 
 export interface HybridSplit {
   parts: HybridPart[];
+  /**
+   * The statement has more subqueries than `maxGroups`, or more parts than `maxParts`: the split
+   * stopped early (each candidate costs a parse) and `parts` is incomplete. Callers refuse it.
+   */
+  overflow: boolean;
   /** Rewrites the statement with each part replaced by `SELECT * FROM <name>` (same order). */
   rewrite(names: readonly string[]): string;
 }
@@ -31,7 +36,13 @@ export interface HybridSplit {
  * scratch table is not a part, but the subqueries inside it may be. Identical parts (same text)
  * are listed once, so each runs once.
  */
-export function splitHybrid(sql: string, isScratch: (table: string) => boolean): HybridSplit {
+export function splitHybrid(
+  sql: string,
+  isScratch: (table: string) => boolean,
+  limits: { maxParts?: number; maxGroups?: number } = {},
+): HybridSplit {
+  const maxParts = limits.maxParts ?? Infinity;
+  const maxGroups = limits.maxGroups ?? Infinity;
   const tokens = tokenize(sql, { ansi: true }).filter(isSignificant);
   const groups: Array<{ start: number; end: number }> = [];
   const open: number[] = [];
@@ -47,9 +58,11 @@ export function splitHybrid(sql: string, isScratch: (table: string) => boolean):
       }
     }
   });
+  if (groups.length > maxGroups) return { parts: [], overflow: true, rewrite: refuse };
   groups.sort((a, b) => a.start - b.start || b.end - a.end);
 
   const chosen: HybridPart[] = [];
+  const texts = new Set<string>();
   for (const g of groups) {
     if (chosen.some((c) => g.start >= c.start && g.end <= c.end)) continue;
     const text = sql.slice(g.start, g.end);
@@ -57,6 +70,8 @@ export function splitHybrid(sql: string, isScratch: (table: string) => boolean):
     if (classified.kind !== 'SELECT' || classified.tables.length === 0) continue;
     if (classified.tables.some(isScratch)) continue;
     chosen.push({ sql: text.trim(), tables: classified.tables, start: g.start, end: g.end });
+    texts.add(text.trim());
+    if (texts.size > maxParts) return { parts: [], overflow: true, rewrite: refuse };
   }
 
   const unique: HybridPart[] = [];
@@ -69,6 +84,7 @@ export function splitHybrid(sql: string, isScratch: (table: string) => boolean):
 
   return {
     parts: unique,
+    overflow: false,
     rewrite(names) {
       if (names.length !== unique.length) throw new Error('One name per part is needed.');
       let out = '';
@@ -80,4 +96,8 @@ export function splitHybrid(sql: string, isScratch: (table: string) => boolean):
       return out + sql.slice(at);
     },
   };
+}
+
+function refuse(): string {
+  throw new Error('An overflowing split cannot be rewritten.');
 }
