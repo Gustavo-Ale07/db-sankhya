@@ -16,8 +16,12 @@ interface Props {
   resultKey: string;
 }
 
+/** The column type, when the source gave one: the Sankhya gateway does not. */
+const typeLabel = (col: ResultColumn) => (col.type && col.type !== 'unknown' ? col.type : '');
+
 function initialWidth(col: ResultColumn, rows: Value[][], index: number): number {
-  let max = col.name.length + 2;
+  // The header holds the name, the type label and the sort arrow.
+  let max = col.name.length + 3 + Math.ceil(typeLabel(col).length * 0.8);
   for (let i = 0; i < Math.min(rows.length, 50); i++) {
     const len = cellText(rows[i]?.[index]).length;
     if (len > max) max = len;
@@ -172,10 +176,12 @@ export function ResultGrid({ columns, rows, resultKey }: Props) {
                   type="button"
                   className="flex min-w-0 flex-1 items-center gap-1 px-2 py-1 text-left hover:bg-hover"
                   onClick={() => toggleSort(i)}
-                  title={`${c.name} (${c.type}) — ordenar`}
+                  title={`${c.name}${typeLabel(c) ? ` (${typeLabel(c)})` : ''} — ordenar`}
                 >
                   <span className="truncate">{c.name}</span>
-                  <span className="text-[10px] font-normal text-muted">{c.type}</span>
+                  {typeLabel(c) && (
+                    <span className="text-[10px] font-normal text-muted">{typeLabel(c)}</span>
+                  )}
                   {sort?.col === i && <span aria-hidden>{sort.dir === 'asc' ? '▲' : '▼'}</span>}
                 </button>
                 <span
