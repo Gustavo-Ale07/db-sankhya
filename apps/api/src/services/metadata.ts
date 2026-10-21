@@ -54,12 +54,18 @@ export interface MetadataDeps {
   /** Clock in epoch milliseconds; tests inject a fake one. */
   now?: () => number;
   ttlMs?: number;
+  /** How long a degraded catalog is served before it is read again (DEGRADED_TTL_MS). */
+  degradedTtlMs?: number;
 }
 
 /** How long a discovered catalog is served before the dictionary is read again. */
 export const METADATA_TTL_MS = 60 * 60 * 1000;
-/** A degraded catalog is kept in memory only, and only this long. */
-export const DEGRADED_TTL_MS = 60 * 1000;
+/**
+ * A degraded catalog is kept in memory only, and is read again after this long (by default; see
+ * METADATA_DEGRADED_TTL_SECONDS). Until it is as old as a whole one may be, it is still served
+ * while that read runs behind it.
+ */
+export const DEGRADED_TTL_MS = 10 * 60 * 1000;
 /** How long the metadata of one table, read on demand, is served before it is read again. */
 export const TABLE_TTL_MS = 5 * 60 * 1000;
 
@@ -189,10 +195,14 @@ export class MetadataService {
   /** On-demand table metadata, keyed by connection and table (see tableKey). */
   private readonly tables = new Map<string, { table: CatalogTable; at: number }>();
   private readonly tablesInflight = new Map<string, Promise<CatalogTable | undefined>>();
-  /** Bumped when a connection's tables are forgotten: a lookup started earlier is not kept. */
-  private readonly tablesGeneration = new Map<string, number>();
+  /**
+   * Bumped when what is known of a connection is forgotten (invalidate, refresh): a discovery or
+   * lookup started earlier still answers its caller but is not kept.
+   */
+  private readonly generation = new Map<string, number>();
   private readonly now: () => number;
   private readonly ttlMs: number;
+  private readonly degradedTtlMs: number;
 
   constructor(
     private readonly db: Database,
@@ -200,18 +210,37 @@ export class MetadataService {
   ) {
     this.now = deps.now ?? Date.now;
     this.ttlMs = deps.ttlMs ?? METADATA_TTL_MS;
+    this.degradedTtlMs = deps.degradedTtlMs ?? DEGRADED_TTL_MS;
   }
 
   async get(connectionId: string, opts: { refresh?: boolean } = {}): Promise<Catalog> {
-    if (opts.refresh) this.forgetTables(connectionId);
-    else {
-      const cached = await this.cached(connectionId);
+    if (opts.refresh) this.forget(connectionId);
+    // A lookup that began before an invalidation may answer its caller but keeps nothing.
+    const generation = this.generationOf(connectionId);
+    if (!opts.refresh) {
+      const cached = await this.cached(connectionId, generation);
       if (cached) return cached;
+      // A degraded catalog past its short life is still answered at once while it is read again
+      // behind it, until it is as old as a whole catalog may be.
+      const stale = this.memory.get(connectionId);
+      if (stale?.degraded?.length && this.age(stale) < this.ttlMs) {
+        this.discovery(connectionId, generation).catch(() => undefined);
+        return stale;
+      }
     }
-    // Concurrent callers share one discovery; a refresh also joins one already running.
+    return this.discovery(connectionId, generation);
+  }
+
+  /** The discovery of a connection; concurrent callers share one. */
+  private discovery(connectionId: string, generation: number): Promise<Catalog> {
+    // Begun before an invalidation: runs alone, so no later caller joins what will not be kept.
+    if (generation !== this.generationOf(connectionId))
+      return this.discover(connectionId, generation);
     let running = this.inflight.get(connectionId);
     if (!running) {
-      running = this.discover(connectionId).finally(() => this.inflight.delete(connectionId));
+      const started = (running = this.discover(connectionId, generation).finally(() => {
+        if (this.inflight.get(connectionId) === started) this.inflight.delete(connectionId);
+      }));
       this.inflight.set(connectionId, running);
     }
     return running;
@@ -244,32 +273,37 @@ export class MetadataService {
     return running;
   }
 
-  /** Forgets the memory and persisted catalog of a connection (e.g. after its credentials change). */
+  /**
+   * Forgets the memory and persisted catalog of a connection, and its tables (called when the
+   * connection, its secrets or its existence change). A discovery or lookup still running is not
+   * kept, nor joined by later callers.
+   */
   async invalidate(connectionId: string): Promise<void> {
     this.memory.delete(connectionId);
-    this.forgetTables(connectionId);
-    if (!this.persistable(connectionId)) return;
-    try {
-      await this.db.delete(metadataCache).where(eq(metadataCache.connectionId, connectionId));
-    } catch {
-      // The row, if any, is rediscovered once it expires.
-    }
+    this.forget(connectionId);
+    await this.unstore(connectionId);
   }
 
-  private forgetTables(connectionId: string): void {
+  /** Forgets the tables and the running reads of a connection (see `generation`). */
+  private forget(connectionId: string): void {
     const prefix = tableKey(connectionId, '');
     for (const key of this.tables.keys()) if (key.startsWith(prefix)) this.tables.delete(key);
     for (const key of this.tablesInflight.keys()) {
       if (key.startsWith(prefix)) this.tablesInflight.delete(key);
     }
-    this.tablesGeneration.set(connectionId, (this.tablesGeneration.get(connectionId) ?? 0) + 1);
+    this.inflight.delete(connectionId);
+    this.generation.set(connectionId, this.generationOf(connectionId) + 1);
+  }
+
+  private generationOf(connectionId: string): number {
+    return this.generation.get(connectionId) ?? 0;
   }
 
   private async discoverTable(
     connectionId: string,
     name: string,
   ): Promise<CatalogTable | undefined> {
-    const generation = this.tablesGeneration.get(connectionId) ?? 0;
+    const generation = this.generationOf(connectionId);
     const runtime = await this.deps.getRuntime(connectionId);
     const sql = tableSql(name);
     // Every read must be complete: a partial answer would pass for the whole table.
@@ -317,30 +351,34 @@ export class MetadataService {
     };
     // A table without columns is answered but not kept: nothing about it can be confirmed. Nor is
     // one read before the connection was invalidated (its credentials may have changed since).
-    const current = (this.tablesGeneration.get(connectionId) ?? 0) === generation;
-    if (columns.length && current) {
+    if (columns.length && this.generationOf(connectionId) === generation) {
       this.tables.set(tableKey(connectionId, name), { table, at: this.now() });
     }
     return table;
   }
 
-  private fresh(catalog: Catalog): boolean {
+  /** Age of a catalog in milliseconds; a catalog from the future counts as expired. */
+  private age(catalog: Catalog): number {
     const age = this.now() - Date.parse(catalog.fetchedAt);
-    return age >= 0 && age < (catalog.degraded?.length ? DEGRADED_TTL_MS : this.ttlMs);
+    return age >= 0 ? age : Infinity;
   }
 
-  private async cached(connectionId: string): Promise<Catalog | undefined> {
+  private fresh(catalog: Catalog): boolean {
+    return this.age(catalog) < (catalog.degraded?.length ? this.degradedTtlMs : this.ttlMs);
+  }
+
+  private async cached(connectionId: string, generation: number): Promise<Catalog | undefined> {
     const hit = this.memory.get(connectionId);
     if (hit && this.fresh(hit)) return hit;
     const stored = await this.load(connectionId);
-    if (stored && this.fresh(stored)) {
+    if (stored && this.fresh(stored) && this.generationOf(connectionId) === generation) {
       this.memory.set(connectionId, stored);
       return stored;
     }
     return undefined;
   }
 
-  private async discover(connectionId: string): Promise<Catalog> {
+  private async discover(connectionId: string, generation: number): Promise<Catalog> {
     const runtime = await this.deps.getRuntime(connectionId);
     const run = (sql: string) => runtime.client.executeQuery(sql);
 
@@ -415,8 +453,18 @@ export class MetadataService {
       source: 'dictionary',
       ...(degraded.length ? { degraded } : {}),
     };
+    // Read before the connection was invalidated: answered, never kept (its secrets or settings
+    // may have changed since).
+    if (this.generationOf(connectionId) !== generation) return catalog;
     this.memory.set(connectionId, catalog);
-    if (!degraded.length) await this.store(connectionId, catalog);
+    if (!degraded.length) {
+      await this.store(connectionId, catalog);
+      // Invalidated while it was being stored: the row may have landed after the delete.
+      if (this.generationOf(connectionId) !== generation) {
+        if (this.memory.get(connectionId) === catalog) this.memory.delete(connectionId);
+        await this.unstore(connectionId);
+      }
+    }
     return catalog;
   }
 
@@ -436,6 +484,15 @@ export class MetadataService {
       return row && isCatalog(row.payload) ? row.payload : undefined;
     } catch {
       return undefined;
+    }
+  }
+
+  private async unstore(connectionId: string): Promise<void> {
+    if (!this.persistable(connectionId)) return;
+    try {
+      await this.db.delete(metadataCache).where(eq(metadataCache.connectionId, connectionId));
+    } catch {
+      // The row, if any, is rediscovered once it expires.
     }
   }
 

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { eq } from 'drizzle-orm';
 import { connections, createDatabase, metadataCache } from '@dbx/database';
 import type { DatabaseHandle } from '@dbx/database';
@@ -205,7 +205,7 @@ describe('MetadataService', () => {
     expect(failed.degraded).toEqual(['PK:failed']);
   });
 
-  it('keeps a degraded catalog in memory for 60 s only and never persists it', async () => {
+  it('keeps a degraded catalog in memory for DEGRADED_TTL_MS only and never persists it', async () => {
     const { service, conn, mock, database, advance } = await setup();
     mock.inject({ type: 'malformed' }, { sqlIncludes: 'FROM TDDCAM' });
     mock.inject({ type: 'malformed' }, { sqlIncludes: 'FROM TDDCAM' });
@@ -219,10 +219,14 @@ describe('MetadataService', () => {
     expect(await svc.get(conn.id)).toBe(degraded);
     expect(mock.calls.length).toBe(before);
 
-    // After the short expiry the next lookup rediscovers and, now complete, persists.
+    // After the short expiry the catalog is read again and, now complete, persisted.
     advance(1);
-    const healed = await svc.get(conn.id);
-    expect(healed.degraded).toBeUndefined();
+    await svc.get(conn.id);
+    const healed = await vi.waitFor(async () => {
+      const c = await svc.get(conn.id);
+      expect(c.degraded).toBeUndefined();
+      return c;
+    });
     expect(healed.tables.find((t) => t.name === 'TGFPAR')?.columns.length).toBeGreaterThan(0);
     expect(await database.db.select().from(metadataCache)).toHaveLength(1);
   });
@@ -237,6 +241,75 @@ describe('MetadataService', () => {
     expect(catalog.tables).toHaveLength(rows[0]!.n);
     expect(catalog.degraded).toEqual(['TDDCAM:truncated', 'TDDINS:truncated', 'PK:truncated']);
     expect(await database.db.select().from(metadataCache)).toHaveLength(0);
+  });
+
+  it('never keeps a discovery that was still running when the connection was invalidated', async () => {
+    const { service, conn, mock, database } = await setup();
+    const svc = service();
+    const stale = svc.get(conn.id);
+    await svc.invalidate(conn.id);
+    // A caller arriving after the invalidation never joins the discovery started before it.
+    const fresh = svc.get(conn.id);
+    expect(fresh).not.toBe(stale);
+    await Promise.all([stale, fresh]);
+
+    // Only the discovery started after the invalidation was kept.
+    await svc.invalidate(conn.id);
+    const running = svc.get(conn.id);
+    await svc.invalidate(conn.id);
+    await running;
+    expect(await database.db.select().from(metadataCache)).toHaveLength(0);
+    const before = queries(mock);
+    await svc.get(conn.id);
+    expect(queries(mock)).toBeGreaterThan(before);
+  });
+
+  it('serves an expired degraded catalog while one discovery reads it again behind it', async () => {
+    const { service, conn, mock, database, advance } = await setup();
+    mock.inject({ type: 'malformed' }, { sqlIncludes: 'FROM TDDCAM' });
+    mock.inject({ type: 'malformed' }, { sqlIncludes: 'FROM TDDCAM' });
+    const svc = service();
+    const degraded = await svc.get(conn.id);
+    expect(degraded.degraded).toEqual(['TDDCAM:failed']);
+
+    advance(DEGRADED_TTL_MS);
+    // Answered at once with what is known, while a single discovery reads it again.
+    const [a, b] = await Promise.all([svc.get(conn.id), svc.get(conn.id)]);
+    expect(a).toBe(degraded);
+    expect(b).toBe(degraded);
+    await vi.waitFor(async () => expect((await svc.get(conn.id)).degraded).toBeUndefined());
+    expect(await database.db.select().from(metadataCache)).toHaveLength(1);
+  });
+
+  it('reads a degraded catalog older than the full TTL again before answering', async () => {
+    const { service, conn, mock, advance } = await setup();
+    mock.inject({ type: 'malformed' }, { sqlIncludes: 'FROM TDDCAM' });
+    mock.inject({ type: 'malformed' }, { sqlIncludes: 'FROM TDDCAM' });
+    const svc = service();
+    expect((await svc.get(conn.id)).degraded).toEqual(['TDDCAM:failed']);
+    advance(METADATA_TTL_MS);
+    expect((await svc.get(conn.id)).degraded).toBeUndefined();
+  });
+
+  it('keeps a degraded catalog for the configured time, 10 minutes by default', async () => {
+    expect(DEGRADED_TTL_MS).toBe(10 * 60 * 1000);
+    const { conn, conns, database, mock } = await setup();
+    let clock = Date.UTC(2026, 0, 1);
+    const svc = new MetadataService(database.db, {
+      getRuntime: (id) => conns.getRuntime(id),
+      now: () => clock,
+      degradedTtlMs: 1000,
+    });
+    mock.inject({ type: 'malformed' }, { sqlIncludes: 'FROM TDDCAM' });
+    mock.inject({ type: 'malformed' }, { sqlIncludes: 'FROM TDDCAM' });
+    const degraded = await svc.get(conn.id);
+    clock += 999;
+    const before = queries(mock);
+    expect(await svc.get(conn.id)).toBe(degraded);
+    expect(queries(mock)).toBe(before);
+    clock += 1;
+    await svc.get(conn.id);
+    await vi.waitFor(() => expect(queries(mock)).toBeGreaterThan(before));
   });
 
   it('invalidate drops the memory and persisted catalog, forcing rediscovery', async () => {

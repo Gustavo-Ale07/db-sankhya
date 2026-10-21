@@ -167,6 +167,8 @@ const envSchema = z.object({
   SCRATCH_TTL_MINUTES: int(60, 1, 7 * 24 * 60),
   SCRATCH_STATEMENT_TIMEOUT_MS: int(10_000, 100, 600_000),
   MATERIALIZE_MAX_ROWS: int(5000, 1, 1_000_000),
+  /** How long an incomplete (degraded) catalog is served before it is read again. */
+  METADATA_DEGRADED_TTL_SECONDS: int(600, 10, 3600),
   CUSTOM_TABLE_PREFIXES: csv('AD_'),
   BOOTSTRAP_TOKEN_TTL_MINUTES: int(30, 1, 24 * 60),
 
@@ -234,6 +236,8 @@ export interface AppConfig {
     statementTimeoutMs: number;
   };
   materializeMaxRows: number;
+  /** METADATA_DEGRADED_TTL_SECONDS: how long an incomplete catalog is served before a new read. */
+  metadataDegradedTtlSeconds: number;
   customTablePrefixes: string[];
   bootstrapTokenTtlMinutes: number;
   trustProxy: boolean | string;
@@ -429,6 +433,7 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
       statementTimeoutMs: e.SCRATCH_STATEMENT_TIMEOUT_MS,
     },
     materializeMaxRows: e.MATERIALIZE_MAX_ROWS,
+    metadataDegradedTtlSeconds: e.METADATA_DEGRADED_TTL_SECONDS,
     customTablePrefixes: e.CUSTOM_TABLE_PREFIXES.map((p) => p.toUpperCase()),
     bootstrapTokenTtlMinutes: e.BOOTSTRAP_TOKEN_TTL_MINUTES,
     trustProxy: trust,

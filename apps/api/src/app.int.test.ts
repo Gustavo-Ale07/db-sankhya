@@ -603,6 +603,54 @@ describe('queries (Sankhya read path)', () => {
     expect(codeOf(bad)).toBe('VALIDATION_ERROR');
   });
 
+  it('forgets the catalog of a connection whose secrets or settings change', async () => {
+    const h = await setup();
+    const { connections, metadata } = h.app.services;
+    const conn = await connections.create({
+      name: 'Demo',
+      environment: 'SANDBOX',
+      mode: 'mock',
+      baseUrl: 'mock://local',
+      dialect: 'oracle',
+      secrets: MOCK_CREDENTIALS,
+    });
+    const first = await metadata.get(conn.id);
+    expect(await metadata.get(conn.id)).toBe(first);
+    await connections.rotateSecrets(conn.id, { xToken: MOCK_CREDENTIALS.xToken });
+    expect(await metadata.get(conn.id)).not.toBe(first);
+    const second = await metadata.get(conn.id);
+    await connections.update(conn.id, { environment: 'HOMOLOGATION' });
+    expect(await metadata.get(conn.id)).not.toBe(second);
+  });
+
+  it('reads the catalog again on POST /api/schema/refresh, behind QUERY.SELECT, audited', async () => {
+    const h = await setup();
+    const cookie = await h.createUser('VIEWER');
+    const url = '/api/schema/refresh?connectionId=env-default';
+    const first = await h.call(cookie, {
+      method: 'GET',
+      url: '/api/schema?connectionId=env-default',
+    });
+    const res = await h.call(cookie, { method: 'POST', url });
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json().catalog.fetchedAt).not.toBe(first.json().catalog.fetchedAt);
+    expect(res.json().catalog.tables.map((t: { name: string }) => t.name)).toContain('TGFPAR');
+
+    const nobody = await h.createUser([]);
+    expect((await h.call(nobody, { method: 'POST', url })).statusCode).toBe(403);
+
+    const admin = await h.login();
+    const audit = await h.call(admin, { method: 'GET', url: '/api/audit?action=schema.refresh' });
+    expect(audit.json().total).toBe(1);
+    expect(audit.json().items[0]).toMatchObject({ status: 'success', operation: 'SCHEMA' });
+
+    // Every refresh reads the whole dictionary: a few a minute at most.
+    let limited = 0;
+    for (let i = 0; i < 10; i++)
+      if ((await h.call(cookie, { method: 'POST', url })).statusCode === 429) limited++;
+    expect(limited).toBeGreaterThan(0);
+  });
+
   it('serves the catalog of a connection at /api/schema, behind QUERY.SELECT', async () => {
     const h = await setup();
     const cookie = await h.createUser('VIEWER');

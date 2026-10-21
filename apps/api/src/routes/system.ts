@@ -112,6 +112,7 @@ export async function systemRoutes(app: FastifyInstance): Promise<void> {
       throw err;
     }
     return {
+      auth,
       connectionId,
       // Only the tables and columns this user may read are listed (names are disclosure too).
       visible: (catalog: Catalog) =>
@@ -129,6 +130,48 @@ export async function systemRoutes(app: FastifyInstance): Promise<void> {
     noStore(reply);
     return redact({ connectionId, catalog });
   });
+
+  /**
+   * Reads the whole catalog again now (e.g. after it came back incomplete). Each refresh reads the
+   * whole dictionary from the gateway, so it is rate limited, and audited.
+   */
+  app.post(
+    '/api/schema/refresh',
+    { config: { rateLimit: { max: 6, timeWindow: '1 minute' } } },
+    async (request, reply) => {
+      const { auth, connectionId, visible } = await schemaAccess(request);
+      const entry = {
+        userId: auth.user.id,
+        userEmail: auth.user.email,
+        ip: clientIp(request),
+        requestId: request.id,
+        action: 'schema.refresh',
+        operation: 'SCHEMA',
+        resource: null,
+      } as const;
+      let catalog: Catalog;
+      try {
+        catalog = await metadata.get(connectionId, { refresh: true });
+      } catch (err) {
+        const e = err instanceof AppError ? err : undefined;
+        await audit.record({
+          ...entry,
+          status: 'failed',
+          errorCode: e?.code ?? 'INTERNAL_ERROR',
+          errorMessage: e?.message ?? 'Catalog refresh failed',
+          details: { connectionId },
+        });
+        throw err;
+      }
+      await audit.record({
+        ...entry,
+        status: 'success',
+        details: { connectionId, degraded: catalog.degraded ?? [] },
+      });
+      noStore(reply);
+      return redact({ connectionId, catalog: await visible(catalog) });
+    },
+  );
 
   /**
    * One table with every column, read on its own from the dictionary: the whole catalog may have

@@ -123,6 +123,7 @@ export class ConnectionsService {
   private readonly runtimes = new Map<string, Promise<SankhyaRuntime>>();
   private readonly resolve: (host: string) => Promise<string[]>;
   private mock?: Promise<MockGateway & { close(): Promise<void> }>;
+  private readonly listeners: Array<(id: string) => unknown> = [];
 
   constructor(
     private readonly db: Database,
@@ -130,6 +131,24 @@ export class ConnectionsService {
     private readonly deps: ConnectionsDeps = {},
   ) {
     this.resolve = deps.resolve ?? resolveAll;
+  }
+
+  /**
+   * Calls `listener` after a connection is changed, has its secrets replaced or is deleted, so
+   * what is cached of it elsewhere (its catalog) is dropped.
+   */
+  onChange(listener: (id: string) => unknown): void {
+    this.listeners.push(listener);
+  }
+
+  private async changed(id: string): Promise<void> {
+    for (const listener of this.listeners) {
+      try {
+        await listener(id);
+      } catch {
+        // A listener only drops caches; the change itself already happened.
+      }
+    }
   }
 
   async list(): Promise<ConnectionPublic[]> {
@@ -208,6 +227,7 @@ export class ConnectionsService {
       throw err;
     } finally {
       this.dropRuntime(id);
+      await this.changed(id);
     }
   }
 
@@ -229,6 +249,7 @@ export class ConnectionsService {
       return this.toPublic(row);
     } finally {
       this.dropRuntime(id);
+      await this.changed(id);
     }
   }
 
@@ -240,6 +261,7 @@ export class ConnectionsService {
       .returning({ id: connections.id });
     this.dropRuntime(id);
     if (deleted.length === 0) throw notFound();
+    await this.changed(id);
   }
 
   /** Authenticates and runs the probe query. Failures are reported, never thrown. */

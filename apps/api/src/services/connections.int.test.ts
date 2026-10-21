@@ -163,6 +163,20 @@ describe('ConnectionsService', () => {
     expect(await codeOf(service.rotateSecrets(id, {}))).toBe('VALIDATION_ERROR');
   });
 
+  it('tells its listeners when a connection changes or goes, so what is cached of it is dropped', async () => {
+    const { service } = await setup();
+    const changed: string[] = [];
+    service.onChange((id) => {
+      changed.push(id);
+    });
+    const { id } = await service.create(MOCK_INPUT);
+    expect(changed).toEqual([]);
+    await service.update(id, { environment: 'HOMOLOGATION' });
+    await service.rotateSecrets(id, { clientSecret: 'replaced-secret-fixture-value' });
+    await service.delete(id);
+    expect(changed).toEqual([id, id, id]);
+  });
+
   it('rejects non-allowlisted base URLs', async () => {
     const { service } = await setup({}, { resolve: () => Promise.reject(new Error('no DNS')) });
     const live = { ...MOCK_INPUT, mode: 'live' as const };

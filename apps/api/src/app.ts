@@ -82,7 +82,10 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     history: new HistoryService(database.db),
     saved: new SavedQueriesService(database.db),
     connections,
-    metadata: new MetadataService(database.db, { getRuntime: (id) => connections.getRuntime(id) }),
+    metadata: new MetadataService(database.db, {
+      getRuntime: (id) => connections.getRuntime(id),
+      degradedTtlMs: config.metadataDegradedTtlSeconds * 1000,
+    }),
     policies: new PolicyService(database.db, app.log),
     security: new SecuritySettingsService(database.db, config, app.log),
     scratch: new ScratchManager({ ...config.scratch }),
@@ -90,6 +93,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     executions: new ExecutionRegistry(),
     startedAt: new Date(),
   };
+  // A connection that changed or went keeps no catalog read with its old settings or secrets.
+  connections.onChange((id) => services.metadata.invalidate(id));
   app.decorate('services', services);
   app.decorateRequest('auth', null);
 
