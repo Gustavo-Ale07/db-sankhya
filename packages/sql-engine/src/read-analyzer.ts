@@ -309,7 +309,10 @@ class Walker {
         if (!isNode(col)) throw unsupported('Unrecognised select item.');
         this.expr(col.expr);
       }
-    } else if (node.columns !== '*') {
+    } else if (node.columns === '*') {
+      // Not produced by the parser today; recorded as a star so it can never read unchecked.
+      this.star.push({});
+    } else {
       throw unsupported('Unrecognised select list.');
     }
     if (Array.isArray(node.from)) for (const f of node.from) this.from(f);
