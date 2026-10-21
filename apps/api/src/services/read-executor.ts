@@ -1,7 +1,7 @@
 import { AppError, isAppError } from '@dbx/shared';
 import { analyzeRead, tokenGate } from '@dbx/sql-engine';
 import type { ReadAnalysis } from '@dbx/sql-engine';
-import type { Catalog } from './metadata';
+import type { Catalog, CatalogTable } from './metadata';
 import type { SankhyaRuntime } from './sankhya-runtime';
 
 /**
@@ -21,8 +21,16 @@ export interface ReadInput {
   /** Rows returned at most; one more is fetched to know whether the result was cut. */
   maxRows: number;
   signal: AbortSignal;
-  /** Authorizes the analyzed read. A rejection propagates and nothing is sent. */
-  decide: (analysis: ReadAnalysis) => PolicyDecision | Promise<PolicyDecision>;
+  /**
+   * Authorizes the analyzed read against `catalog`, which also holds the tables `findTable`
+   * found. A rejection propagates and nothing is sent.
+   */
+  decide: (analysis: ReadAnalysis, catalog: Catalog) => PolicyDecision | Promise<PolicyDecision>;
+  /**
+   * Reads one table on its own, for a table missing from a degraded table list (TDDTAB cut or
+   * failed). `undefined` when it does not exist or the user may not see it (one answer for both).
+   */
+  findTable?: (name: string) => Promise<CatalogTable | undefined>;
 }
 
 export interface ReadOutput {
@@ -55,9 +63,10 @@ export async function executeRead(input: ReadInput): Promise<ReadOutput> {
   if (!gate.ok) throw new AppError('SQL_FORBIDDEN', `Statement refused: ${gate.reason}`);
 
   const analysis = analyzeRead(sql, { dialect: runtime.dialect });
-  assertTablesKnown(analysis, catalog);
+  const known = await assertTablesKnown(analysis, catalog, input.findTable);
+  throwIfAborted(signal);
 
-  const decision = await decide(analysis);
+  const decision = await decide(analysis, known);
   throwIfAborted(signal);
   if (decision.effect !== 'ALLOW')
     throw new AppError('FORBIDDEN', decision.reason ?? 'The read was denied by policy');
@@ -95,12 +104,32 @@ function effectiveMaxRows(ceiling: number, policy: number | undefined): number {
   return Math.min(ceiling, policy);
 }
 
-function assertTablesKnown(analysis: ReadAnalysis, catalog: Catalog): void {
+/**
+ * Every table of the read must be in the catalog, which is returned with the tables found on
+ * their own. A degraded table list may simply not have seen a table yet, so each one missing from
+ * it is looked up (`findTable`) before the read is refused; one not found either is still refused.
+ */
+async function assertTablesKnown(
+  analysis: ReadAnalysis,
+  catalog: Catalog,
+  findTable: ReadInput['findTable'],
+): Promise<Catalog> {
   const known = new Set(catalog.tables.map((t) => t.name.toUpperCase()));
-  const missing = analysis.tables.find((t) => !known.has(t.name.toUpperCase()));
-  if (!missing) return;
-  // A degraded table list may simply not have seen the table yet; still fail closed.
+  const absent = () => analysis.tables.find((t) => !known.has(t.name.toUpperCase()));
+  if (!absent()) return catalog;
   const incomplete = (catalog.degraded ?? []).some((d) => d.split(':')[0] === 'TDDTAB');
+  const found: CatalogTable[] = [];
+  if (incomplete && findTable) {
+    for (const name of new Set(analysis.tables.map((t) => t.name.toUpperCase()))) {
+      if (known.has(name)) continue;
+      const table = await findTable(name);
+      if (table?.name.toUpperCase() !== name) break;
+      found.push(table);
+      known.add(name);
+    }
+  }
+  const missing = absent();
+  if (!missing) return { ...catalog, tables: [...catalog.tables, ...found] };
   throw new AppError(
     'RESOURCE_NOT_FOUND',
     incomplete

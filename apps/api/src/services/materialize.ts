@@ -6,10 +6,9 @@
  * checked before COMMIT). Nothing here bypasses either path.
  */
 import { AppError, isAppError } from '@dbx/shared';
-import type { ReadAnalysis } from '@dbx/sql-engine';
 import type { Catalog } from './metadata';
 import { executeRead } from './read-executor';
-import type { PolicyDecision } from './read-executor';
+import type { ReadInput } from './read-executor';
 import type { SankhyaRuntime } from './sankhya-runtime';
 import type { ScratchColumnType, ScratchWorkspace } from './scratch';
 import { assertScratchTableName } from './scratch-guard';
@@ -27,7 +26,9 @@ export interface MaterializeInput {
   /** Rows copied at most (MATERIALIZE_MAX_ROWS); more rows are cut and reported as truncated. */
   maxRows: number;
   /** The read's authorization (see executeRead); its `maxRows` can only lower `maxRows`. */
-  decide: (analysis: ReadAnalysis) => PolicyDecision | Promise<PolicyDecision>;
+  decide: ReadInput['decide'];
+  /** See executeRead. */
+  findTable?: ReadInput['findTable'];
   catalog: Catalog;
   signal: AbortSignal;
 }
@@ -41,14 +42,14 @@ export interface MaterializeOutput {
 const MAX_COLUMN_NAME = 63;
 
 export async function materialize(input: MaterializeInput): Promise<MaterializeOutput> {
-  const { runtime, workspace, sql, into, maxRows, decide, catalog, signal } = input;
+  const { runtime, workspace, sql, into, maxRows, decide, findTable, catalog, signal } = input;
   // Validate the target first: a bad name must not cost a gateway call.
   assertScratchTableName(into);
   if (!Number.isSafeInteger(maxRows) || maxRows < 1) {
     throw new AppError('INTERNAL_ERROR', 'maxRows must be a positive integer');
   }
 
-  const read = await executeRead({ runtime, catalog, sql, maxRows, signal, decide });
+  const read = await executeRead({ runtime, catalog, sql, maxRows, signal, decide, findTable });
   throwIfAborted(signal);
 
   const names = columnNames(read.columns);

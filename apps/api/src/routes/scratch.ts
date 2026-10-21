@@ -29,6 +29,7 @@ import {
   authorizeConnection,
   connectionDenied,
   evaluateFor,
+  findVisibleTable,
   readCatalog,
   readTargets,
 } from '../services/read-policy';
@@ -293,39 +294,37 @@ export async function scratchRoutes(app: FastifyInstance): Promise<void> {
       }
 
       let source: PolicyDecision | undefined;
-      const decideWith =
-        (catalog: Catalog) =>
-        async (a: ReadAnalysis): Promise<ReadDecision> => {
-          const targets = readTargets(
-            a,
-            await readCatalog(catalog, a, (name) => metadata.table(connectionId, name)),
-          );
-          const check = {
-            policies,
-            auth,
-            groupIds,
-            environment: access.environment,
-            connectionId,
-            entities: targets.entities,
-            columns: targets.columns,
-            defaults,
-          };
-          const read = await evaluateFor({ ...check, action: 'QUERY.SELECT' });
-          source = read;
-          if (read.effect !== 'ALLOW')
-            return { effect: 'DENY', reason: 'The read was denied by policy' };
-          const copy = await evaluateFor({ ...check, action: 'TEMP.MATERIALIZE' });
-          source = copy;
-          if (copy.effect !== 'ALLOW') return { effect: 'DENY', reason: DENIED };
-          return {
-            effect: 'ALLOW',
-            maxRows: Math.min(
-              target.limits.maxReadRows,
-              read.limits.maxReadRows,
-              copy.limits.maxReadRows,
-            ),
-          };
+      const decideWith = async (a: ReadAnalysis, catalog: Catalog): Promise<ReadDecision> => {
+        const targets = readTargets(
+          a,
+          await readCatalog(catalog, a, (name) => metadata.table(connectionId, name)),
+        );
+        const check = {
+          policies,
+          auth,
+          groupIds,
+          environment: access.environment,
+          connectionId,
+          entities: targets.entities,
+          columns: targets.columns,
+          defaults,
         };
+        const read = await evaluateFor({ ...check, action: 'QUERY.SELECT' });
+        source = read;
+        if (read.effect !== 'ALLOW')
+          return { effect: 'DENY', reason: 'The read was denied by policy' };
+        const copy = await evaluateFor({ ...check, action: 'TEMP.MATERIALIZE' });
+        source = copy;
+        if (copy.effect !== 'ALLOW') return { effect: 'DENY', reason: DENIED };
+        return {
+          effect: 'ALLOW',
+          maxRows: Math.min(
+            target.limits.maxReadRows,
+            read.limits.maxReadRows,
+            copy.limits.maxReadRows,
+          ),
+        };
+      };
 
       const { signal, release } = abortOnClose(reply);
       try {
@@ -337,7 +336,13 @@ export async function scratchRoutes(app: FastifyInstance): Promise<void> {
           sql: body.sql,
           into: body.into,
           maxRows: config.materializeMaxRows,
-          decide: decideWith(catalog),
+          decide: decideWith,
+          findTable: (name) =>
+            findVisibleTable(
+              { policies, auth, groupIds, environment: access.environment, connectionId },
+              name,
+              (n) => metadata.table(connectionId, n),
+            ),
           catalog,
           signal,
         });

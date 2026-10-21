@@ -166,6 +166,39 @@ describe('executeRead', () => {
     expect(executeQuery).not.toHaveBeenCalled();
   });
 
+  it('looks a table up on its own when the table list is degraded, before refusing it', async () => {
+    const { runtime, executeQuery } = fakeRuntime('oracle');
+    const catalog: Catalog = { ...CATALOG, degraded: ['TDDTAB:truncated'] };
+    const tgfxyz = {
+      name: 'TGFXYZ',
+      columns: [{ name: 'X', type: 'I', pk: false }],
+      foreignKeys: [],
+    };
+    const findTable = vi.fn(async (name: string) => (name === 'TGFXYZ' ? tgfxyz : undefined));
+    const decide = vi.fn((_a: ReadAnalysis, _c: Catalog): PolicyDecision => ({ effect: 'ALLOW' }));
+    await executeRead(base(runtime, 'SELECT X FROM tgfxyz', { catalog, findTable, decide }));
+    expect(findTable).toHaveBeenCalledWith('TGFXYZ');
+    // The policy sees the table that was found, with its columns.
+    expect(decide.mock.calls[0]![1].tables).toContainEqual(tgfxyz);
+    expect(executeQuery).toHaveBeenCalledTimes(1);
+
+    // Not found on its own either: refused as before, saying the catalog is incomplete.
+    const e = await errorOf(
+      executeRead(base(runtime, 'SELECT Y FROM TGFNOPE', { catalog, findTable, decide })),
+    );
+    expect(e.code).toBe('RESOURCE_NOT_FOUND');
+    expect(e.message).toMatch(/incomplete/i);
+    expect(executeQuery).toHaveBeenCalledTimes(1);
+  });
+
+  it('never looks a missing table up when the table list is whole', async () => {
+    const { runtime } = fakeRuntime('oracle');
+    const findTable = vi.fn(async () => undefined);
+    const e = await errorOf(executeRead(base(runtime, 'SELECT X FROM TGFXYZ', { findTable })));
+    expect(e.code).toBe('RESOURCE_NOT_FOUND');
+    expect(findTable).not.toHaveBeenCalled();
+  });
+
   it('asks decide with the analysis and maps DENY to FORBIDDEN', async () => {
     const { runtime, executeQuery } = fakeRuntime('oracle');
     const decide = vi.fn((_a: ReadAnalysis): PolicyDecision => ({

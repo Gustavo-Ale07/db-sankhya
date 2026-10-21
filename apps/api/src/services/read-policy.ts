@@ -70,6 +70,30 @@ export async function readCatalog(
 }
 
 /**
+ * A table missing from a degraded table list, read on its own (`lookup`, the dictionary) only
+ * when the user may see it: a hidden table gets the same answer as one that does not exist, and
+ * neither the cost nor the failure of that read can tell them apart. Fails closed: a failed
+ * policy filter or lookup finds nothing.
+ */
+export async function findVisibleTable(
+  check: Parameters<typeof visibleCatalog>[0],
+  name: string,
+  lookup: (name: string) => Promise<CatalogTable | undefined>,
+): Promise<CatalogTable | undefined> {
+  const probe: Catalog = {
+    tables: [{ name: name.toUpperCase(), columns: [], foreignKeys: [] }],
+    fetchedAt: new Date().toISOString(),
+    source: 'dictionary',
+  };
+  if (!(await visibleCatalog(check, probe)).tables.length) return undefined;
+  try {
+    return await lookup(name);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Entities and columns of an analyzed read, for the policy request. Attribution fails closed: a
  * column (or star) whose qualifier names no base table or alias (a CTE, a derived table) and an
  * unqualified column are attributed to every base table of the statement. A star is expanded

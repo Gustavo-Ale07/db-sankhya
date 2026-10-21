@@ -1,11 +1,17 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { analyzeRead } from '@dbx/sql-engine';
 import { compileDenyChecker, evaluatePolicy } from '@dbx/shared';
 import type { DenyChecker, Environment, Permission, PolicyRule } from '@dbx/shared';
 import type { AuthState } from '../context';
 import type { Catalog, CatalogTable } from './metadata';
 import type { PolicyService } from './policy';
-import { POLICY_FILTER_FAILED, memoizedCatalogs, readTargets, visibleCatalog } from './read-policy';
+import {
+  POLICY_FILTER_FAILED,
+  findVisibleTable,
+  memoizedCatalogs,
+  readTargets,
+  visibleCatalog,
+} from './read-policy';
 
 const table = (name: string, columns: string[]) => ({
   name,
@@ -336,6 +342,40 @@ describe('visibleCatalog', () => {
     expect(tablesHidden).toBeGreaterThan(30);
     expect(columnsHidden).toBeGreaterThan(30);
     expect(tablesHidden + columnsHidden).toBeLessThan(sets.length - 30);
+  });
+
+  describe('findVisibleTable', () => {
+    const DENY_TABLE: PolicyRule = { ...DENY_EMAIL, id: 'r2', entities: ['TGFXYZ'], columns: [] };
+    const found = table('TGFXYZ', ['X']);
+
+    it('reads a table the user may see from the dictionary', async () => {
+      const lookup = vi.fn(async () => found);
+      const check = { policies: fake([DENY_EMAIL]).policies, auth, ...CONTEXT };
+      expect(await findVisibleTable(check, 'TGFXYZ', lookup)).toBe(found);
+      expect(lookup).toHaveBeenCalledWith('TGFXYZ');
+    });
+
+    it('answers a hidden table as a missing one, without reading the dictionary', async () => {
+      const lookup = vi.fn(async () => found);
+      const check = { policies: fake([DENY_TABLE]).policies, auth, ...CONTEXT };
+      expect(await findVisibleTable(check, 'TGFXYZ', lookup)).toBeUndefined();
+      expect(lookup).not.toHaveBeenCalled();
+    });
+
+    it('fails closed: a failed lookup or policy filter finds nothing', async () => {
+      const check = { policies: fake([]).policies, auth, ...CONTEXT };
+      const failing = vi.fn(async () => {
+        throw new Error('gateway down');
+      });
+      expect(await findVisibleTable(check, 'TGFXYZ', failing)).toBeUndefined();
+      const broken = {
+        ...check,
+        policies: { denyChecker: () => Promise.resolve(null) } as unknown as PolicyService,
+      };
+      const lookup = vi.fn(async () => found);
+      expect(await findVisibleTable(broken, 'TGFXYZ', lookup)).toBeUndefined();
+      expect(lookup).not.toHaveBeenCalled();
+    });
   });
 
   describe('on 5,000 tables of 31 columns', () => {

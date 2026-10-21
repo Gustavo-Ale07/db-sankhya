@@ -16,6 +16,7 @@ import {
   authorizeConnection,
   connectionDenied,
   evaluateFor,
+  findVisibleTable,
   readCatalog,
   readTargets,
 } from '../services/read-policy';
@@ -293,31 +294,29 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
     let analysis: ReadAnalysis | undefined;
     let policy: PolicyDecision | undefined;
     let allowed = false;
-    const decideWith =
-      (catalog: Catalog) =>
-      async (a: ReadAnalysis): Promise<ReadDecision> => {
-        analysis = a;
-        const targets = readTargets(
-          a,
-          await readCatalog(catalog, a, (name) => metadata.table(connectionId, name)),
-        );
-        policy = await evaluateFor({
-          policies,
-          auth,
-          groupIds,
-          action: 'QUERY.SELECT',
-          environment: access.environment,
-          connectionId,
-          entities: targets.entities,
-          columns: targets.columns,
-          defaults,
-        });
-        allowed = policy.effect === 'ALLOW';
-        // The rule internals stay in the audit log; the user gets a generic denial.
-        return allowed
-          ? { effect: 'ALLOW', maxRows: policy.limits.maxReadRows }
-          : { effect: 'DENY', reason: 'The read was denied by policy' };
-      };
+    const decideWith = async (a: ReadAnalysis, catalog: Catalog): Promise<ReadDecision> => {
+      analysis = a;
+      const targets = readTargets(
+        a,
+        await readCatalog(catalog, a, (name) => metadata.table(connectionId, name)),
+      );
+      policy = await evaluateFor({
+        policies,
+        auth,
+        groupIds,
+        action: 'QUERY.SELECT',
+        environment: access.environment,
+        connectionId,
+        entities: targets.entities,
+        columns: targets.columns,
+        defaults,
+      });
+      allowed = policy.effect === 'ALLOW';
+      // The rule internals stay in the audit log; the user gets a generic denial.
+      return allowed
+        ? { effect: 'ALLOW', maxRows: policy.limits.maxReadRows }
+        : { effect: 'DENY', reason: 'The read was denied by policy' };
+    };
     const resourceOf = () => analysis?.tables[0]?.name ?? null;
 
     const controller = executions.start(executionId, auth.user.id);
@@ -335,7 +334,13 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
         sql,
         maxRows: config.sankhya.maxRows,
         signal: controller.signal,
-        decide: decideWith(catalog),
+        decide: decideWith,
+        findTable: (name) =>
+          findVisibleTable(
+            { policies, auth, groupIds, environment: access.environment, connectionId },
+            name,
+            (n) => metadata.table(connectionId, n),
+          ),
       });
       await safeHistory(request, {
         userId: auth.user.id,

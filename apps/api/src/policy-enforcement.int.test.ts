@@ -1,5 +1,5 @@
 import { Writable } from 'node:stream';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { sql } from 'drizzle-orm';
 import type { FastifyInstance, InjectOptions } from 'fastify';
 import { createDatabase } from '@dbx/database';
@@ -325,6 +325,50 @@ describe('policies on the Sankhya read path', () => {
     const { cookie } = await h.viewer();
     const res = await query(h, cookie, { sql: 'SELECT CODPARC FROM TGFPAR' });
     expect(res.json()).toMatchObject({ rowCount: 4, truncated: true });
+  });
+});
+
+describe('a table list the gateway cut (TDDTAB degraded)', () => {
+  /** The real catalog without TSICID, as if the table list had been cut before it. */
+  const cut = async (h: Harness) => {
+    const whole = await h.app.services.metadata.get('env-default');
+    const catalog = {
+      ...whole,
+      tables: whole.tables.filter((t) => t.name !== 'TSICID'),
+      degraded: ['TDDTAB:truncated'],
+    };
+    vi.spyOn(h.app.services.metadata, 'get').mockResolvedValue(catalog);
+  };
+
+  it('reads a table the list lost from the dictionary on its own, under the same policy', async () => {
+    const h = await setup();
+    await cut(h);
+    await h.policy({ columns: ['TSICID.NOMECID'] });
+    const { cookie } = await h.viewer();
+    const ok = await query(h, cookie, { sql: 'SELECT CODCID FROM TSICID' });
+    expect(ok.statusCode, ok.body).toBe(200);
+    expect(ok.json().rowCount).toBeGreaterThan(0);
+    // The table found on its own carries its columns into the policy: a denied one is refused.
+    const denied = await query(h, cookie, { sql: 'SELECT NOMECID FROM TSICID' });
+    expect(denied.statusCode, denied.body).toBe(403);
+  });
+
+  it('answers a hidden table it lost exactly as one that does not exist, without reading it', async () => {
+    const h = await setup();
+    await cut(h);
+    await h.policy({ entities: ['TSICID'] });
+    const { cookie } = await h.viewer();
+    const before = reads(h.mock, "NOMETAB = 'TSICID'");
+    const hidden = await query(h, cookie, { sql: 'SELECT CODCID FROM TSICID' });
+    const missing = await query(h, cookie, { sql: 'SELECT CODCID FROM TSIXYZ' });
+    expect(hidden.statusCode).toBe(missing.statusCode);
+    // The same body but for the table name and the request id.
+    const same = (body: string) =>
+      body.replace(/TSICID|TSIXYZ/g, 'T').replace(/"requestId":"[^"]*"/, '');
+    expect(same(hidden.body)).toBe(same(missing.body));
+    expect(errorOf(hidden).code).toBe('RESOURCE_NOT_FOUND');
+    expect(reads(h.mock, "NOMETAB = 'TSICID'")).toBe(before);
+    expect(reads(h.mock, 'FROM TSICID')).toBe(0);
   });
 });
 
