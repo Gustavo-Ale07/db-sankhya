@@ -378,6 +378,29 @@ export class MutationService {
       }
     }
 
+    // The table alone first: a request without columns is never refused where the full one below
+    // is allowed, and a table the caller may not change is refused before its dictionary is read,
+    // so neither the cost nor a failure of that read tells it apart from one they may change.
+    const tableDecision = await evaluateFor({
+      policies,
+      auth: writeAuth,
+      groupIds,
+      action: permission,
+      environment,
+      connectionId,
+      entities: [write.table.toUpperCase()],
+      columns: [],
+      hasWhere: true,
+      defaults,
+    });
+    if (tableDecision.effect !== 'ALLOW') {
+      throw refuse('AUTHORIZE', new AppError('FORBIDDEN', 'The change was denied by policy'), {
+        reasons: tableDecision.reasons,
+        matchedRuleIds: tableDecision.matchedRuleIds,
+        policyVersion: tableDecision.policyVersion,
+      });
+    }
+
     const catalog = await tableCatalog(metadata, connectionId, write.table);
     let capability = resolveCapability(write, { catalog, scratchTables: [] });
     if (capability.class === 'UNSUPPORTED' || capability.route !== 'SANKHYA_SAVE') {

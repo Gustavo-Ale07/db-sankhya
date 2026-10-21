@@ -384,6 +384,25 @@ describe('MutationService.prepare', () => {
     expect((denied!.details as Record<string, unknown>).reasons).toBeDefined();
   });
 
+  it('a table the policy denies is refused before its dictionary is read', async () => {
+    const h = await setup();
+    const { auth } = await h.userWith(WRITER);
+    await h.policy({ entities: ['TGFPAR'] });
+    // Were the dictionary read first, its failure would answer SANKHYA_API_ERROR instead and tell
+    // a denied table apart from one the caller may change.
+    h.mock.inject({ type: 'malformed' }, { sqlIncludes: "NOMETAB = 'TGFPAR'" });
+    const before = h.mock.calls.length;
+    await expect(
+      prepare(h, auth, "UPDATE TGFPAR SET NOMEPARC = 'X' WHERE CODPARC = 1"),
+    ).rejects.toMatchObject({ code: 'FORBIDDEN', message: 'The change was denied by policy' });
+    expect(h.mock.calls.slice(before)).toEqual([]);
+    // The rule denies only DATA.UPDATE: an INSERT reads the dictionary and meets the failure.
+    await expect(
+      prepare(h, auth, "INSERT INTO TGFPAR (CODPARC, NOMEPARC) VALUES (900, 'X')"),
+    ).rejects.toMatchObject({ code: 'SANKHYA_API_ERROR' });
+    expect(writeCalls(h.mock)).toEqual([]);
+  });
+
   it('refuses unparseable input (fail closed)', async () => {
     const h = await setup();
     const { auth } = await h.userWith(WRITER);
