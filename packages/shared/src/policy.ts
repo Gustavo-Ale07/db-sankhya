@@ -172,6 +172,14 @@ export interface EvaluateOptions {
    * back to the rule-7 default. Rules can still only lower the result.
    */
   defaults?: Partial<Pick<EffectiveLimits, 'maxReadRows' | 'maxWriteRows'>>;
+  /**
+   * A write checked for its tables before its columns are known: an ALLOW rule that can reach a
+   * table (its entities hit it and, with columns, one of its patterns has no table part or one
+   * hitting it) covers that table whatever its columns. DENY rules apply as usual. Never more
+   * restrictive than the same request with its columns, so it only refuses early what that one
+   * would refuse; the full request must still be evaluated.
+   */
+  tableOnly?: boolean;
 }
 
 /**
@@ -599,7 +607,14 @@ function evaluate(
   }
   if (invalid.length > 0) return deny(...invalid);
 
-  const applicable = rules.filter((r) => matchesContext(r, req) && overlaps(r, req));
+  const tableOnly = readOwn(options, 'tableOnly') === true;
+  // Without columns, a column ALLOW overlaps nothing; `tableOnly` keeps the ones reaching a table.
+  const applicable = rules.filter(
+    (r) =>
+      matchesContext(r, req) &&
+      (overlaps(r, req) ||
+        (tableOnly && r.effect === 'ALLOW' && req.entities.some((e) => reaches(r, e)))),
+  );
   const denies = applicable.filter((r) => r.effect === 'DENY');
   const allows = applicable.filter((r) => r.effect === 'ALLOW');
   matchedRuleIds.push(...applicable.map((r) => r.id));
@@ -623,7 +638,9 @@ function evaluate(
   const write = isPolicyWriteAction(req.action);
   if (write) {
     if (req.entities.length === 0) return deny('write without a target entity');
-    const uncovered = req.entities.filter((e) => !allows.some((r) => covers(r, e, req)));
+    const uncovered = req.entities.filter(
+      (e) => !allows.some((r) => (tableOnly ? reaches(r, e) : covers(r, e, req))),
+    );
     if (uncovered.length > 0) {
       return deny(`no ALLOW rule for ${req.action} on ${uncovered.map((e) => e.full).join(', ')}`);
     }
@@ -1006,6 +1023,14 @@ function covers(r: CompiledRule, entity: Entity, req: NormalizedRequest): boolea
   const cols = req.columns.filter((c) => c.entity === entity);
   return (
     cols.length > 0 && cols.every((c) => r.columns.some((p) => columnHit(p, c, allowHit, false)))
+  );
+}
+
+/** Whether an ALLOW rule could grant some column of one entity (`tableOnly`). */
+function reaches(r: CompiledRule, entity: Entity): boolean {
+  if (!entityMatches(r, entity, allowHit)) return false;
+  return (
+    r.columns.length === 0 || r.columns.some((p) => p.table === null || allowHit(p.table, entity))
   );
 }
 

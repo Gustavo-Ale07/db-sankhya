@@ -158,8 +158,12 @@ there: they are targeted by environment, or by a rule with no connection list. A
   expanded, while `COUNT(col)` references `col`. On Oracle, a quoted table or CTE name that is not
   upper case is refused: `"tgfpar"` names another object than `TGFPAR`, and a CTE so named could
   hide a read of the real table.
-- A write is checked against the policy for its table before the table's dictionary is read, so
-  the answer for a table the caller may not change does not depend on whether it exists.
+- A write is checked for its table before the table's dictionary is read: a DENY on the table, a
+  missing `DATA.*` permission, or no ALLOW that can reach the table (one naming it, or with a
+  column pattern for it) refuses it there, so the answer for a table the caller may not change
+  does not depend on whether it exists. An ALLOW limited to some columns passes this check; the
+  decision that authorizes the write is the one made afterwards with every column the statement
+  sets or reads in its `WHERE`.
 - A scratch `SELECT` is evaluated with the columns it reads. Scratch has no catalog, so a star or
   a whole-row reference (`row_to_json(t)`) or a `NATURAL JOIN` counts as `*`, which every column
   rule on that table hits, and a `JOIN … USING (c)` column counts on every table of the statement.

@@ -415,6 +415,32 @@ describe('MutationService.prepare', () => {
     expect(writeCalls(h.mock)).toEqual([]);
   });
 
+  it('an ALLOW for one column authorizes that column alone, through the table pre-check', async () => {
+    const h = await setup();
+    const { auth } = await h.userWith(WRITER);
+    await h.clearPolicies();
+    await h.policy({
+      name: 'name only',
+      effect: 'ALLOW',
+      entities: ['TGFPAR'],
+      // The WHERE columns are part of the request, as in the full decision.
+      columns: ['TGFPAR.NOMEPARC', 'TGFPAR.CODPARC'],
+    });
+    const prepared = await prepare(h, auth, "UPDATE TGFPAR SET NOMEPARC = 'X' WHERE CODPARC = 1");
+    expect(prepared.planId).toBeTruthy();
+    await expect(
+      prepare(h, auth, "UPDATE TGFPAR SET ATIVO = 'N' WHERE CODPARC = 1"),
+    ).rejects.toMatchObject({ code: 'FORBIDDEN', message: 'The change was denied by policy' });
+    // No ALLOW names the table at all: refused before its dictionary is read.
+    h.mock.inject({ type: 'malformed' }, { sqlIncludes: "NOMETAB = 'TGFPRO'" });
+    const before = h.mock.calls.length;
+    await expect(
+      prepare(h, auth, "UPDATE TGFPRO SET DESCRPROD = 'X' WHERE CODPROD = 1"),
+    ).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(h.mock.calls.slice(before)).toEqual([]);
+    expect(writeCalls(h.mock)).toEqual([]);
+  });
+
   it('refuses unparseable input (fail closed)', async () => {
     const h = await setup();
     const { auth } = await h.userWith(WRITER);

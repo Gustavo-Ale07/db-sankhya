@@ -133,6 +133,8 @@ export interface PolicyCheck {
   hasWhere?: boolean;
   /** Operator row ceilings (clamped by the evaluator to its hard maxima). */
   defaults?: { maxReadRows?: number; maxWriteRows?: number };
+  /** A write checked for its table before its columns are known (`EvaluateOptions.tableOnly`). */
+  tableOnly?: boolean;
 }
 
 /** One policy evaluation for the authenticated user. Never throws (evaluate fails closed). */
@@ -149,7 +151,10 @@ export function evaluateFor(check: PolicyCheck): Promise<PolicyDecision> {
       hasWhere: check.hasWhere ?? false,
     },
     new Set<Permission>(check.auth.grants.permissions),
-    check.defaults ? { defaults: check.defaults } : {},
+    {
+      ...(check.defaults ? { defaults: check.defaults } : {}),
+      ...(check.tableOnly ? { tableOnly: true } : {}),
+    },
   );
 }
 

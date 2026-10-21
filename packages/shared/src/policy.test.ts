@@ -1606,3 +1606,78 @@ describe('compileDenyChecker', () => {
       expect(isPlainPolicyName(bad)).toBe(false);
   });
 });
+
+describe('evaluatePolicy tableOnly (a write checked before its columns are known)', () => {
+  const table = (over: Partial<PolicyRequest> = {}) =>
+    req({ action: 'DATA.UPDATE', columns: [], ...over });
+  const nameOnly = rule({
+    id: 'name-only',
+    actions: ['DATA.UPDATE'],
+    entities: ['TGFPAR'],
+    columns: ['TGFPAR.NOMEPARC'],
+  });
+  const decide = (rules: PolicyRule[], request = table()) =>
+    evaluatePolicy(request, rules, ALL, { tableOnly: true });
+
+  it('an ALLOW limited to some columns of the table passes; without the option it does not', () => {
+    expect(decide([nameOnly]).effect).toBe('ALLOW');
+    expect(evaluatePolicy(table(), [nameOnly], ALL).effect).toBe('DENY');
+  });
+
+  it('a table DENY, a missing permission and no ALLOW reaching the table still refuse', () => {
+    const denyTable = rule({
+      id: 'deny',
+      effect: 'DENY',
+      actions: ['DATA.UPDATE'],
+      entities: ['TGFPAR'],
+    });
+    expect(decide([nameOnly, denyTable])).toMatchObject({ effect: 'DENY' });
+    expect(decide([nameOnly], table({ entities: ['TGFPRO'] })).reasons.join()).toMatch(
+      /no ALLOW rule/,
+    );
+    // A column pattern naming another table does not reach this one, entities or not.
+    const other = rule({ id: 'other', actions: ['DATA.UPDATE'], columns: ['TGFPRO.DESCRPROD'] });
+    expect(decide([other]).effect).toBe('DENY');
+    expect(
+      evaluatePolicy(table(), [nameOnly], new Set<Permission>(['QUERY.SELECT']), {
+        tableOnly: true,
+      }).effect,
+    ).toBe('DENY');
+  });
+
+  it('a column DENY does not refuse the table; the full request decides that column', () => {
+    const denyCol = rule({
+      id: 'deny-col',
+      effect: 'DENY',
+      actions: ['DATA.UPDATE'],
+      columns: ['TGFPAR.NOMEPARC'],
+    });
+    expect(decide([allowUpdate, denyCol]).effect).toBe('ALLOW');
+    expect(evaluatePolicy(update(), [allowUpdate, denyCol], ALL).effect).toBe('DENY');
+  });
+
+  it('is never more restrictive than the same request with its columns', () => {
+    const ruleSets: PolicyRule[][] = [
+      [allowUpdate],
+      [nameOnly],
+      [rule({ id: 'g', actions: ['DATA.UPDATE'], columns: ['NOME*'] })],
+      [rule({ id: 'q', actions: ['DATA.UPDATE'], entities: ['SANKHYA.TGF*'], columns: ['*'] })],
+      [nameOnly, rule({ id: 'd', effect: 'DENY', actions: ['DATA.UPDATE'], columns: ['ATIVO'] })],
+    ];
+    const requests = ['TGFPAR', 'sankhya.TGFPAR', 'TGFPRO'].flatMap((entity) =>
+      [['NOMEPARC'], ['NOMEPARC', 'CODPARC'], ['ATIVO'], ['*']].map((names) =>
+        req({
+          action: 'DATA.UPDATE',
+          entities: [entity],
+          columns: names.map((name) => ({ table: entity, name })),
+        }),
+      ),
+    );
+    for (const rules of ruleSets) {
+      for (const full of requests) {
+        if (evaluatePolicy(full, rules, ALL).effect !== 'ALLOW') continue;
+        expect(decide(rules, { ...full, columns: [] }).effect, JSON.stringify(full)).toBe('ALLOW');
+      }
+    }
+  });
+});

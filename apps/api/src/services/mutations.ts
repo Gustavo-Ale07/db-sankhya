@@ -391,9 +391,11 @@ export class MutationService {
       );
     }
 
-    // The table alone first: a request without columns is never refused where the full one below
-    // is allowed, and a table the caller may not change is refused before its dictionary is read,
-    // so neither the cost nor a failure of that read tells it apart from one they may change.
+    // The table alone first, so a table the caller may not change is refused before its
+    // dictionary is read and neither the cost nor a failure of that read tells it apart from one
+    // they may change: a DENY on the table refuses it, and so does the lack of any ALLOW that can
+    // reach it. An ALLOW limited to some of its columns passes here (`tableOnly`); which columns
+    // the statement may change is decided by the full request below.
     const tableDecision = await evaluateFor({
       policies,
       auth: writeAuth,
@@ -405,6 +407,7 @@ export class MutationService {
       columns: [],
       hasWhere: true,
       defaults,
+      tableOnly: true,
     });
     if (tableDecision.effect !== 'ALLOW') {
       throw refuse('AUTHORIZE', new AppError('FORBIDDEN', 'The change was denied by policy'), {
