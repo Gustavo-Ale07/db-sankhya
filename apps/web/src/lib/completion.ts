@@ -136,6 +136,32 @@ export function findAliases(sql: string, tables: CatalogTable[]): Map<string, st
   return out;
 }
 
+/**
+ * The catalog with every table the SQL names replaced by its complete version from `load` (for a
+ * dictionary cut at the gateway row cap, which lists only some columns of a table). A table that
+ * cannot be loaded keeps what the catalog had: this only feeds suggestions.
+ */
+export async function withTablesOf(
+  sql: string,
+  tables: CatalogTable[],
+  load: (name: string) => Promise<CatalogTable>,
+): Promise<CatalogTable[]> {
+  const named = new Set(findAliases(sql, tables).values());
+  if (named.size === 0) return tables;
+  const loaded = new Map<string, CatalogTable>();
+  await Promise.all(
+    tables
+      .filter((t) => named.has(t.name.toLowerCase()))
+      .map((t) =>
+        load(t.name).then(
+          (full) => void loaded.set(t.name, full),
+          () => undefined,
+        ),
+      ),
+  );
+  return tables.map((t) => loaded.get(t.name) ?? t);
+}
+
 function tableSuggestion(t: CatalogTable): Suggestion {
   return {
     label: t.name,

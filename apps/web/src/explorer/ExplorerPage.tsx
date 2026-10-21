@@ -145,8 +145,8 @@ export function ExplorerPage({
   );
   useEffect(() => {
     // Cleared while another connection's dictionary loads: no suggestions from the wrong one.
-    setCompletionSchema(schema.data?.catalog.tables ?? []);
-  }, [schema.data]);
+    setCompletionSchema(schema.data?.catalog.tables ?? [], loadTable);
+  }, [schema.data, loadTable]);
 
   const tab = tabs.find((t) => t.id === activeId) ?? tabs[0]!;
   const run: RunState = runs[tab.id] ?? { status: 'idle' };

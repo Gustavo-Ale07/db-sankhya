@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { CatalogTable } from '../api/types';
-import { findAliases, statementAt, suggest } from './completion';
+import { findAliases, statementAt, suggest, withTablesOf } from './completion';
 
 const col = (name: string, pk = false) => ({ name, type: 'NUMBER', pk });
 const tables: CatalogTable[] = [
@@ -94,5 +94,31 @@ describe('statementAt', () => {
   });
   it('handles empty text', () => {
     expect(statementAt('', 0).sql).toBe('');
+  });
+});
+
+describe('withTablesOf (a dictionary cut at the gateway row cap)', () => {
+  const cut: CatalogTable[] = [{ ...tables[0]!, columns: [col('CODPARC', true)] }, tables[1]!];
+
+  it('loads the complete columns of the tables the SQL names, and only those', async () => {
+    const asked: string[] = [];
+    const load = (name: string) => {
+      asked.push(name);
+      return Promise.resolve(tables.find((t) => t.name === name)!);
+    };
+    const full = await withTablesOf('SELECT p. FROM tgfpar p', cut, load);
+    expect(asked).toEqual(['TGFPAR']);
+    expect(suggest('SELECT p.', 'SELECT p. FROM tgfpar p', full).map((s) => s.label)).toContain(
+      'NOMEPARC',
+    );
+    expect(await withTablesOf('SELECT 1', cut, load)).toBe(cut);
+    expect(asked).toEqual(['TGFPAR']);
+  });
+
+  it('keeps what the catalog had for a table that cannot be loaded', async () => {
+    const full = await withTablesOf('SELECT * FROM TGFPAR', cut, () =>
+      Promise.reject(new Error('502')),
+    );
+    expect(full).toEqual(cut);
   });
 });

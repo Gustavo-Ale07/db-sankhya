@@ -7,7 +7,7 @@ import EditorWorker from 'monaco-editor/editor/editor.worker.start?worker';
 import { loader } from '@monaco-editor/react';
 import type { CatalogTable } from '../api/types';
 import type { SuggestionKind } from '../lib/completion';
-import { suggest } from '../lib/completion';
+import { suggest, withTablesOf } from '../lib/completion';
 
 declare global {
   interface Window {
@@ -22,12 +22,38 @@ loader.config({ monaco: monaco as unknown as Parameters<typeof loader.config>[0]
 export type Monaco = typeof monaco;
 export { monaco };
 
-let schemaRef: CatalogTable[] = [];
-let registered = false;
+type TableLoader = (name: string) => Promise<CatalogTable>;
 
-/** Feeds the autocomplete with the current schema; registers the provider once. */
-export function setCompletionSchema(tables: CatalogTable[]): void {
+let schemaRef: CatalogTable[] = [];
+let loaderRef: TableLoader | undefined;
+let registered = false;
+/** Complete tables, per loader: a new connection (a new loader) starts empty. */
+const loadedBy = new WeakMap<TableLoader, Map<string, Promise<CatalogTable>>>();
+
+function cached(load: TableLoader): TableLoader {
+  let byName = loadedBy.get(load);
+  if (!byName) loadedBy.set(load, (byName = new Map()));
+  const known = byName;
+  return (name) => {
+    let table = known.get(name);
+    if (!table) {
+      table = load(name);
+      known.set(name, table);
+      // A failed read is tried again on the next suggestion.
+      table.catch(() => known.delete(name));
+    }
+    return table;
+  };
+}
+
+/**
+ * Feeds the autocomplete with the current schema; registers the provider once. With `loadTable`
+ * (a dictionary cut at the gateway row cap), the columns of the tables a statement names are
+ * read in full before they are suggested.
+ */
+export function setCompletionSchema(tables: CatalogTable[], loadTable?: TableLoader): void {
   schemaRef = tables;
+  loaderRef = loadTable;
   if (registered) return;
   registered = true;
   const kinds: Record<SuggestionKind, monaco.languages.CompletionItemKind> = {
@@ -46,7 +72,7 @@ export function setCompletionSchema(tables: CatalogTable[]): void {
   };
   monaco.languages.registerCompletionItemProvider('sql', {
     triggerCharacters: ['.', ' '],
-    provideCompletionItems(model, position) {
+    async provideCompletionItems(model, position) {
       const full = model.getValue();
       const offset = model.getOffsetAt(position);
       const before = full.slice(0, offset);
@@ -58,7 +84,12 @@ export function setCompletionSchema(tables: CatalogTable[]): void {
         position.lineNumber,
         word.endColumn,
       );
-      const items = suggest(before.slice(stmtStart), full, schemaRef);
+      const schema = schemaRef;
+      const load = loaderRef;
+      const tables = load ? await withTablesOf(full, schema, cached(load)) : schema;
+      // The connection changed while its tables were read: nothing from the old one.
+      if (schema !== schemaRef || load !== loaderRef) return { suggestions: [] };
+      const items = suggest(before.slice(stmtStart), full, tables);
       return {
         suggestions: items.map((s) => ({
           label: { label: s.label, description: s.detail },
