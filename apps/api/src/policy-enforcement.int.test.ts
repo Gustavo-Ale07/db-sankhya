@@ -912,6 +912,12 @@ describe('a dictionary bigger than the gateway row cap', () => {
     }
     expect(new Set(answers.map((a) => JSON.stringify(a))).size).toBe(1);
     expect(reads(h.mock, 'OR')).toBe(0);
+    // A hidden table is refused before any dictionary read: neither its cost nor a failed read
+    // tells it apart from a table the connection does not have.
+    expect(reads(h.mock, "NOMETAB = 'TSICID'")).toBe(0);
+    h.mock.inject({ type: 'malformed' }, { sqlIncludes: "NOMETAB = 'TSICID'" });
+    const hidden = await tableRoute(h, cookie, 'TSICID');
+    expect(errorOf(hidden)).toEqual(answers[0]);
   });
 
   it('requires a session, QUERY.SELECT and access to the connection', async () => {

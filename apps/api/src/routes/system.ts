@@ -10,7 +10,7 @@ import {
   requirePermission,
 } from '../http';
 import { ENV_CONNECTION_ID } from '../services/connections';
-import type { Catalog } from '../services/metadata';
+import type { Catalog, CatalogTable } from '../services/metadata';
 import { authorizeConnection, connectionDenied, visibleCatalog } from '../services/read-policy';
 
 const schemaQuery = z.object({ connectionId: connectionIdSchema.optional() }).strict();
@@ -138,14 +138,20 @@ export async function systemRoutes(app: FastifyInstance): Promise<void> {
   app.get('/api/schema/tables/:name', async (request, reply) => {
     const { name } = parseBody(tableParams, request.params);
     const { connectionId, visible } = await schemaAccess(request);
-    const found = await metadata.table(connectionId, name);
-    const catalog = await visible({
-      tables: found ? [found] : [],
-      fetchedAt: new Date().toISOString(),
-      source: 'dictionary',
-    });
-    const table = catalog.tables[0];
-    if (!table) throw new AppError('RESOURCE_NOT_FOUND', 'Table not found');
+    const one = async (table: CatalogTable | undefined) =>
+      (
+        await visible({
+          tables: table ? [table] : [],
+          fetchedAt: new Date().toISOString(),
+          source: 'dictionary',
+        })
+      ).tables[0];
+    const notFound = () => new AppError('RESOURCE_NOT_FOUND', 'Table not found');
+    // A table the user may not see is refused before the dictionary is read, so neither the
+    // cost of that read nor its failure tells it apart from a table that does not exist.
+    if (!(await one({ name: name.toUpperCase(), columns: [], foreignKeys: [] }))) throw notFound();
+    const table = await one(await metadata.table(connectionId, name));
+    if (!table) throw notFound();
     noStore(reply);
     return redact({ connectionId, table });
   });
