@@ -2,7 +2,7 @@ name: Supply chain
 
 on:
   push:
-    branches: [main]
+    branches: [main, migration, 'fix/**']
   pull_request:
   schedule:
     - cron: '17 4 * * 1'
