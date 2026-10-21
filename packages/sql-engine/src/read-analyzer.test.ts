@@ -316,6 +316,14 @@ describe('analyzeRead', () => {
       expect(e.message).toContain('tgfpar');
     });
 
+    it('refuses a quoted CTE name that is not upper case on oracle (it would not hide TGFPAR)', () => {
+      const sql =
+        'WITH "tgfpar" AS (SELECT 1 A FROM DUAL) SELECT P.* FROM TGFPAR P CROSS JOIN "tgfpar" Q';
+      const e = errorOf(() => analyzeRead(sql, { dialect: 'oracle' }));
+      expect(e.code).toBe('SQL_UNSUPPORTED');
+      expect(e.message).toContain('tgfpar');
+    });
+
     it('accepts upper-case quoted and unquoted lower-case table names on oracle', () => {
       expect(analyzeRead('SELECT CODPARC FROM "TGFPAR"', { dialect: 'oracle' }).tables).toEqual([
         { name: 'TGFPAR' },

@@ -604,7 +604,8 @@ function isRowCapSafe(ast: unknown): boolean {
 /**
  * Oracle folds unquoted identifiers to upper case and matches quoted ones exactly, while the
  * catalog check is case-insensitive. A quoted table name that is not upper case would name a
- * different object than the catalog entry it matched, so it is refused.
+ * different object than the catalog entry it matched, so it is refused. So is such a CTE name:
+ * CTEs are matched case-insensitively, and `"tgfpar"` would hide a read of the real `TGFPAR`.
  */
 function assertOracleQuotedTables(sql: string, tables: { name: string }[]): void {
   const quoted = new Set<string>();
@@ -620,7 +621,7 @@ function assertOracleQuotedTables(sql: string, tables: { name: string }[]): void
   }
   for (const { name } of tables) {
     if (name !== name.toUpperCase() && quoted.has(name)) {
-      throw unsupported(`Quoted table name "${name}" must be upper case on Oracle.`);
+      throw unsupported(`Quoted name "${name}" must be upper case on Oracle.`);
     }
   }
 }
@@ -646,7 +647,9 @@ export function analyzeRead(sql: string, opts: ReadAnalysisOptions = {}): ReadAn
   const walker = new Walker(opts.dialect);
   walker.select(ast);
   walker.assertNoShadowing();
-  if (opts.dialect === 'oracle') assertOracleQuotedTables(sql, walker.tables);
+  if (opts.dialect === 'oracle') {
+    assertOracleQuotedTables(sql, [...walker.tables, ...walker.ctes.map((name) => ({ name }))]);
+  }
   return {
     orderBy: hasOuterOrderBy(ast),
     rowCapSafe: isRowCapSafe(ast),

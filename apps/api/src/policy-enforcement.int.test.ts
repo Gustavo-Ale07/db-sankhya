@@ -209,6 +209,60 @@ describe('policies on the Sankhya read path', () => {
     expect(audit.json().items[0]).toMatchObject({ errorCode: 'FORBIDDEN', resource: 'TGFPAR' });
   });
 
+  it('a column DENY follows the column through aliases, joins, subqueries, CTEs and UNION', async () => {
+    const h = await setup();
+    await h.policy({ columns: ['TGFPAR.EMAIL'] });
+    const { cookie } = await h.viewer();
+    for (const sqlText of [
+      'SELECT a.EMAIL FROM TGFPAR a JOIN TGFPAR b ON b.CODPARC = a.CODPARC',
+      'SELECT b.* FROM TSICID c JOIN TGFPAR b ON b.CODCID = c.CODCID',
+      'SELECT (SELECT MAX(EMAIL) FROM TGFPAR) X FROM TSICID',
+      "SELECT CODCID FROM TSICID WHERE CODCID IN (SELECT CODPARC FROM TGFPAR WHERE EMAIL LIKE 'a%')",
+      'WITH c AS (SELECT * FROM TGFPAR) SELECT CODPARC FROM c',
+      'SELECT x.* FROM (SELECT * FROM TGFPAR) x',
+      'SELECT CODCID FROM TSICID UNION SELECT EMAIL FROM TGFPAR',
+      'SELECT UPPER(SUBSTR(EMAIL, 1, 3)) FROM TGFPAR',
+      'SELECT COUNT(*) FROM TGFPAR GROUP BY EMAIL',
+      "SELECT CODPARC FROM TGFPAR GROUP BY CODPARC HAVING MAX(EMAIL) > 'a'",
+      'SELECT CODPARC FROM TGFPAR ORDER BY EMAIL',
+      'SELECT ROW_NUMBER() OVER (ORDER BY EMAIL) N FROM TGFPAR',
+      'SELECT "EMAIL" FROM TGFPAR',
+      'SELECT email FROM tgfpar',
+    ]) {
+      const res = await query(h, cookie, { sql: sqlText });
+      expect(res.statusCode, sqlText).toBe(403);
+      expect(codeOf(res), sqlText).toBe('FORBIDDEN');
+    }
+    expect(reads(h.mock, 'EMAIL')).toBe(0);
+    expect(reads(h.mock, 'email')).toBe(0);
+  });
+
+  it('a table DENY refuses COUNT(*) and a CTE over the table', async () => {
+    const h = await setup();
+    await h.policy({ entities: ['TGFPAR'] });
+    const { cookie } = await h.viewer();
+    for (const sqlText of [
+      'SELECT COUNT(*) FROM TGFPAR',
+      'WITH x AS (SELECT CODPARC FROM TGFPAR) SELECT 1 A FROM x',
+    ]) {
+      const res = await query(h, cookie, { sql: sqlText });
+      expect(res.statusCode, sqlText).toBe(403);
+    }
+    expect(reads(h.mock, 'FROM TGFPAR')).toBe(0);
+  });
+
+  it('refuses an Oracle CTE whose quoted lower-case name would hide the real table', async () => {
+    const h = await setup();
+    await h.policy({ entities: ['TGFPAR'] });
+    const { cookie } = await h.viewer();
+    const res = await query(h, cookie, {
+      sql: 'WITH "tgfpar" AS (SELECT 1 A FROM DUAL) SELECT P.* FROM TGFPAR P CROSS JOIN "tgfpar" Q',
+    });
+    expect(res.statusCode, res.body).toBe(400);
+    expect(codeOf(res)).toBe('SQL_UNSUPPORTED');
+    expect(reads(h.mock, 'CROSS JOIN')).toBe(0);
+  });
+
   it('refuses NATURAL and condition-less joins that would hide a denied column', async () => {
     const h = await setup();
     await h.policy({ columns: ['TSICID.CODCID'] });
