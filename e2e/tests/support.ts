@@ -1,7 +1,7 @@
 // Helpers shared by the lifecycle, four-eyes and scratch/DDL specs. Every file builds its own
 // sessions and fixtures through the API and removes what would change other files (policies,
 // connections, the kill switch); nothing here depends on explorer.spec.ts having run.
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect } from '@playwright/test';
@@ -14,6 +14,19 @@ import type {
 } from '@playwright/test';
 import { BASE_URL, BOOTSTRAP, E2E_DIR, POLICY_ADMIN, SPECIALIST } from '../playwright.config';
 
+/** An e2e server: its address and its data directory (see playwright.config.ts). */
+export interface Server {
+  baseURL: string;
+  dir: string;
+}
+export const MAIN: Server = { baseURL: BASE_URL, dir: E2E_DIR };
+
+/** The server a request context talks to; the CSRF check expects its address as the Origin. */
+const origins = new WeakMap<APIRequestContext, string>();
+
+/** A one-time password start-server.mjs saved in the server's directory. */
+const saved = (server: Server, file: string) => readFileSync(join(server.dir, file), 'utf8').trim();
+
 /**
  * Partner rows (TGFPAR.CODPARC) each file writes or refuses to write. All mock connections share
  * one dataset and renamed rows stay renamed for the rest of the run, so a new spec picks a free
@@ -24,6 +37,8 @@ export const RESERVED_CODPARC = {
   'lifecycle.spec.ts': [7, 11, 12, 13],
   'four-eyes.spec.ts': [21],
   'preview.spec.ts': [31],
+  // Previewed only, on the CUT server's own dataset.
+  'cut-dictionary.spec.ts': [41],
 } as const;
 
 /** Role seeded by start-server.mjs: OPERATOR plus APPROVAL.DECIDE (keep the key in sync). */
@@ -58,7 +73,7 @@ export async function call(
   for (let attempt = 0; ; attempt++) {
     const res = await req.fetch(path, {
       method,
-      headers: { origin: BASE_URL },
+      headers: { origin: origins.get(req) ?? BASE_URL },
       ...(data !== undefined ? { data } : {}),
     });
     if (res.status() !== 429 || attempt >= 3) return res;
@@ -121,12 +136,18 @@ export async function apiLogin(
   }
 }
 
-export async function newContext(browser: Browser, storageState?: string): Promise<BrowserContext> {
-  return browser.newContext({
-    baseURL: BASE_URL,
+export async function newContext(
+  browser: Browser,
+  storageState?: string,
+  server: Server = MAIN,
+): Promise<BrowserContext> {
+  const ctx = await browser.newContext({
+    baseURL: server.baseURL,
     locale: 'pt-BR',
     ...(storageState ? { storageState } : {}),
   });
+  origins.set(ctx.request, server.baseURL);
+  return ctx;
 }
 
 /**
@@ -139,10 +160,11 @@ async function sessionContext(
   browser: Browser,
   email: string,
   login: (ctx: BrowserContext) => Promise<void>,
+  server: Server = MAIN,
 ): Promise<BrowserContext> {
-  const file = join(E2E_DIR, 'sessions', `${email}.json`);
+  const file = join(server.dir, 'sessions', `${email}.json`);
   if (existsSync(file)) {
-    const cached = await newContext(browser, file);
+    const cached = await newContext(browser, file, server);
     const me = await call(cached.request, 'GET', '/api/auth/me');
     if (me.ok()) {
       const body = (await me.json()) as { user?: { mustChangePassword?: boolean } };
@@ -150,17 +172,26 @@ async function sessionContext(
     }
     await cached.close();
   }
-  const ctx = await newContext(browser);
+  const ctx = await newContext(browser, undefined, server);
   await login(ctx);
-  mkdirSync(join(E2E_DIR, 'sessions'), { recursive: true });
+  mkdirSync(join(server.dir, 'sessions'), { recursive: true });
   await ctx.storageState({ path: file });
   return ctx;
 }
 
 /** The bootstrap administrator: changed password first (a full run), one-time one otherwise. */
-export function adminContext(browser: Browser): Promise<BrowserContext> {
-  return sessionContext(browser, BOOTSTRAP.email, (ctx) =>
-    apiLogin(ctx, BOOTSTRAP.email, [CHANGED_PASSWORD, BOOTSTRAP.password], CHANGED_PASSWORD),
+export function adminContext(browser: Browser, server: Server = MAIN): Promise<BrowserContext> {
+  return sessionContext(
+    browser,
+    BOOTSTRAP.email,
+    (ctx) =>
+      apiLogin(
+        ctx,
+        BOOTSTRAP.email,
+        [CHANGED_PASSWORD, saved(server, 'bootstrap-password.txt')],
+        CHANGED_PASSWORD,
+      ),
+    server,
   );
 }
 
@@ -182,14 +213,21 @@ export function specialistContext(browser: Browser): Promise<BrowserContext> {
 export const POLICY_ADMIN_PASSWORD = 'Politicas#Demo2026';
 
 /** The ADMIN-only administrator: separation of duties lets only it change policies. */
-export function policyAdminContext(browser: Browser): Promise<BrowserContext> {
-  return sessionContext(browser, POLICY_ADMIN.email, (ctx) =>
-    apiLogin(
-      ctx,
-      POLICY_ADMIN.email,
-      [POLICY_ADMIN.password, POLICY_ADMIN_PASSWORD],
-      POLICY_ADMIN_PASSWORD,
-    ),
+export function policyAdminContext(
+  browser: Browser,
+  server: Server = MAIN,
+): Promise<BrowserContext> {
+  return sessionContext(
+    browser,
+    POLICY_ADMIN.email,
+    (ctx) =>
+      apiLogin(
+        ctx,
+        POLICY_ADMIN.email,
+        [saved(server, 'policy-admin-password.txt'), POLICY_ADMIN_PASSWORD],
+        POLICY_ADMIN_PASSWORD,
+      ),
+    server,
   );
 }
 
@@ -216,10 +254,11 @@ export class Fixtures {
   constructor(
     private readonly admin: APIRequestContext,
     private readonly browser: Browser,
+    private readonly server: Server = MAIN,
   ) {}
 
   async policy(body: Record<string, unknown>): Promise<string> {
-    this.policyAdmin ??= await policyAdminContext(this.browser);
+    this.policyAdmin ??= await policyAdminContext(this.browser, this.server);
     const policies = this.policyAdmin.request;
     const { item } = await ok<{ item: { id: string } }>(
       policies,

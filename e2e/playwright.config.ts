@@ -8,13 +8,27 @@ import { defineConfig, devices } from '@playwright/test';
 // STATIC_DIR, with the in-process mock Sankhya gateway (fictitious data) and a fresh PGlite
 // directory. There is no default password: start-server.mjs creates the administrator with the
 // admin CLI (dist/admin.mjs) and saves its one-time password for the tests.
-// E2E_PORT lets two runs work side by side; each port gets its own data directory.
+// E2E_PORT lets two runs work side by side, three ports apart (bootstrap.spec.ts starts its own
+// server on E2E_PORT + 1, and the CUT server below listens on E2E_PORT + 2); each port gets its
+// own data directory.
 const PORT = Number(process.env.E2E_PORT ?? 3199);
 const root = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 // Same derivation as start-server.mjs (from PORT); keep the two in sync.
 export const E2E_DIR = join(tmpdir(), `dbx-e2e-${PORT}`);
 const PASSWORD_FILE = join(E2E_DIR, 'bootstrap-password.txt');
 export const BASE_URL = `http://localhost:${PORT}`;
+
+/**
+ * A second server, two ports up, whose mock gateway cuts every result at 50 rows without
+ * saying so, with 5000 fictitious dictionary rows ahead of the demo tables': the dictionary
+ * outgrows the 100 pages a read may take, so its catalog is always incomplete
+ * (`TDDCAM:truncated`) and lists no column of the demo tables. Only cut-dictionary.spec.ts uses it.
+ */
+const CUT_PORT = PORT + 2;
+export const CUT = {
+  baseURL: `http://localhost:${CUT_PORT}`,
+  dir: join(tmpdir(), `dbx-e2e-${CUT_PORT}`),
+};
 
 export const BOOTSTRAP = {
   email: 'admin@example.com',
@@ -48,6 +62,13 @@ export const POLICY_ADMIN = {
   },
 };
 
+/** Test-only mock switches of the CUT server (refused outside mock mode and in production). */
+const CUT_GATEWAY = {
+  SANKHYA_MOCK_ROW_CAP: '50',
+  SANKHYA_MOCK_SILENT_CUT: 'true',
+  SANKHYA_MOCK_DICTIONARY_PADDING: '5000',
+};
+
 export default defineConfig({
   testDir: './tests',
   fullyParallel: false,
@@ -70,15 +91,19 @@ export default defineConfig({
       use: { ...devices['Desktop Chrome'], viewport: { width: 1440, height: 900 } },
     },
   ],
-  webServer: {
+  webServer: [server(PORT), server(CUT_PORT, CUT_GATEWAY)],
+});
+
+function server(port: number, extra: Record<string, string> = {}) {
+  return {
     command: `node "${root('./start-server.mjs')}"`,
-    url: `http://localhost:${PORT}/health/live`,
+    url: `http://localhost:${port}/health/live`,
     reuseExistingServer: false,
     timeout: 60_000,
     env: {
       NODE_ENV: 'test',
-      PORT: String(PORT),
-      APP_URL: `http://localhost:${PORT}`,
+      PORT: String(port),
+      APP_URL: `http://localhost:${port}`,
       STATIC_DIR: root('../apps/web/dist'),
       AUTH_SECRET: 'e2e-only-session-secret-0123456789abcdef',
       // Read by the admin CLI (the first administrator); no bootstrap token is issued.
@@ -105,6 +130,7 @@ export default defineConfig({
       GLOBAL_WRITE_ENABLED: 'true',
       WRITE_TO_SANKHYA: 'true',
       SAFE_MODE: 'true',
+      ...extra,
     },
-  },
-});
+  };
+}

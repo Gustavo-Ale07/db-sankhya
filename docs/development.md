@@ -87,6 +87,12 @@ docs/             documentation, ADRs, screenshots
 First-time Playwright setup: `pnpm --filter @dbx/e2e exec playwright install chromium`.
 `UPDATE_SCREENSHOTS=1 pnpm test:e2e` refreshes the images in `docs/screenshots`.
 
+The e2e run uses three ports from `E2E_PORT` (default 3199): the main server, the server
+`bootstrap.spec.ts` starts on `E2E_PORT + 1`, and on `E2E_PORT + 2` a server whose mock gateway
+cuts results silently with a padded dictionary (`SANKHYA_MOCK_*`, see
+[sankhya.md](sankhya.md#testing-a-cut-dictionary-with-the-mock)), so its catalog is always
+incomplete; `cut-dictionary.spec.ts` uses it. Two runs side by side need ports three apart.
+
 ## Database changes
 
 Edit `packages/database/src/schema.ts`, then run `pnpm db:generate`. Commit the generated SQL in

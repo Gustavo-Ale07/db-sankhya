@@ -31,6 +31,7 @@ let fixtures: Fixtures;
 let sandboxId: string;
 let page: Page;
 let sandboxPlanId: string | undefined;
+let sandboxPlan: { token: string; strongConfirmation: string | null } | undefined;
 
 const nameOf = async (codparc: number, connectionId?: string) =>
   (
@@ -196,6 +197,7 @@ test('SANDBOX UPDATE executes and is VERIFIED', async () => {
   expect(preview.status()).toBe(200);
   const plan = (await preview.json()) as {
     planId: string;
+    token: string;
     execution: { available: boolean };
     requires: { strongConfirmation: string | null };
   };
@@ -229,10 +231,27 @@ test('SANDBOX UPDATE executes and is VERIFIED', async () => {
   await expect(dialog.getByTestId('step-now').filter({ hasText: SANDBOX_NAME })).toHaveCount(1);
   await shot(page, 'lifecycle-sandbox-verified');
   sandboxPlanId = plan.planId;
+  sandboxPlan = { token: plan.token, strongConfirmation: plan.requires.strongConfirmation };
   await dialog.getByRole('button', { name: 'Fechar', exact: true }).last().click();
   await expect(dialog).toBeHidden();
 
   // The row really holds the new value now.
+  expect(await nameOf(ROW.sandbox, sandboxId)).toBe(SANDBOX_NAME);
+});
+
+test('a plan runs once: executing it again is refused and writes nothing', async () => {
+  expect(sandboxPlanId && sandboxPlan).toBeTruthy();
+  // A new idempotency key: the same key would replay the first report instead.
+  const res = await call(page.request, 'POST', '/api/query/execute', {
+    planId: sandboxPlanId,
+    token: sandboxPlan!.token,
+    idempotencyKey: `e2e-reuse-${STAMP}`,
+    ...(sandboxPlan!.strongConfirmation
+      ? { strongConfirmation: sandboxPlan!.strongConfirmation }
+      : {}),
+  });
+  expect(res.ok()).toBe(false);
+  expect((await refusal(res)).code).toBe('CONFIRMATION_USED');
   expect(await nameOf(ROW.sandbox, sandboxId)).toBe(SANDBOX_NAME);
 });
 
