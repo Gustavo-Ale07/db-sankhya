@@ -505,6 +505,26 @@ describe('MutationService.prepare', () => {
     ).rejects.toMatchObject({ code: 'WRITE_ROW_LIMIT_EXCEEDED' });
     expect(writeCalls(h.mock)).toEqual([]);
   });
+
+  it('names the write limit, not the read limit that cut the snapshot', async () => {
+    const h = await setup();
+    const { auth } = await h.userWith(WRITER);
+    await h.policy({
+      name: 'reads of two rows',
+      effect: 'ALLOW',
+      actions: ['QUERY.SELECT'],
+      limits: { maxReadRows: 2 },
+    });
+    const err = await prepare(h, auth, "UPDATE TGFPAR SET ATIVO = 'S' WHERE CODPARC > 0").catch(
+      (e: unknown) => e,
+    );
+    expect(err).toMatchObject({ code: 'WRITE_ROW_LIMIT_EXCEEDED' });
+    const { message, details } = err as { message: string; details: Record<string, unknown> };
+    expect(details.maxWriteRows).not.toBe(2);
+    expect(message).toContain(`write limit is ${String(details.maxWriteRows)}`);
+    expect(details).toMatchObject({ previewRows: 2 });
+    expect(writeCalls(h.mock)).toEqual([]);
+  });
 });
 
 describe('POST /api/query/preview', () => {

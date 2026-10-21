@@ -14,6 +14,11 @@ describe('translateMessage', () => {
       'Resultado limitado a 100 linhas. Adicione filtros ou um LIMIT/OFFSET explícito para paginar.',
     ],
     ['Table not found', 'Tabela não encontrada.'],
+    ['The change affects more than 50 rows.', 'A alteração afeta mais de 50 linhas.'],
+    [
+      'The change affects more than 2 rows, the most its preview may read; the write limit is 50.',
+      'A alteração afeta mais de 2 linhas, o máximo que a prévia pode ler; o limite de escrita é 50.',
+    ],
     [
       'Table TGFXYZ is not in the catalog of this connection',
       'A tabela TGFXYZ não está no catálogo desta conexão.',

@@ -1033,12 +1033,15 @@ export class MutationService {
       },
     });
     if (out.truncated) {
+      // The snapshot may be cut by a read limit lower than the write limit: name both.
       throw refuse(
         'PREVIEW',
         new AppError(
           'WRITE_ROW_LIMIT_EXCEEDED',
-          `The change affects more than ${out.maxRows} rows.`,
-          { maxWriteRows: out.maxRows },
+          out.maxRows < opts.maxWriteRows
+            ? `The change affects more than ${out.maxRows} rows, the most its preview may read; the write limit is ${opts.maxWriteRows}.`
+            : `The change affects more than ${opts.maxWriteRows} rows.`,
+          { maxWriteRows: opts.maxWriteRows, previewRows: out.maxRows },
         ),
       );
     }

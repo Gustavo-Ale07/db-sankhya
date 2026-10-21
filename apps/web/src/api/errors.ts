@@ -77,6 +77,12 @@ const MESSAGES: [RegExp, (...m: string[]) => string][] = [
   ],
   [/^Table not found$/, () => 'Tabela não encontrada.'],
   [
+    /^The change affects more than (\d+) rows, the most its preview may read; the write limit is (\d+)\.$/,
+    (n, limit) =>
+      `A alteração afeta mais de ${n} linhas, o máximo que a prévia pode ler; o limite de escrita é ${limit}.`,
+  ],
+  [/^The change affects more than (\d+) rows\.$/, (n) => `A alteração afeta mais de ${n} linhas.`],
+  [
     /^Table (\S+) is not in the catalog of this connection; the catalog is incomplete, refresh it and try again$/,
     (t) =>
       `A tabela ${t} não está no catálogo desta conexão; o catálogo está incompleto: recarregue-o e tente de novo.`,
