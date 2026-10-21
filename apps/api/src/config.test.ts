@@ -189,6 +189,11 @@ describe('Sankhya runtime configuration', () => {
     expect(c.planTtlSeconds).toBe(300);
     expect(c.approvalTtlMinutes).toBe(60);
     expect(() => loadConfig({ APPROVAL_TTL_MINUTES: '0' })).toThrow(/APPROVAL_TTL_MINUTES/);
+    expect(c.planRedactHours).toBe(24);
+    expect(c.planRetentionDays).toBe(30);
+    expect(c.metadataMaxPages).toBe(100);
+    expect(() => loadConfig({ PLAN_RETENTION_DAYS: '0' })).toThrow(/PLAN_RETENTION_DAYS/);
+    expect(() => loadConfig({ METADATA_MAX_PAGES: '1001' })).toThrow(/METADATA_MAX_PAGES/);
     expect(c.sankhya).toMatchObject({
       mode: 'mock',
       allowedHosts: ['api.sankhya.com.br', 'api.sandbox.sankhya.com.br'],

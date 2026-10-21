@@ -4,6 +4,7 @@ import { createDatabase } from '@dbx/database';
 import { ConfigError, loadConfig } from './config';
 import { buildApp } from './app';
 import { announceBootstrap } from './services/bootstrap';
+import { purgePlans } from './services/plans';
 import { createShutdown } from './shutdown';
 
 async function main(): Promise<void> {
@@ -34,6 +35,15 @@ async function main(): Promise<void> {
     void app.services.sessions
       .purgeExpired()
       .catch((err: unknown) => app.log.warn({ err }, 'session purge failed'));
+    const now = Date.now();
+    void purgePlans(database.db, {
+      redactBefore: new Date(now - config.planRedactHours * 3600_000),
+      deleteBefore: new Date(now - config.planRetentionDays * 86_400_000),
+    })
+      .then((n) => {
+        if (n.redacted || n.deleted) app.log.info(n, 'settled plans purged');
+      })
+      .catch((err: unknown) => app.log.warn({ err }, 'plan purge failed'));
   }, 3600_000);
   housekeeping.unref();
 

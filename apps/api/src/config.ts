@@ -137,6 +137,10 @@ const envSchema = z.object({
   PLAN_TTL_SECONDS: int(300, 30, 3600),
   /** Lifetime of a plan that requires approval (four eyes), in minutes. */
   APPROVAL_TTL_MINUTES: int(60, 1, 24 * 60),
+  /** Settled plans lose their before values and preview after this many hours. */
+  PLAN_REDACT_HOURS: int(24, 1, 30 * 24),
+  /** Settled plans without an approval request are deleted after this many days. */
+  PLAN_RETENTION_DAYS: int(30, 1, 3650),
   SANKHYA_BASE_URL: optionalText,
   SANKHYA_CLIENT_ID: optionalText,
   SANKHYA_CLIENT_SECRET: optionalText,
@@ -229,6 +233,9 @@ export interface AppConfig {
   planTtlSeconds: number;
   /** APPROVAL_TTL_MINUTES: lifetime of plans that require approval. */
   approvalTtlMinutes: number;
+  /** PLAN_REDACT_HOURS / PLAN_RETENTION_DAYS: housekeeping of settled plans (purgePlans). */
+  planRedactHours: number;
+  planRetentionDays: number;
   sankhya: SankhyaConfig;
   scratch: {
     maxWorkspaces: number;
@@ -419,6 +426,8 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
     demoMode: e.DEMO_MODE,
     planTtlSeconds: e.PLAN_TTL_SECONDS,
     approvalTtlMinutes: e.APPROVAL_TTL_MINUTES,
+    planRedactHours: e.PLAN_REDACT_HOURS,
+    planRetentionDays: e.PLAN_RETENTION_DAYS,
     sankhya: {
       mode: sankhyaMode ?? 'live',
       allowedHosts: e.SANKHYA_ALLOWED_HOSTS.map((h) => h.toLowerCase()),

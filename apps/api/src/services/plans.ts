@@ -72,6 +72,50 @@ type Tx = Parameters<Parameters<Database['transaction']>[0]>[0];
  */
 const HAS_APPROVAL = sql`exists (select 1 from "approvals" a where a."plan_id" = "plans"."id" and a."decision" = 'APPROVE' and a."plan_hash" = "plans"."plan_hash" and a."decided_by" is not null and a."decided_by" <> "plans"."user_id")`;
 
+/** What `purgePlans` leaves in `targets` and `preview` of a settled plan. */
+export const PLAN_REDACTED = { redacted: true } as const;
+
+/** A plan that can no longer run: used, refused, or past its lifetime. */
+const SETTLED = or(
+  inArray(plans.status, ['CONSUMED', 'EXPIRED', 'INVALIDATED']),
+  lte(plans.expiresAt, sql`now()`),
+);
+
+/**
+ * Housekeeping of settled plans (see docs/security.md, plan retention). Past `redactBefore` their
+ * before values (`targets`) and preview are replaced by PLAN_REDACTED; the row, its hashes and its
+ * status stay, so a replay is refused as altered (CONFIRMATION_INVALID), never run. Past
+ * `deleteBefore` the row goes, unless an approval request names it: approvals keep their plan.
+ * The assisted rollback reads the execution report in the audit log, never the plan.
+ */
+export async function purgePlans(
+  db: Database,
+  opts: { redactBefore: Date; deleteBefore: Date },
+): Promise<{ redacted: number; deleted: number }> {
+  const deleted = await db
+    .delete(plans)
+    .where(
+      and(
+        SETTLED,
+        lte(plans.createdAt, opts.deleteBefore),
+        sql`not exists (select 1 from "approvals" a where a."plan_id" = "plans"."id")`,
+      ),
+    )
+    .returning({ id: plans.id });
+  const redacted = await db
+    .update(plans)
+    .set({ targets: PLAN_REDACTED, preview: PLAN_REDACTED })
+    .where(
+      and(
+        SETTLED,
+        lte(plans.createdAt, opts.redactBefore),
+        sql`${plans.targets} <> ${JSON.stringify(PLAN_REDACTED)}::jsonb`,
+      ),
+    )
+    .returning({ id: plans.id });
+  return { redacted: redacted.length, deleted: deleted.length };
+}
+
 /** `"<ENVIRONMENT> <ACTION> <N> <ENTITY>"`, for example `PRODUCTION UPDATE 3 TGFPAR`. */
 export function strongConfirmationPhrase(
   environment: Environment,

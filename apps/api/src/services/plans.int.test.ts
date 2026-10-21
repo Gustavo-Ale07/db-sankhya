@@ -7,7 +7,13 @@ import { DEFAULT_LIMITS, canonicalJSON, isAppError } from '@dbx/shared';
 import type { ErrorCode, PolicyDecision } from '@dbx/shared';
 import type { Capability } from '@dbx/sql-engine';
 import { sha256Hex } from '../security/crypto';
-import { PlansService, paramsHashOf, strongConfirmationPhrase } from './plans';
+import {
+  PLAN_REDACTED as REDACTED,
+  PlansService,
+  paramsHashOf,
+  purgePlans,
+  strongConfirmationPhrase,
+} from './plans';
 import type { NewPlan } from './plans';
 
 const SECRET = 'plan-test-secret-fixture-0123456789abcdef';
@@ -610,5 +616,78 @@ describe('PlansService.consume', () => {
     // A rejection needs no approval row: it only makes the plan unusable.
     expect(await svc.decide(plan.id, plan.planHash, 'REJECT')).toBe(true);
     expect(await statusOf(plan.id)).toBe('INVALIDATED');
+  });
+});
+
+describe('purgePlans', () => {
+  const HOUR = 3600_000;
+  const DAY = 24 * HOUR;
+  const at = (ms: number) => new Date(Date.now() - ms);
+  const age = (id: string, ms: number) =>
+    database.db
+      .update(plans)
+      .set({ createdAt: at(ms), expiresAt: at(ms - TTL * 1000) })
+      .where(eq(plans.id, id));
+  const rowOf = async (id: string) =>
+    (
+      await database.db
+        .select({ targets: plans.targets, preview: plans.preview, status: plans.status })
+        .from(plans)
+        .where(eq(plans.id, id))
+    )[0];
+  const purge = () =>
+    purgePlans(database.db, { redactBefore: at(DAY), deleteBefore: at(30 * DAY) });
+
+  it('redacts the before values of settled plans past a day and deletes them past the retention', async () => {
+    const svc = service();
+    const consumed = await svc.create(newPlan());
+    await svc.consume({ id: consumed.id, token: consumed.token, userId, sessionId });
+    await age(consumed.id, 2 * DAY);
+    const stale = await svc.create(newPlan());
+    await age(stale.id, 2 * DAY); // PENDING but long expired
+    const old = await svc.create(newPlan());
+    await age(old.id, 31 * DAY);
+    const fresh = await svc.create(newPlan());
+
+    expect(await purge()).toEqual({ redacted: 2, deleted: 1 });
+    for (const id of [consumed.id, stale.id]) {
+      expect(await rowOf(id)).toMatchObject({ targets: REDACTED, preview: REDACTED });
+    }
+    expect((await rowOf(consumed.id))?.status).toBe('CONSUMED');
+    expect(await rowOf(old.id)).toBeUndefined();
+    expect((await rowOf(fresh.id))?.targets).toEqual(newPlan().targets);
+    // Already redacted rows are not counted again.
+    expect(await purge()).toEqual({ redacted: 0, deleted: 0 });
+  });
+
+  it('never touches a plan that can still run, and keeps one with an approval request', async () => {
+    const svc = service();
+    const live = await svc.create(newPlan());
+    // Old, but its lifetime (an approval plan's) is not over.
+    await database.db
+      .update(plans)
+      .set({ createdAt: at(31 * DAY), expiresAt: new Date(Date.now() + HOUR) })
+      .where(eq(plans.id, live.id));
+    const approved = await svc.create(newPlan());
+    await approveDirectly(approved.id);
+    await age(approved.id, 31 * DAY);
+
+    expect(await purge()).toEqual({ redacted: 1, deleted: 0 });
+    expect((await rowOf(live.id))?.targets).toEqual(newPlan().targets);
+    // The approval record stays; only the before values go.
+    expect(await rowOf(approved.id)).toMatchObject({ targets: REDACTED });
+  });
+
+  it('a replay of a redacted plan is refused, never run again', async () => {
+    const svc = service();
+    const plan = await svc.create(newPlan());
+    const key = 'k-1';
+    await svc.consume({ id: plan.id, token: plan.token, userId, sessionId, idempotencyKey: key });
+    await age(plan.id, 2 * DAY);
+    await purge();
+    await expectCode(
+      svc.consume({ id: plan.id, token: plan.token, userId, sessionId, idempotencyKey: key }),
+      'CONFIRMATION_INVALID',
+    );
   });
 });
