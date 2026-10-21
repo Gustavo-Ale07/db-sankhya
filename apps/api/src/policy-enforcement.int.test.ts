@@ -5,7 +5,7 @@ import type { FastifyInstance, InjectOptions } from 'fastify';
 import { createDatabase } from '@dbx/database';
 import type { DatabaseHandle } from '@dbx/database';
 import { MOCK_CREDENTIALS, createMockSankhya } from '@dbx/sankhya-client/mock';
-import type { MockSankhya } from '@dbx/sankhya-client/mock';
+import type { MockSankhya, MockSankhyaOptions } from '@dbx/sankhya-client/mock';
 import type { Permission } from '@dbx/shared';
 import { buildApp } from './app';
 import { loadConfig, secretValues } from './config';
@@ -55,6 +55,7 @@ const open: Harness[] = [];
 async function setup(
   env: Record<string, string> = {},
   before?: (database: DatabaseHandle) => Promise<void>,
+  mockOptions?: MockSankhyaOptions,
 ): Promise<Harness> {
   const config = loadConfig({ ...BASE_ENV, ...env });
   const database = await createDatabase(config.databaseUrl);
@@ -67,7 +68,7 @@ async function setup(
       cb();
     },
   });
-  const mock = await createMockSankhya();
+  const mock = await createMockSankhya(mockOptions);
   const app = await buildApp({
     config,
     database,
@@ -825,5 +826,67 @@ describe('materialization route', () => {
     const res = await materialize(h, cookie, { ...READ, connectionId: UNKNOWN_CONNECTION });
     expect(res.statusCode).toBe(403);
     expect(codeOf(res)).toBe('FORBIDDEN');
+  });
+});
+
+describe('a dictionary bigger than the gateway row cap', () => {
+  /**
+   * 50 fictitious TDDCAM rows come first, then TSICID's columns, then TGFPAR's: the cap (54 rows)
+   * ends the whole-dictionary read at TGFPAR.CODPARC, so the global catalog lists TGFPAR with
+   * that one column. A star must not be expanded from such a list.
+   */
+  const CUT = { dictionaryPadding: 50, queryRowCap: 54 };
+  const cut = async (h: Harness) => {
+    const catalog = await h.app.services.metadata.get('env-default');
+    expect(catalog.degraded).toContain('TDDCAM:truncated');
+    const par = catalog.tables.find((t) => t.name === 'TGFPAR');
+    expect(par?.columns.map((c) => c.name)).toEqual(['CODPARC']);
+  };
+
+  it('a column DENY still refuses SELECT * on a table whose columns the catalog lost', async () => {
+    const h = await setup({}, undefined, CUT);
+    await cut(h);
+    await h.policy({ columns: ['TGFPAR.EMAIL'] });
+    const { cookie } = await h.viewer();
+    for (const sqlText of ['SELECT * FROM TGFPAR', 'SELECT p.* FROM TGFPAR p WHERE CODPARC = 1']) {
+      const res = await query(h, cookie, { sql: sqlText });
+      expect(res.statusCode, sqlText).toBe(403);
+      expect(codeOf(res), sqlText).toBe('FORBIDDEN');
+    }
+    const copy = await materialize(h, cookie, { sql: 'SELECT * FROM TGFPAR', into: 'tmp_par' });
+    expect(copy.statusCode, copy.body).toBe(403);
+    expect(reads(h.mock, 'FROM TGFPAR')).toBe(0);
+  });
+
+  it('runs SELECT * when nothing is denied, reading the table metadata once', async () => {
+    const h = await setup({}, undefined, CUT);
+    await cut(h);
+    const { cookie } = await h.viewer();
+    const res = await query(h, cookie, { sql: 'SELECT * FROM TGFPAR WHERE CODPARC = 1' });
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json().columns.map((c: { name: string }) => c.name)).toContain('NOMEPARC');
+    expect(reads(h.mock, "WHERE NOMETAB = 'TGFPAR'")).toBe(3);
+    expect((await query(h, cookie, { sql: 'SELECT * FROM TGFPAR' })).statusCode).toBe(200);
+    expect(reads(h.mock, "WHERE NOMETAB = 'TGFPAR'")).toBe(3);
+  });
+
+  it('reads no table metadata for a read without a star', async () => {
+    const h = await setup({}, undefined, CUT);
+    await cut(h);
+    const { cookie } = await h.viewer();
+    const res = await query(h, cookie, { sql: 'SELECT CODPARC, NOMEPARC FROM TGFPAR' });
+    expect(res.statusCode, res.body).toBe(200);
+    expect(reads(h.mock, 'WHERE NOMETAB =')).toBe(0);
+  });
+
+  it('refuses SELECT * when the table metadata cannot be read (fail closed)', async () => {
+    const h = await setup({}, undefined, CUT);
+    await cut(h);
+    const { cookie } = await h.viewer();
+    h.mock.inject({ type: 'malformed' }, { sqlIncludes: "FROM TDDCAM WHERE NOMETAB = 'TGFPAR'" });
+    const res = await query(h, cookie, { sql: 'SELECT * FROM TGFPAR' });
+    expect(res.statusCode, res.body).toBe(502);
+    expect(codeOf(res)).toBe('SANKHYA_API_ERROR');
+    expect(reads(h.mock, 'FROM TGFPAR')).toBe(0);
   });
 });

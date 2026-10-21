@@ -16,6 +16,7 @@ import {
   authorizeConnection,
   connectionDenied,
   evaluateFor,
+  readCatalog,
   readTargets,
 } from '../services/read-policy';
 import type { PolicyDecision } from '@dbx/shared';
@@ -296,7 +297,10 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
       (catalog: Catalog) =>
       async (a: ReadAnalysis): Promise<ReadDecision> => {
         analysis = a;
-        const targets = readTargets(a, catalog);
+        const targets = readTargets(
+          a,
+          await readCatalog(catalog, a, (name) => metadata.table(connectionId, name)),
+        );
         policy = await evaluateFor({
           policies,
           auth,

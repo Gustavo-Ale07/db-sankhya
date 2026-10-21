@@ -41,6 +41,35 @@ export interface ReadTargets {
 }
 
 /**
+ * The catalog to attribute a read with (see readTargets). When the whole-dictionary column read
+ * failed or was cut at the gateway row cap, a table may be listed with only some of its columns,
+ * and a star expanded from that list would miss a denied column. The columns of every table of a
+ * read with a star are then read on their own (`table`, see MetadataService.table); a failed read
+ * throws, so the read is refused. A table that read does not find keeps no columns: its star
+ * stays `*`, which every column DENY on it hits.
+ */
+export async function readCatalog(
+  catalog: Catalog,
+  analysis: ReadAnalysis,
+  table: (name: string) => Promise<CatalogTable | undefined>,
+): Promise<Catalog> {
+  const partial = (catalog.degraded ?? []).some((d) => d.split(':')[0] === 'TDDCAM');
+  if (!partial || !analysis.star.some((s) => !s.inAggregate)) return catalog;
+  const read = new Map<string, CatalogTable | undefined>();
+  for (const name of new Set(analysis.tables.map((t) => t.name.toUpperCase()))) {
+    read.set(name, await table(name));
+  }
+  return {
+    ...catalog,
+    tables: catalog.tables.map((t) => {
+      const name = t.name.toUpperCase();
+      if (!read.has(name)) return t;
+      return read.get(name) ?? { ...t, columns: [] };
+    }),
+  };
+}
+
+/**
  * Entities and columns of an analyzed read, for the policy request. Attribution fails closed: a
  * column (or star) whose qualifier names no base table or alias (a CTE, a derived table) and an
  * unqualified column are attributed to every base table of the statement. A star is expanded

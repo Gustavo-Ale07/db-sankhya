@@ -29,6 +29,7 @@ import {
   authorizeConnection,
   connectionDenied,
   evaluateFor,
+  readCatalog,
   readTargets,
 } from '../services/read-policy';
 import {
@@ -295,7 +296,10 @@ export async function scratchRoutes(app: FastifyInstance): Promise<void> {
       const decideWith =
         (catalog: Catalog) =>
         async (a: ReadAnalysis): Promise<ReadDecision> => {
-          const targets = readTargets(a, catalog);
+          const targets = readTargets(
+            a,
+            await readCatalog(catalog, a, (name) => metadata.table(connectionId, name)),
+          );
           const check = {
             policies,
             auth,
