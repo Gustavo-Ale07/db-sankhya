@@ -378,6 +378,19 @@ export class MutationService {
       }
     }
 
+    // What no table could support (a Sankhya DELETE, a shape the save service cannot take) is
+    // refused as such first; it does not depend on the table, so it tells nothing about it.
+    const shape = resolveCapability(write, {
+      catalog: { tables: [{ name: write.table }] },
+      scratchTables: [],
+    });
+    if (shape.class === 'UNSUPPORTED' || shape.route !== 'SANKHYA_SAVE') {
+      throw refuse(
+        'AUTHORIZE',
+        new AppError('OPERATION_NOT_SUPPORTED', shape.reason, { capability: shape.class }),
+      );
+    }
+
     // The table alone first: a request without columns is never refused where the full one below
     // is allowed, and a table the caller may not change is refused before its dictionary is read,
     // so neither the cost nor a failure of that read tells it apart from one they may change.

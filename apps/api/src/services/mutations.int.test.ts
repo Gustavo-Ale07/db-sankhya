@@ -366,6 +366,18 @@ describe('MutationService.prepare', () => {
     expect(writeCalls(h.mock)).toEqual([]);
   });
 
+  it('a Sankhya DELETE is OPERATION_NOT_SUPPORTED even where no policy allows it, with no read', async () => {
+    const h = await setup();
+    const { auth } = await h.userWith(WRITER);
+    await h.clearPolicies();
+    const before = h.mock.calls.length;
+    await expect(prepare(h, auth, 'DELETE FROM TGFPAR WHERE CODPARC = 1')).rejects.toMatchObject({
+      code: 'OPERATION_NOT_SUPPORTED',
+      details: { capability: 'UNSUPPORTED' },
+    });
+    expect(h.mock.calls.slice(before)).toEqual([]);
+  });
+
   it('a policy DENY refuses the preview before any snapshot read; internals stay in the audit', async () => {
     const h = await setup();
     const { auth } = await h.userWith(WRITER);
