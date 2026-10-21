@@ -132,6 +132,10 @@ export interface QueryResult {
   executionId: string;
   connectionId: string;
   kind: string;
+  /** Where the read ran: the Sankhya gateway, the caller's scratch, or both (hybrid). */
+  source?: 'sankhya' | 'scratch' | 'hybrid';
+  /** The Sankhya parts a hybrid read copied into scratch, with their row counts. */
+  hybrid?: { parts: Array<{ tables: string[]; rows: number; truncated: boolean }> };
   resource: string | null;
   columns: ResultColumn[];
   rows: Value[][];

@@ -7,12 +7,17 @@ import type { Classified, ReadAnalysis } from '@dbx/sql-engine';
 import type { AuthState } from '../context';
 import type { Catalog } from '../services/metadata';
 import { ENV_CONNECTION_ID } from '../services/connections';
+import { dropEphemeral, isScratchName, planScratchRead } from '../services/hybrid';
+import type { ScratchRead } from '../services/hybrid';
+import { materialize } from '../services/materialize';
 import { ApprovalsService } from '../services/approvals';
 import { MutationService } from '../services/mutations';
 import { PlansService } from '../services/plans';
 import { executeRead } from '../services/read-executor';
 import type { PolicyDecision as ReadDecision } from '../services/read-executor';
 import {
+  SCRATCH_CONNECTION_ID,
+  SCRATCH_ENVIRONMENT,
   authorizeConnection,
   connectionDenied,
   evaluateFor,
@@ -36,6 +41,8 @@ const MUTATIONS_UNAVAILABLE = 'Mutations are not available yet.';
 /** /api/query never runs a mutation: INSERT / UPDATE / DELETE are only previewed (Task 11.2a). */
 const USE_PREVIEW = 'Mutations are never executed here. Preview them with /api/query/preview.';
 const PREVIEW_URL = '/api/query/preview';
+
+const DENIED = 'The statement was denied by policy';
 
 const EXECUTION_ID = /^[A-Za-z0-9_-]{8,64}$/;
 
@@ -178,6 +185,12 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
     const classified = classifyStatement(body.sql);
     const mutation = mutationKind(classified);
     if (mutation === null) {
+      // A SELECT that names a tmp_ table runs in the caller's scratch: alone, or (hybrid) with
+      // its Sankhya parts copied in first. tmp_ names never reach the Sankhya catalog.
+      if (classified.kind === 'SELECT' && classified.tables.some(isScratchName)) {
+        const hybrid = !classified.tables.every(isScratchName);
+        return scratchRead(request, reply, auth, body.sql, executionId, body.connectionId, hybrid);
+      }
       return sankhyaRead(request, reply, auth, body.sql, executionId, body.connectionId);
     }
     // INSERT / UPDATE / DELETE get a pointer to the preview; nothing is planned or sent here, so
@@ -372,6 +385,7 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
         executionId,
         connectionId,
         kind: 'SELECT',
+        source: 'sankhya',
         resource: resourceOf(),
         columns: out.columns.map((name) => ({ name, type: 'unknown' })),
         rows: out.rows,
@@ -423,6 +437,275 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
       });
       throw err;
     } finally {
+      reply.raw.off('close', onClose);
+      executions.finish(executionId);
+    }
+  }
+
+  /**
+   * A read of the caller's scratch tables, or a hybrid read (`hybrid`): each Sankhya part goes
+   * through the Sankhya read path once, under QUERY.SELECT and TEMP.MATERIALIZE exactly as
+   * /api/scratch/materialize, capped at min(SANKHYA_MAX_ROWS, MATERIALIZE_MAX_ROWS, policy), into
+   * an ephemeral table dropped afterwards (on error and cancel too). Every authorization (both
+   * permissions, the scratch read with its columns, the connection, the copy) is decided before
+   * the first gateway call.
+   */
+  async function scratchRead(
+    request: FastifyRequest,
+    reply: FastifyReply,
+    auth: AuthState,
+    sql: string,
+    executionId: string,
+    requested: string | undefined,
+    hybrid: boolean,
+  ) {
+    const started = performance.now();
+    const source = hybrid ? 'hybrid' : 'scratch';
+    // Echoed so the editor matches the result to the connection it asked for.
+    const connectionId = requested ?? (config.sankhya.envConnection ? ENV_CONNECTION_ID : null);
+    let plan: ScratchRead | undefined;
+    let resource: string | null = null;
+    let denied: PolicyDecision | undefined;
+    let apiCalls = 0;
+    let workspace: Awaited<ReturnType<typeof app.services.scratch.workspace>> | undefined;
+    const copied: ScratchRead['parts'] = [];
+
+    const controller = executions.start(executionId, auth.user.id);
+    const onClose = () => {
+      if (!reply.raw.writableEnded)
+        controller.abort(new AppError('QUERY_CANCELLED', 'The client disconnected'));
+    };
+    reply.raw.once('close', onClose);
+    const forbidden = (decision: PolicyDecision) => {
+      denied = decision;
+      return new AppError('FORBIDDEN', DENIED);
+    };
+    try {
+      requirePermission(request, 'QUERY.SELECT');
+      if (hybrid) requirePermission(request, 'TEMP.MATERIALIZE');
+      plan = planScratchRead(sql, hybrid);
+      const { parts, statement } = plan;
+      const ephemeral = new Set(parts.map((p) => p.into));
+      resource = statement.tables.find((t) => !ephemeral.has(t)) ?? null;
+      const groupIds = await authz.activeGroupIds(auth.user.id);
+
+      // The scratch side: the columns the statement reads from the caller's own tables (the
+      // ephemeral copies are judged on the Sankhya side, column by column).
+      const read = await evaluateFor({
+        policies,
+        auth,
+        groupIds,
+        action: 'QUERY.SELECT',
+        environment: SCRATCH_ENVIRONMENT,
+        connectionId: SCRATCH_CONNECTION_ID,
+        entities: statement.tables.filter((t) => !ephemeral.has(t)),
+        columns: (statement.columns ?? []).filter((c) => !ephemeral.has(c.table)),
+        defaults: { maxReadRows: config.scratch.maxRows },
+      });
+      if (read.effect !== 'ALLOW') throw forbidden(read);
+
+      const hybridParts: Array<{ tables: string[]; rows: number; truncated: boolean }> = [];
+      workspace = await app.services.scratch.workspace(auth.user.id);
+      if (parts.length > 0) {
+        const sourceId = requested ?? defaultConnection();
+        const defaults = { maxReadRows: config.materializeMaxRows };
+        const target = await evaluateFor({
+          policies,
+          auth,
+          groupIds,
+          action: 'TEMP.MATERIALIZE',
+          environment: SCRATCH_ENVIRONMENT,
+          connectionId: SCRATCH_CONNECTION_ID,
+          entities: parts.map((p) => p.into),
+          defaults,
+        });
+        if (target.effect !== 'ALLOW') throw forbidden(target);
+        const access = await authorizeConnection({
+          policies,
+          auth,
+          groupIds,
+          action: 'QUERY.SELECT',
+          connectionId: sourceId,
+          connections,
+          defaults,
+        });
+        if (!access.ok) throw connectionDenied();
+        const sourceAccess = await evaluateFor({
+          policies,
+          auth,
+          groupIds,
+          action: 'TEMP.MATERIALIZE',
+          environment: access.environment,
+          connectionId: sourceId,
+          entities: [],
+          columns: [],
+          defaults,
+        });
+        if (sourceAccess.effect !== 'ALLOW') throw forbidden(sourceAccess);
+
+        const decideWith = async (a: ReadAnalysis, catalog: Catalog): Promise<ReadDecision> => {
+          const targets = readTargets(
+            a,
+            await readCatalog(catalog, a, (name) => metadata.table(sourceId, name)),
+          );
+          const check = {
+            policies,
+            auth,
+            groupIds,
+            environment: access.environment,
+            connectionId: sourceId,
+            entities: targets.entities,
+            columns: targets.columns,
+            defaults,
+          };
+          const select = await evaluateFor({ ...check, action: 'QUERY.SELECT' });
+          if (select.effect !== 'ALLOW') {
+            denied = select;
+            return { effect: 'DENY', reason: 'The read was denied by policy' };
+          }
+          const copy = await evaluateFor({ ...check, action: 'TEMP.MATERIALIZE' });
+          if (copy.effect !== 'ALLOW') {
+            denied = copy;
+            return { effect: 'DENY', reason: DENIED };
+          }
+          apiCalls += 1;
+          return {
+            effect: 'ALLOW',
+            maxRows: Math.min(
+              target.limits.maxReadRows,
+              select.limits.maxReadRows,
+              copy.limits.maxReadRows,
+            ),
+          };
+        };
+        const runtime = await connections.getRuntime(sourceId);
+        const catalog = await metadata.get(sourceId);
+        // One part at a time, each read exactly once.
+        for (const part of parts) {
+          copied.push(part);
+          const out = await materialize({
+            runtime,
+            workspace,
+            sql: part.sql,
+            into: part.into,
+            maxRows: Math.min(config.sankhya.maxRows, config.materializeMaxRows),
+            decide: decideWith,
+            findTable: (name) =>
+              findVisibleTable(
+                {
+                  policies,
+                  auth,
+                  groupIds,
+                  environment: access.environment,
+                  connectionId: sourceId,
+                },
+                name,
+                (n) => metadata.table(sourceId, n),
+              ),
+            catalog,
+            signal: controller.signal,
+          });
+          hybridParts.push({ tables: part.tables, rows: out.rows, truncated: out.truncated });
+        }
+      }
+
+      const out = await workspace.execStatement(statement, controller.signal, {
+        maxResultRows: read.limits.maxReadRows,
+      });
+      const durationMs = Math.round(performance.now() - started);
+      await safeHistory(request, {
+        userId: auth.user.id,
+        executionId,
+        sql,
+        status: 'success',
+        operation: 'SELECT',
+        resource,
+        durationMs,
+        resultRows: out.rows.length,
+        apiCalls,
+      });
+      await audit.record({
+        ...auditBase(request, auth),
+        action: 'read.executed',
+        status: 'success',
+        operation: 'SELECT',
+        resource,
+        statement: sql,
+        connectionId: SCRATCH_CONNECTION_ID,
+        environment: SCRATCH_ENVIRONMENT,
+        durationMs,
+        details: {
+          source,
+          connectionId,
+          rowCount: out.rows.length,
+          truncated: out.truncated,
+          ...(hybrid ? { parts: hybridParts } : {}),
+        },
+      });
+      return redact({
+        type: 'result',
+        executionId,
+        connectionId,
+        kind: 'SELECT',
+        source,
+        ...(hybrid ? { hybrid: { parts: hybridParts } } : {}),
+        resource,
+        columns: out.columns.map((name) => ({ name, type: 'unknown' })),
+        rows: out.rows,
+        rowCount: out.rows.length,
+        truncated: out.truncated,
+        apiCalls,
+        durationMs,
+        messages: [
+          ...hybridParts
+            .filter((p) => p.truncated)
+            .map((p) => `Sankhya part (${p.tables.join(', ')}) cut at ${p.rows} rows.`),
+          ...(out.truncated ? [`Result truncated to ${out.rows.length} rows.`] : []),
+        ],
+      });
+    } catch (err) {
+      const code = isAppError(err) ? err.code : 'INTERNAL_ERROR';
+      if (isAppError(err) && (code === 'SQL_FORBIDDEN' || code === 'FORBIDDEN')) {
+        await audit.record({
+          ...auditBase(request, auth),
+          action: 'read.denied',
+          status: 'denied',
+          operation: 'SELECT',
+          resource,
+          statement: sql,
+          errorCode: code,
+          errorMessage: err.message,
+          details: {
+            source,
+            connectionId,
+            ...(denied
+              ? {
+                  reasons: denied.reasons,
+                  matchedRuleIds: denied.matchedRuleIds,
+                  policyVersion: denied.policyVersion,
+                }
+              : {}),
+          },
+        });
+      }
+      await safeHistory(request, {
+        userId: auth.user.id,
+        executionId,
+        sql,
+        status: code === 'QUERY_CANCELLED' ? 'cancelled' : 'error',
+        operation: plan ? 'SELECT' : null,
+        resource,
+        durationMs: Math.round(performance.now() - started),
+        apiCalls,
+        errorCode: code,
+      });
+      throw err;
+    } finally {
+      if (workspace && copied.length > 0) {
+        await dropEphemeral(workspace, copied, (err) =>
+          request.log.error({ err }, 'failed to drop an ephemeral hybrid table'),
+        );
+      }
       reply.raw.off('close', onClose);
       executions.finish(executionId);
     }
