@@ -188,3 +188,28 @@ GIT_COMMIT=$(git rev-parse --short HEAD) docker compose up -d --build
 Migrations are versioned and applied when the app starts. Read the release notes first: upgrading
 from a version before the permission catalog changes what administrators can do (see
 [permissions.md](permissions.md#upgrading-from-an-earlier-version)).
+
+### Controlled publication
+
+Publish a release with writes off and check it read-only before anyone relies on it.
+
+1. **Before.** Note the running commit (`GET /api/meta`) as the rollback target, take the
+   `pre-upgrade.dump` above, and confirm `SAFE_MODE=true`, `GLOBAL_WRITE_ENABLED=false` and
+   `WRITE_TO_SANKHYA=false` in the environment. Do not change `.env` for the upgrade.
+2. **Build and start** the new commit as above. Migrations run on start; a release without new
+   files under `packages/database/migrations` changes no table.
+3. **Health.** `GET /health/live` and `GET /health/ready` answer 200; `GET /api/meta` shows the new
+   commit; `docker compose logs app` has no `error` lines from the start.
+4. **Read-only smoke test** (as a user with `QUERY.SELECT`):
+   - **Status** shows writes unavailable and the three switches off;
+   - the schema tree loads; time the first `GET /api/schema` (the first catalog load reads the
+     dictionary in pages, see [sankhya.md](sankhya.md#data-dictionary)) and look for
+     `degraded` in its response;
+   - a `SELECT` of a few rows from a table you may read returns them; a column a policy denies is
+     still refused;
+   - expanding a large table in the schema tree lists all its columns;
+   - an `UPDATE` preview of a known column (on a row you choose, without executing) shows the
+     plan; **Executar** stays disabled and `/api/query/execute` answers `READ_ONLY_MODE`.
+5. **Watch** the logs for `SANKHYA_*` errors and catalog read times during the first hour.
+6. **Rollback.** Check out the previous commit and rebuild it the same way. Restore the dump only
+   if a migration of the new release ran and must be undone.

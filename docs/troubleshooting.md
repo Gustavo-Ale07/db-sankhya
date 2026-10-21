@@ -62,6 +62,17 @@ docker compose exec app node dist/admin.mjs reset-password --email admin@example
 | `RESOURCE_NOT_FOUND`     | The table is not in the connection's catalog. Check the schema tree.                                                                                        |
 | `SANKHYA_NOT_CONFIGURED` | No Sankhya connection is ready. Set the `SANKHYA_*` variables or register a connection.                                                                     |
 
+### `COLUMN_NOT_FOUND` on a column that exists in the ERP
+
+Before this release, the column dictionary (`TDDCAM`) was read in one query that the gateway cut
+at its row cap, and a mutation preview could refuse a real column (for example `TGFPAR.NOMEPARC`).
+The dictionary is now read in pages, and previews, `SELECT *`, DDL and the schema tree read the
+table on its own when the catalog is partial ([sankhya.md](sankhya.md#data-dictionary)). If the
+error persists, check with read-only queries in the editor:
+`SELECT COUNT(*) FROM TDDCAM` and `SELECT NOMECAMPO FROM TDDCAM WHERE NOMETAB = 'TGFPAR'`.
+A `SANKHYA_API_ERROR` on a preview means the table's own dictionary read failed; nothing was
+planned. Preview again.
+
 ## Gateway errors
 
 | Code                   | Meaning                                                                                          |

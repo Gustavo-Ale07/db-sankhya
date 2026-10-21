@@ -102,6 +102,23 @@ only partly is cached for one minute. Every table a statement uses must exist in
 Column names of the dictionary vary between versions; the adapter tolerates missing optional
 columns.
 
+`TDDCAM` usually holds more rows than the gateway returns for one query. It is read in pages
+ordered by `NUCAMPO` (`WHERE NUCAMPO > <last key>`), up to 100 pages, and the rows read must match
+`SELECT COUNT(*) FROM TDDCAM`. A page that fails, a count that differs or the page limit marks the
+catalog `TDDCAM:truncated` or `TDDCAM:failed`. A gateway that refuses the paged query falls back to
+one unpaged read, which a big dictionary cuts at the row cap.
+
+When the catalog is partial, nothing that needs every column of a table trusts it. Mutation
+previews, `SELECT *` expansion, DDL generation, the schema tree and editor autocomplete read the
+table on its own (`FROM TDDCAM WHERE NOMETAB = '<table>'`, through
+`GET /api/schema/tables/:name`); that read is cached per connection and dropped when the catalog is
+refreshed. If it fails too, the request fails with `SANKHYA_API_ERROR` (502) instead of using
+partial columns. A column that is in neither read does not exist and is refused.
+
+The first catalog load reads several pages; on a large dictionary it takes longer than the old
+single read. Watch the duration of the first `GET /api/schema` after a deploy, and the reverse
+proxy's read timeout (the load continues and is cached even if the browser gives up).
+
 ## Environments
 
 Each connection declares the environment it points at. The environment drives the policy and the
