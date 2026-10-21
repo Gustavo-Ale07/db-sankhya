@@ -307,7 +307,8 @@ export async function ddlRoutes(app: FastifyInstance): Promise<void> {
           artifacts: Artifact[];
         };
       } catch (err) {
-        if (isAppError(err) && true) {
+        // Asking for the typed confirmation is a step of the flow, not a denial.
+        if (isAppError(err) && err.code !== 'CONFIRMATION_REQUIRED') {
           const { reasons, matchedRuleIds, policyVersion } = (err.details ?? {}) as Record<
             string,
             unknown

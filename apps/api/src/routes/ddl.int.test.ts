@@ -312,11 +312,16 @@ describe('POST /api/ddl/artifact', () => {
     const first = await h.ddl(cookie, { sql });
     expect(first.statusCode, first.body).toBe(428);
     expect(codeOf(first)).toBe('CONFIRMATION_REQUIRED');
+    expect((await auditOf(h, 'ddl.denied')).total).toBe(0);
     for (const confirm of ['DESTRUCTIVE ad_exemplo', 'destructive AD_EXEMPLO', 'yes', '']) {
       const wrong = await h.ddl(cookie, { sql, confirm });
       expect(wrong.statusCode, confirm).toBe(400);
       expect(codeOf(wrong), confirm).toBe('CONFIRMATION_INVALID');
     }
+    // A wrong confirmation is refused and audited.
+    expect((await auditOf(h, 'ddl.denied')).items[0]).toMatchObject({
+      errorCode: 'CONFIRMATION_INVALID',
+    });
     const ok = await h.ddl(cookie, { sql, confirm: 'DESTRUCTIVE AD_EXEMPLO' });
     expect(ok.statusCode, ok.body).toBe(200);
     expect(ok.json().severity).toBe('DESTRUCTIVE');
@@ -333,9 +338,8 @@ describe('POST /api/ddl/artifact', () => {
     const res = await h.ddl(cookie, { sql: same });
     expect(res.statusCode, res.body).toBe(428);
     expect(res.body).toContain('Cannot verify');
-    expect((await auditOf(h, 'ddl.denied')).items[0]).toMatchObject({
-      errorCode: 'CONFIRMATION_REQUIRED',
-    });
+    // Asking for the confirmation is a step of the flow, not a denial.
+    expect((await auditOf(h, 'ddl.denied')).total).toBe(0);
     const ok = await h.ddl(cookie, { sql: same, confirm: 'DESTRUCTIVE AD_EXEMPLO' });
     expect(ok.statusCode, ok.body).toBe(200);
     expect(ok.json().severity).toBe('DESTRUCTIVE');
