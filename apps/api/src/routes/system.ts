@@ -1,4 +1,4 @@
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { AppError } from '@dbx/shared';
 import {
@@ -10,9 +10,11 @@ import {
   requirePermission,
 } from '../http';
 import { ENV_CONNECTION_ID } from '../services/connections';
+import type { Catalog } from '../services/metadata';
 import { authorizeConnection, connectionDenied, visibleCatalog } from '../services/read-policy';
 
 const schemaQuery = z.object({ connectionId: connectionIdSchema.optional() }).strict();
+const tableParams = z.object({ name: z.string().min(1).max(128) }).strict();
 
 const READY_TIMEOUT_MS = 2000;
 
@@ -66,7 +68,11 @@ export async function systemRoutes(app: FastifyInstance): Promise<void> {
     demoMode: config.demoMode,
   }));
 
-  app.get('/api/schema', async (request, reply) => {
+  /**
+   * Who reads the catalog of which connection: QUERY.SELECT and a connection the policy lets the
+   * user read. An unknown connection gets the same answer as a denied one, and is audited.
+   */
+  async function schemaAccess(request: FastifyRequest) {
     const auth = requirePermission(request, 'QUERY.SELECT');
     const { connectionId: requested } = parseBody(schemaQuery, request.query);
     let connectionId = requested;
@@ -79,8 +85,6 @@ export async function systemRoutes(app: FastifyInstance): Promise<void> {
       }
       connectionId = ENV_CONNECTION_ID;
     }
-    // The catalog is only loaded for a connection the policy lets this user read; an unknown
-    // connection gets the same answer as a denied one.
     const groupIds = await authz.activeGroupIds(auth.user.id);
     const access = await authorizeConnection({
       policies,
@@ -107,14 +111,43 @@ export async function systemRoutes(app: FastifyInstance): Promise<void> {
       });
       throw err;
     }
-    // Only the tables and columns this user may read are listed (names are disclosure too).
-    const catalog = await visibleCatalog(
-      { policies, auth, groupIds, environment: access.environment, connectionId },
-      await metadata.get(connectionId),
-      (err) => request.log.error({ err }, 'Catalog policy filter failed: serving no table'),
-    );
+    return {
+      connectionId,
+      // Only the tables and columns this user may read are listed (names are disclosure too).
+      visible: (catalog: Catalog) =>
+        visibleCatalog(
+          { policies, auth, groupIds, environment: access.environment, connectionId },
+          catalog,
+          (err) => request.log.error({ err }, 'Catalog policy filter failed: serving no table'),
+        ),
+    };
+  }
+
+  app.get('/api/schema', async (request, reply) => {
+    const { connectionId, visible } = await schemaAccess(request);
+    const catalog = await visible(await metadata.get(connectionId));
     noStore(reply);
     return redact({ connectionId, catalog });
+  });
+
+  /**
+   * One table with every column, read on its own from the dictionary: the whole catalog may have
+   * been cut at the gateway row cap. A table the user may not see, one the connection does not
+   * have and a name that is no identifier all get the same answer.
+   */
+  app.get('/api/schema/tables/:name', async (request, reply) => {
+    const { name } = parseBody(tableParams, request.params);
+    const { connectionId, visible } = await schemaAccess(request);
+    const found = await metadata.table(connectionId, name);
+    const catalog = await visible({
+      tables: found ? [found] : [],
+      fetchedAt: new Date().toISOString(),
+      source: 'dictionary',
+    });
+    const table = catalog.tables[0];
+    if (!table) throw new AppError('RESOURCE_NOT_FOUND', 'Table not found');
+    noStore(reply);
+    return redact({ connectionId, table });
   });
 
   app.get('/api/status', async (request, reply) => {

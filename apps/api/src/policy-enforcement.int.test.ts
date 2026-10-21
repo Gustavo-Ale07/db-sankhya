@@ -879,6 +879,62 @@ describe('a dictionary bigger than the gateway row cap', () => {
     expect(reads(h.mock, 'WHERE NOMETAB =')).toBe(0);
   });
 
+  const tableRoute = (h: Harness, cookie: string | null, name: string, connectionId?: string) =>
+    h.call(cookie, {
+      method: 'GET',
+      url: `/api/schema/tables/${encodeURIComponent(name)}${connectionId ? `?connectionId=${connectionId}` : ''}`,
+    });
+
+  it('lists every column of a table on demand, minus the columns the reader may not see', async () => {
+    const h = await setup({}, undefined, CUT);
+    await cut(h);
+    await h.policy({ columns: ['TGFPAR.EMAIL'] });
+    const { cookie } = await h.viewer();
+    const res = await tableRoute(h, cookie, 'tgfpar');
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json().connectionId).toBe('env-default');
+    const names = (res.json().table as SchemaTable).columns.map((c) => c.name);
+    expect(names).toEqual(expect.arrayContaining(['CODPARC', 'NOMEPARC', 'RAZAOSOCIAL']));
+    expect(res.body).not.toContain('EMAIL');
+    expect(reads(h.mock, 'FROM TGFPAR')).toBe(0);
+  });
+
+  it('answers a hidden, an unknown and a malformed table the same way', async () => {
+    const h = await setup({}, undefined, CUT);
+    await h.policy({ entities: ['TSICID'] });
+    const { cookie } = await h.viewer();
+    const answers = [];
+    for (const name of ['TSICID', 'TGFNAOEXISTE', "TGFPAR' OR '1'='1"]) {
+      const res = await tableRoute(h, cookie, name);
+      expect(res.statusCode, res.body).toBe(400);
+      expect(codeOf(res)).toBe('RESOURCE_NOT_FOUND');
+      answers.push(errorOf(res));
+    }
+    expect(new Set(answers.map((a) => JSON.stringify(a))).size).toBe(1);
+    expect(reads(h.mock, 'OR')).toBe(0);
+  });
+
+  it('requires a session, QUERY.SELECT and access to the connection', async () => {
+    const h = await setup({}, undefined, CUT);
+    expect((await tableRoute(h, null, 'TGFPAR')).statusCode).toBe(401);
+    const { cookie: noRead } = await h.userWith(['TEMP.CREATE']);
+    expect((await tableRoute(h, noRead, 'TGFPAR')).statusCode).toBe(403);
+    const { cookie } = await h.viewer();
+    const unknown = await tableRoute(h, cookie, 'TGFPAR', UNKNOWN_CONNECTION);
+    expect(unknown.statusCode).toBe(403);
+    expect(codeOf(unknown)).toBe('FORBIDDEN');
+    expect(reads(h.mock, "NOMETAB = 'TGFPAR'")).toBe(0);
+  });
+
+  it('refuses the table when its metadata cannot be read, instead of listing fewer columns', async () => {
+    const h = await setup({}, undefined, CUT);
+    const { cookie } = await h.viewer();
+    h.mock.inject({ type: 'malformed' }, { sqlIncludes: "FROM TDDCAM WHERE NOMETAB = 'TGFPAR'" });
+    const res = await tableRoute(h, cookie, 'TGFPAR');
+    expect(res.statusCode, res.body).toBe(502);
+    expect(codeOf(res)).toBe('SANKHYA_API_ERROR');
+  });
+
   it('refuses SELECT * when the table metadata cannot be read (fail closed)', async () => {
     const h = await setup({}, undefined, CUT);
     await cut(h);
