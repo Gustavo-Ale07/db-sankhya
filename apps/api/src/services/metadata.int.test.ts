@@ -429,6 +429,16 @@ describe('MetadataService, a dictionary bigger than the gateway row cap', () => 
     expect(catalog.degraded).toContain('TDDCAM:truncated');
     expect(pages(mock)).toHaveLength(MAX_FIELD_PAGES);
   });
+
+  it('stops after the configured number of pages', async () => {
+    const { conns, conn, mock, database } = await setup({ dictionaryPadding: 400, queryRowCap: 3 });
+    const svc = new MetadataService(database.db, {
+      getRuntime: (id) => conns.getRuntime(id),
+      maxPages: 5,
+    });
+    expect((await svc.get(conn.id)).degraded).toContain('TDDCAM:truncated');
+    expect(pages(mock)).toHaveLength(5);
+  });
 });
 
 describe('MetadataService, a gateway that cuts at its row cap without saying so', () => {

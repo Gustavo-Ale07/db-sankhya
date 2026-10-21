@@ -56,6 +56,8 @@ export interface MetadataDeps {
   ttlMs?: number;
   /** How long a degraded catalog is served before it is read again (DEGRADED_TTL_MS). */
   degradedTtlMs?: number;
+  /** At most this many pages of one dictionary read (MAX_FIELD_PAGES). */
+  maxPages?: number;
 }
 
 /** How long a discovered catalog is served before the dictionary is read again. */
@@ -137,7 +139,7 @@ const TABLES_READ: PagedRead = {
   count: countSql('TDDTAB'),
 };
 
-/** At most this many pages of one dictionary read; a bigger one is reported as cut. */
+/** Default of METADATA_MAX_PAGES: pages of one dictionary read; a bigger one is reported as cut. */
 export const MAX_FIELD_PAGES = 100;
 
 /** The dictionary reads of one table; `name` is a validated TABLE_NAME, never caller text. */
@@ -203,6 +205,7 @@ export class MetadataService {
   private readonly now: () => number;
   private readonly ttlMs: number;
   private readonly degradedTtlMs: number;
+  private readonly maxPages: number;
 
   constructor(
     private readonly db: Database,
@@ -211,6 +214,7 @@ export class MetadataService {
     this.now = deps.now ?? Date.now;
     this.ttlMs = deps.ttlMs ?? METADATA_TTL_MS;
     this.degradedTtlMs = deps.degradedTtlMs ?? DEGRADED_TTL_MS;
+    this.maxPages = deps.maxPages ?? MAX_FIELD_PAGES;
   }
 
   async get(connectionId: string, opts: { refresh?: boolean } = {}): Promise<Catalog> {
@@ -398,7 +402,7 @@ export class MetadataService {
     let tablesResult: QueryResult;
     try {
       tablesResult =
-        (await readPaged(run, degraded, TABLES_READ)) ??
+        (await readPaged(run, degraded, TABLES_READ, this.maxPages)) ??
         (await checked('TDDTAB', await run(TABLES_SQL), TABLES_READ.count));
     } catch (err) {
       throw new AppError(
@@ -410,7 +414,7 @@ export class MetadataService {
     }
     // The remaining reads only add detail; losing one must not fail the catalog.
     const fields =
-      (await readPaged(run, degraded, FIELDS_READ).catch(() => undefined)) ??
+      (await readPaged(run, degraded, FIELDS_READ, this.maxPages).catch(() => undefined)) ??
       (await read('TDDCAM', FIELDS_SQL, FIELDS_READ.count));
     const entities = await read('TDDINS', ENTITIES_SQL + ENTITIES_ORDER, countSql('TDDINS'));
     const pk = pkSql(runtime.dialect);
@@ -527,13 +531,14 @@ async function readPaged(
   run: (sql: string) => Promise<QueryResult>,
   degraded: string[],
   read: PagedRead,
+  maxPages: number,
 ): Promise<QueryResult | undefined> {
   let columns: string[] = [];
   const rows: unknown[][] = [];
   const seen = new Set<string>();
   let total: number | undefined | null = null;
   let after: string | undefined;
-  for (let page = 0; page < MAX_FIELD_PAGES; page++) {
+  for (let page = 0; page < maxPages; page++) {
     const result = page ? await optional(() => run(read.page(after))) : await run(read.page());
     if (!result) {
       degraded.push(`${read.label}:failed`);

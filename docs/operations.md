@@ -150,7 +150,8 @@ These are known behaviours to keep in mind when reading results and audit record
 - **Plans from before an upgrade.** A Sankhya plan previewed before the entity instance was frozen
   in plans is refused at execution (`CONFIRMATION_INVALID`). Preview it again.
 - **An incomplete catalog.** A degraded catalog is never stored and is read again after
-  `METADATA_DEGRADED_TTL_SECONDS` (default 600). `POST /api/schema/refresh` (the refresh button of
+  `METADATA_DEGRADED_TTL_SECONDS` (default 600). A dictionary bigger than `METADATA_MAX_PAGES`
+  pages of the gateway's row cap (default 100) is always cut; raise it rather than read it again. `POST /api/schema/refresh` (the refresh button of
   the schema tree) reads it now; it is rate limited and audited as `schema.refresh`. Changing a
   connection or its secrets drops its catalog. See [sankhya.md](sankhya.md#data-dictionary).
 

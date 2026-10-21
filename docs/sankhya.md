@@ -103,7 +103,7 @@ dictionary vary between versions; the adapter tolerates missing optional columns
 
 `TDDTAB` and `TDDCAM` can hold more rows than the gateway returns for one query. They are read in
 pages (`TDDTAB` by `NOMETAB`, `TDDCAM` by `NUCAMPO`, each page starting after the last key of the
-one before), up to 100 pages. **Every dictionary read is checked against its own count**
+one before), up to `METADATA_MAX_PAGES` pages (default 100, 1 to 1000). **Every dictionary read is checked against its own count**
 (`SELECT COUNT(*) AS TOTAL FROM ...`; the primary-key query is counted as a subquery), because a
 gateway may cut a result at its row cap without flagging it: a page that comes back short is
 followed by the next one until the rows add up. A page that fails or repeats a key, a count that

@@ -85,6 +85,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     metadata: new MetadataService(database.db, {
       getRuntime: (id) => connections.getRuntime(id),
       degradedTtlMs: config.metadataDegradedTtlSeconds * 1000,
+      maxPages: config.metadataMaxPages,
     }),
     policies: new PolicyService(database.db, app.log),
     security: new SecuritySettingsService(database.db, config, app.log),
