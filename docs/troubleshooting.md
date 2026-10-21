@@ -59,7 +59,7 @@ docker compose exec app node dist/admin.mjs reset-password --email admin@example
 | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `SQL_FORBIDDEN`          | The read gate or analyzer refused the statement (comments, several statements, write keywords, an unknown construct). See [sql-dialect.md](sql-dialect.md). |
 | `SQL_UNSUPPORTED`        | A mutation sent to the read route. Use the write dialog (preview, then confirm); DDL is not executed. See [capabilities.md](capabilities.md).               |
-| `RESOURCE_NOT_FOUND`     | The table is not in the connection's catalog. Check the schema tree.                                                                                        |
+| `RESOURCE_NOT_FOUND`     | The table is not in the connection's catalog, or you may not see it. Check the schema tree; for "the catalog is incomplete", see below.                     |
 | `SANKHYA_NOT_CONFIGURED` | No Sankhya connection is ready. Set the `SANKHYA_*` variables or register a connection.                                                                     |
 
 ### `COLUMN_NOT_FOUND` on a column that exists in the ERP
@@ -72,6 +72,23 @@ error persists, check with read-only queries in the editor:
 `SELECT COUNT(*) FROM TDDCAM` and `SELECT NOMECAMPO FROM TDDCAM WHERE NOMETAB = 'TGFPAR'`.
 A `SANKHYA_API_ERROR` on a preview means the table's own dictionary read failed; nothing was
 planned. Preview again.
+
+### The schema tree says the catalog is incomplete
+
+The dictionary could not be read whole (the response of `GET /api/schema` lists `degraded`, for
+example `TDDCAM:truncated`). Nothing is stored; the catalog is read again after
+`METADATA_DEGRADED_TTL_SECONDS` (10 minutes by default), or now with the refresh button
+(`POST /api/schema/refresh`, at most 6 a minute). Tables and columns missing from it are still read
+on their own when a query, preview or the tree needs them. If it stays degraded, check with
+read-only queries: `SELECT COUNT(*) AS TOTAL FROM TDDTAB`, `SELECT COUNT(*) AS TOTAL FROM TDDCAM`
+and `SELECT COUNT(*) AS TOTAL FROM TDDINS`. A gateway that refuses `COUNT(*)` keeps the catalog
+degraded; see [sankhya.md](sankhya.md#data-dictionary).
+
+### A write is refused because the table has several instances
+
+`TDDINS` lists more than one entity instance for the table, and which one to save through cannot
+be chosen yet (_decisão pendente_). Nothing was planned. A plan whose instance changed between
+preview and execution is refused with `CONFIRMATION_INVALID`; preview again.
 
 ## Gateway errors
 

@@ -147,6 +147,12 @@ These are known behaviours to keep in mind when reading results and audit record
   again. A plan can be executed once (`CONFIRMATION_USED`); repeating with the same
   `idempotencyKey` returns the first result.
 - **`TARGETS_CHANGED`.** The rows changed between preview and execution. Preview again.
+- **Plans from before an upgrade.** A Sankhya plan previewed before the entity instance was frozen
+  in plans is refused at execution (`CONFIRMATION_INVALID`). Preview it again.
+- **An incomplete catalog.** A degraded catalog is never stored and is read again after
+  `METADATA_DEGRADED_TTL_SECONDS` (default 600). `POST /api/schema/refresh` (the refresh button of
+  the schema tree) reads it now; it is rate limited and audited as `schema.refresh`. Changing a
+  connection or its secrets drops its catalog. See [sankhya.md](sankhya.md#data-dictionary).
 
 ## Health, logs and version
 

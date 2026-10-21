@@ -97,16 +97,42 @@ Other points not verified against a real installation:
 
 The catalog is read from the ERP dictionary tables `TDDTAB` (tables), `TDDCAM` (fields) and
 `TDDINS` (entity instances) through `executeQuery`, plus a primary-key query for the connection's
-dialect (`SANKHYA_DIALECT`: `oracle` or `mssql`). It is cached for one hour; a catalog that loaded
-only partly is cached for one minute. Every table a statement uses must exist in the catalog.
-Column names of the dictionary vary between versions; the adapter tolerates missing optional
-columns.
+dialect (`SANKHYA_DIALECT`: `oracle` or `mssql`). A whole catalog is cached for one hour, in memory
+and in the database. Every table a statement uses must exist in the catalog. Column names of the
+dictionary vary between versions; the adapter tolerates missing optional columns.
 
-`TDDCAM` usually holds more rows than the gateway returns for one query. It is read in pages
-ordered by `NUCAMPO` (`WHERE NUCAMPO > <last key>`), up to 100 pages, and the rows read must match
-`SELECT COUNT(*) FROM TDDCAM`. A page that fails, a count that differs or the page limit marks the
-catalog `TDDCAM:truncated` or `TDDCAM:failed`. A gateway that refuses the paged query falls back to
-one unpaged read, which a big dictionary cuts at the row cap.
+`TDDTAB` and `TDDCAM` can hold more rows than the gateway returns for one query. They are read in
+pages (`TDDTAB` by `NOMETAB`, `TDDCAM` by `NUCAMPO`, each page starting after the last key of the
+one before), up to 100 pages. **Every dictionary read is checked against its own count**
+(`SELECT COUNT(*) AS TOTAL FROM ...`; the primary-key query is counted as a subquery), because a
+gateway may cut a result at its row cap without flagging it: a page that comes back short is
+followed by the next one until the rows add up. A page that fails or repeats a key, a count that
+differs or cannot be read, or the page limit marks the catalog degraded, for example
+`TDDCAM:truncated`, `TDDINS:truncated` or `PK:failed`. A gateway that refuses the paged query falls
+back to one checked unpaged read. A first `TDDTAB` read that fails fails the catalog.
+
+**A degraded catalog** is never stored in the database. It is kept in memory for
+`METADATA_DEGRADED_TTL_SECONDS` (default 600, 10 minutes). After that it is still answered at once
+while one discovery reads the dictionary again behind it, until it is one hour old; an older one is
+read again before answering. `POST /api/schema/refresh?connectionId=...` reads it again now: it
+needs `QUERY.SELECT` and access to the connection, answers the catalog filtered like
+`GET /api/schema`, is limited to 6 calls per minute and is audited as `schema.refresh` (operation
+`SCHEMA`, with the `degraded` list). Updating a connection, replacing its secrets or deleting it
+drops its catalog and the tables read on their own; a discovery that was running at that moment
+answers its caller but is not kept.
+
+When the table list itself is degraded (`TDDTAB:truncated`, or `TDDTAB:failed` on a later page), a
+read of a table missing from it looks the table up on its own before refusing it. A table the user
+may not see is not looked up and gets the same `RESOURCE_NOT_FOUND` as a table that does not
+exist; a lookup that fails refuses too.
+
+**Entity instances (`TDDINS`).** A Sankhya write saves through the entity instance the dictionary
+names for the table. The instance is frozen in the plan when it is previewed (it is part of the
+preview, and so of the hash the user confirms); at execution the dictionary is read again and a
+different instance refuses the plan (`CONFIRMATION_INVALID`, audited as a denied plan). A table
+`TDDINS` lists with more than one instance is refused at preview until the instance to use can be
+configured (_decisão pendente_). Plans previewed before this release carry no instance and are
+refused at execution; preview them again.
 
 When the catalog is partial, nothing that needs every column of a table trusts it. Mutation
 previews, `SELECT *` expansion, DDL generation, the schema tree and editor autocomplete read the
@@ -115,9 +141,23 @@ table on its own (`FROM TDDCAM WHERE NOMETAB = '<table>'`, through
 refreshed. If it fails too, the request fails with `SANKHYA_API_ERROR` (502) instead of using
 partial columns. A column that is in neither read does not exist and is refused.
 
-The first catalog load reads several pages; on a large dictionary it takes longer than the old
-single read. Watch the duration of the first `GET /api/schema` after a deploy, and the reverse
+The first catalog load reads several pages and one count per read (8 gateway queries for a
+dictionary where each read fits in one page); on a large dictionary it takes longer than the old
+single read. Whether the real gateway accepts `COUNT(*)` on the dictionary and the counted
+primary-key subquery has not been verified: if it does not, the catalog is always degraded
+(fail closed) and the tables read on their own still work. Watch the duration of the first `GET /api/schema` after a deploy, and the reverse
 proxy's read timeout (the load continues and is cached even if the browser gives up).
+
+### Testing a cut dictionary with the mock
+
+The bundled mock gateway can imitate a gateway that cuts results. These switches are refused at
+start unless `SANKHYA_MODE=mock` and `NODE_ENV` is not `production`:
+
+| Variable                          | Effect                                                                          |
+| --------------------------------- | ------------------------------------------------------------------------------- |
+| `SANKHYA_MOCK_ROW_CAP`            | Rows the mock returns for one query (1 to 100000).                              |
+| `SANKHYA_MOCK_SILENT_CUT`         | `true`: cut at the row cap without flagging the result as cut.                  |
+| `SANKHYA_MOCK_DICTIONARY_PADDING` | Extra `TDDCAM` rows of fictitious tables (0 to 100000), to outgrow the row cap. |
 
 ## Environments
 
