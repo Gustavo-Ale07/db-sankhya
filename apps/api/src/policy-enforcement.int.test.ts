@@ -805,6 +805,14 @@ describe('materialization route', () => {
     const { cookie } = await h.viewer();
     const res = await materialize(h, cookie, { sql: 'SELECT * FROM TGFPAR', into: 'tmp_par' });
     expect(res.statusCode).toBe(403);
+    for (const sqlText of [
+      'SELECT a.EMAIL FROM TGFPAR a JOIN TGFPAR b ON b.CODPARC = a.CODPARC',
+      'WITH c AS (SELECT * FROM TGFPAR) SELECT CODPARC FROM c',
+      'SELECT CODCID FROM TSICID UNION SELECT EMAIL FROM TGFPAR',
+    ]) {
+      const denied = await materialize(h, cookie, { sql: sqlText, into: 'tmp_par' });
+      expect(denied.statusCode, sqlText).toBe(403);
+    }
     expect(await tables(h, cookie)).toEqual([]);
     expect(reads(h.mock, 'EMAIL')).toBe(0);
   });
