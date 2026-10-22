@@ -93,6 +93,40 @@ Other points not verified against a real installation:
   keys and writes to them are refused;
 - the dbscript artifact format has not been loaded into a real importer.
 
+### What the gateway does (observed)
+
+Raw answers of the base de testes (the company's Sankhya test environment) through the local API,
+on 21 and 22/10/2026. Credentials, tokens and company data are left out; the transaction id is
+replaced by `<id>`. Production was never called.
+
+| Call                                                                                                                  | HTTP | Raw answer                                                                                                                        | Conclusion                                                     |
+| --------------------------------------------------------------------------------------------------------------------- | ---- | --------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| `DbExplorerSP.executeQuery` (`SELECT`, dictionary and data)                                                           | 200  | `"status":"1"`                                                                                                                    | Reads work.                                                    |
+| `CRUDServiceProvider.loadRecords` (`Parceiro`, TGFPAR)                                                                | 200  | `"status":"1"`, 50 records                                                                                                        | The same credential reads through CRUD.                        |
+| `DatasetSP.save` (one column of one row of a small `AD_*` table)                                                      | 200  | `{"serviceName":"DatasetSP.save","status":"0","pendingPrinting":"false","transactionId":"<id>","statusMessage":"Não autorizado"}` | Refused; the read-back showed the value unchanged.             |
+| B0 probe (`UPDATE … WHERE 1=0`, `CREATE`/DML/`ALTER`/`DROP` of `AD_DBX_PROBE`, `saveRecord`, dictionary registration) | n/a  | not run                                                                                                                           | **Não verificado**: waits for write permission on the sandbox. |
+
+The client maps that `"Não autorizado"` to `SANKHYA_AUTH_ERROR`; the write was sent once and not
+repeated. Authentication and reads work with the same credential, so the refusal is about the
+service: the integration user or app of those credentials needs permission for `DatasetSP.save`
+(writing through the entity of that table) in the Sankhya portal. How to verify once it is
+granted: run the Fase 0.6 mark again (one row, one column of an `AD_*` table, base de testes only)
+and confirm `VERIFIED` and the read-back.
+
+Dictionary of the base de testes (read only): `TDDTAB` 3271 rows, `TDDCAM` 44043, `TDDINS` 3875;
+the first `GET /api/schema` took about 6.7 s, and the catalog came back degraded `PK:truncated`
+before the primary keys were paged. Whether it is complete after this release is **não
+verificado** (read `GET /api/status` or `/api/schema` once against the base de testes).
+
+`DBEXPMAXROW` (default 5000) is the ERP parameter believed to cap an `executeQuery` result:
+**parâmetro a verificar no ERP**. The dictionary reads are paged and counted so a lower cap only
+degrades the catalog, never silently shortens it.
+
+The official gateway page lists `DatasetSP.loadRecords`, `CRUDServiceProvider.saveRecord` /
+`loadRecords`, `DbExplorerSP.executeQuery` (mge) and `CACSP.IncluirNota` /
+`incluirAlterarItemNota` / `excluirItemNota` / `cancelarNota`, `SelecaoDocumentoSP.faturar`
+(mgecom). It does not list `DatasetSP.save`, and documents no DDL or `DELETE` service.
+
 ## Data dictionary
 
 The catalog is read from the ERP dictionary tables `TDDTAB` (tables), `TDDCAM` (fields) and
@@ -102,7 +136,8 @@ and in the database. Every table a statement uses must exist in the catalog. Col
 dictionary vary between versions; the adapter tolerates missing optional columns.
 
 `TDDTAB` and `TDDCAM` can hold more rows than the gateway returns for one query. They are read in
-pages (`TDDTAB` by `NOMETAB`, `TDDCAM` by `NUCAMPO`, each page starting after the last key of the
+pages (`TDDTAB` by `NOMETAB`, `TDDCAM` by `NUCAMPO`, the primary keys by `TABLE_NAME`,
+`COLUMN_NAME`, each page starting after the last key of the
 one before), up to `METADATA_MAX_PAGES` pages (default 100, 1 to 1000). **Every dictionary read is checked against its own count**
 (`SELECT COUNT(*) AS TOTAL FROM ...`; the primary-key query is counted as a subquery), because a
 gateway may cut a result at its row cap without flagging it: a page that comes back short is
@@ -158,6 +193,7 @@ start unless `SANKHYA_MODE=mock` and `NODE_ENV` is not `production`:
 | `SANKHYA_MOCK_ROW_CAP`            | Rows the mock returns for one query (1 to 100000).                              |
 | `SANKHYA_MOCK_SILENT_CUT`         | `true`: cut at the row cap without flagging the result as cut.                  |
 | `SANKHYA_MOCK_DICTIONARY_PADDING` | Extra `TDDCAM` rows of fictitious tables (0 to 100000), to outgrow the row cap. |
+| `SANKHYA_MOCK_CALL_LOG`           | File the mock appends each call's service name to (never its body); E2E only.   |
 
 ## Environments
 

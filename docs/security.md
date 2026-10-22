@@ -260,6 +260,12 @@ A write runs only as a plan (see [architecture.md](architecture.md#writes)):
   never repeated automatically.
 - **Verification.** Every changed row is read back and the run is labelled `VERIFIED`,
   `PARTIALLY_VERIFIED`, `UNVERIFIED` or `FAILED`.
+- **Scratch plans.** A `tmp_` command from the editor is a plan as well: same preview, token,
+  single use and audit, a dry run in a rolled-back transaction, and a read-back of the rows or the
+  structure. It needs `GLOBAL_WRITE_ENABLED` (env and runtime) and the `TEMP.*` permission and
+  policy, never `WRITE_TO_SANKHYA`. A `CREATE TABLE tmp_… AS SELECT` reads Sankhya only through
+  the read path, with `QUERY.SELECT`, `TEMP.MATERIALIZE` and the column policy checked before the
+  first gateway call; the end-to-end test asserts the gateway saw read services only.
 - **Audit.** `PLAN_CREATED`, `PLAN_DENIED`, `PLAN_EXECUTED` and `VERIFICATION` events carry the
   plan, the decision and the before and after rows (unless `auditSnapshots` is off). An assisted
   rollback is a new plan built from those snapshots and goes through every step above.
@@ -333,6 +339,11 @@ tokens, passwords, cookies or authorization headers.
   columns. This fails closed on purpose. Tests: `apps/api/src/policy-enforcement.int.test.ts`
   ("a column DENY refuses SELECT * …", three cases) and `e2e/tests/cut-dictionary.spec.ts`.
 
+- **`POST /api/scratch/exec` runs `tmp_` statements without a preview** (_decisão pendente_). The
+  Scratch page (`Scratch (avançado)`) keeps that direct path; the SQL editor always previews. It
+  touches only the caller's own workspace, never the ERP.
+- `SANKHYA_MOCK_*` (including `SANKHYA_MOCK_CALL_LOG`, which logs service names only) are refused
+  at start outside `SANKHYA_MODE=mock` and in production.
 - Open editor tabs are kept in the browser's `localStorage` so drafts survive a reload. They are
   removed on logout; closing the browser without logging out leaves them on that device.
 - Rate limits and the gateway call budget are kept per process. Run a single instance, or put a shared

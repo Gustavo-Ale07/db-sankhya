@@ -181,6 +181,10 @@ redacted from logs.
 
 ### Fixed scratch limits
 
+A workspace and its `tmp_` tables are dropped after `SCRATCH_TTL_MINUTES` (default 60) without
+activity; the **Temporárias (tmp\_\*)** group of the editor's tree says so and lists each table with
+its columns and rows (`GET /api/scratch/tables?columns=1`, filtered by policy).
+
 Besides `SCRATCH_MAX_WORKSPACES`, `SCRATCH_MAX_ROWS`, `SCRATCH_MAX_TABLES`, `SCRATCH_TTL_MINUTES`,
 `SCRATCH_STATEMENT_TIMEOUT_MS` and `MATERIALIZE_MAX_ROWS`, a scratch workspace has limits that are
 set in code (`SCRATCH_DEFAULTS` in `apps/api/src/services/scratch.ts`) and cannot be changed by

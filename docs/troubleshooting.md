@@ -101,6 +101,13 @@ preview and execution is refused with `CONFIRMATION_INVALID`; preview again.
 | `SANKHYA_API_ERROR`    | The Sankhya service refused the request; its message is shown with credentials redacted.         |
 | `SANKHYA_BAD_RESPONSE` | The response did not have the expected shape.                                                    |
 
+**`SANKHYA_AUTH_ERROR` on a write while reads work.** The gateway answered the save with HTTP 200,
+`"status":"0"` and `"statusMessage":"Não autorizado"`. The credentials are valid (reads and
+`CRUDServiceProvider.loadRecords` succeed); the integration user or app behind them has no
+permission for `DatasetSP.save` on that entity. Ask whoever administers the Sankhya portal to grant
+it on the test environment. Do not repeat the write to test it: the run is reported `UNVERIFIED`,
+so read the row first (see [sankhya.md](sankhya.md#what-the-gateway-does-observed)).
+
 ## Writes
 
 | Code                       | Meaning and fix                                                                                                                             |
