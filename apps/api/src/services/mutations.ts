@@ -62,7 +62,13 @@ import {
   evaluateFor,
   readTargets,
 } from './read-policy';
-import type { DryRunResult, ScratchManager, ScratchWorkspace } from './scratch';
+import type {
+  DdlDryRunResult,
+  DryRunResult,
+  ScratchManager,
+  ScratchWorkspace,
+  TableStructure,
+} from './scratch';
 import { analyzeScratchSql } from './scratch-guard';
 import type { ScratchStatement } from './scratch-guard';
 import type { AuditLifecycleContext, AuditService } from './records';
@@ -91,11 +97,18 @@ export interface PreparedMutation {
   previewKind: PreviewKind;
   /** Every label that applies: a Sankhya UPDATE is IMPACT_ANALYSIS (real before) + SIMULATED_PREVIEW. */
   previewLabels: PreviewKind[];
-  preview: { targets: PreviewTarget[]; affected: number };
+  preview: {
+    targets: PreviewTarget[];
+    affected: number;
+    /** Scratch DDL: the target table before and after the dry run (null: it does not exist). */
+    structure?: DdlDryRunResult;
+    /** Scratch DROP TABLE: the rows the table holds now, lost with it. */
+    lostRows?: number;
+  };
   impact: { entities: string[]; rows: number; environment: Environment };
   requires: { strongConfirmation: string | null; approval: boolean };
   /** The kind of the planned SQL statement (from the parsed statement); absent for actions. */
-  operation?: WriteClassified['kind'];
+  operation?: PlannedKind;
   /**
    * Whether the caller holds the permission `execute` checks first (the statement's DATA.*, or
    * TEMP.WRITE on scratch). False for a preview made only through DATA.PREVIEW.
@@ -167,6 +180,14 @@ export interface MutationDeps {
 }
 
 type WriteClassified = Extract<Classified, { kind: 'INSERT' | 'UPDATE' | 'DELETE' }>;
+type DdlClassified = Extract<Classified, { kind: 'CREATE_TABLE' | 'ALTER_TABLE' | 'DROP_TABLE' }>;
+type PlannedKind = WriteClassified['kind'] | DdlClassified['kind'];
+
+const DDL_PERMISSION: Record<DdlClassified['kind'], Permission> = {
+  CREATE_TABLE: 'TEMP.CREATE',
+  ALTER_TABLE: 'TEMP.CREATE',
+  DROP_TABLE: 'TEMP.DROP',
+};
 
 const PERMISSION: Record<WriteClassified['kind'], Permission> = {
   INSERT: 'DATA.INSERT',
@@ -221,6 +242,19 @@ interface ScratchResolution {
   entity: string;
 }
 
+/** Scratch CREATE / ALTER / DROP: the structure dry run instead of a row diff. */
+interface ScratchDdlResolution {
+  workspace: ScratchWorkspace;
+  stmt: ScratchStatement;
+  permission: Permission;
+  capability: Capability;
+  decision: PolicyDecision;
+  dry: DdlDryRunResult;
+  /** One target: the table, its structure before and after (see `structureTarget`). */
+  targets: PreviewTarget[];
+  entity: string;
+}
+
 /** AUTHORIZE → PREVIEW of a business action, at prepare and again at execute. */
 interface ActionResolution {
   action: BusinessAction;
@@ -244,6 +278,28 @@ export class MutationService {
     let environment: Environment | null = null;
     try {
       classified = classifyStatement(sql);
+
+      // CREATE / ALTER / DROP of a tmp_ table: a structure dry run in the caller's workspace.
+      const ddl = scratchDdlOf(classified);
+      if (ddl) {
+        environment = SCRATCH_ENVIRONMENT;
+        const d = await this.resolveScratchDdl(auth, ddl, sql);
+        return await this.finishPlan(ctx, {
+          operation: ddl.kind,
+          kind: ddl.kind,
+          permission: d.permission,
+          environment: SCRATCH_ENVIRONMENT,
+          connectionId: SCRATCH_CONNECTION_ID,
+          capability: d.capability,
+          decision: d.decision,
+          targets: d.targets,
+          entity: d.entity,
+          previewKind: 'TRANSACTIONAL_DRY_RUN',
+          previewLabels: ['TRANSACTIONAL_DRY_RUN'],
+          structure: d.dry,
+        });
+      }
+
       const write = parseWrite(classified);
 
       // ---------------------------------------------------------------- VALIDATE
@@ -533,7 +589,7 @@ export class MutationService {
       /** INSERT / UPDATE / DELETE, or the word of a business action (summary and phrase). */
       operation: string;
       /** The parsed statement kind of a SQL plan (none for a business action). */
-      kind?: WriteClassified['kind'];
+      kind?: PlannedKind;
       permission: Permission;
       environment: Environment;
       connectionId: string;
@@ -545,13 +601,23 @@ export class MutationService {
       entityName?: string | undefined;
       previewKind: PreviewKind;
       previewLabels: PreviewKind[];
+      /** Scratch DDL: the structure dry run, shown as BEFORE/AFTER. */
+      structure?: DdlDryRunResult;
     },
   ): Promise<PreparedMutation> {
     const { auth, sql } = ctx;
     const { operation, permission, environment, capability, decision, targets, entity } = o;
     const { previewKind, previewLabels } = o;
     const affected = targets.length;
-    const preview = { targets, affected, ...(o.entityName ? { entityName: o.entityName } : {}) };
+    const preview = {
+      targets,
+      affected,
+      ...(o.entityName ? { entityName: o.entityName } : {}),
+      ...(o.structure ? { structure: o.structure } : {}),
+      ...(o.structure && o.kind === 'DROP_TABLE'
+        ? { lostRows: o.structure.before?.rows ?? 0 }
+        : {}),
+    };
     const created = await this.deps.plans.create({
       userId: auth.user.id,
       sessionId: auth.session.id,
@@ -964,6 +1030,102 @@ export class MutationService {
     return { workspace, stmt, capability, decision, dry, targets, entity };
   }
 
+  /**
+   * Scratch DDL AUTHORIZE -> PREVIEW: TEMP.CREATE (CREATE, ALTER) or TEMP.DROP (DROP) and an ALLOW
+   * of the policy on that action, then the statement runs inside a transaction of the caller's
+   * workspace and is rolled back; the preview is the table's structure and row count before and
+   * after. Used by `prepare` and again by `execute`.
+   */
+  private async resolveScratchDdl(
+    auth: AuthState,
+    ddl: DdlClassified,
+    sql: string,
+  ): Promise<ScratchDdlResolution> {
+    const permission = DDL_PERMISSION[ddl.kind];
+    if (!auth.grants.permissions.has(permission)) {
+      throw refuse(
+        'AUTHORIZE',
+        new AppError('FORBIDDEN', 'You do not have permission for this action', { permission }),
+      );
+    }
+    const workspace = await this.deps.scratch.workspace(auth.user.id);
+    const names = (await workspace.tables()).map((t) => t.name);
+    if (ddl.kind !== 'CREATE_TABLE' && !names.includes(ddl.table.toLowerCase())) {
+      throw refuse(
+        'VALIDATE',
+        new AppError('OPERATION_NOT_SUPPORTED', `${ddl.table} is not in your scratch area.`),
+      );
+    }
+    const capability = resolveCapability(ddl, { catalog: { tables: [] }, scratchTables: names });
+    if (capability.class === 'UNSUPPORTED' || capability.route !== 'SCRATCH') {
+      throw refuse(
+        'AUTHORIZE',
+        new AppError(
+          'OPERATION_NOT_SUPPORTED',
+          capability.route === 'HYBRID'
+            ? 'A scratch table filled from Sankhya rows is previewed through /api/query/preview.'
+            : capability.reason,
+          { capability: capability.class },
+        ),
+      );
+    }
+    let stmt: ScratchStatement;
+    try {
+      stmt = analyzeScratchSql(sql);
+    } catch (err) {
+      throw refuse(
+        'VALIDATE',
+        isAppError(err) ? new AppError(err.code, err.message, err.details) : notSimulable(),
+      );
+    }
+    if (stmt.target === null || stmt.action !== permission) {
+      throw refuse(
+        'VALIDATE',
+        new AppError('OPERATION_NOT_SUPPORTED', 'The statement could not be previewed.'),
+      );
+    }
+    const groupIds = await this.deps.authz.activeGroupIds(auth.user.id);
+    const decision = await evaluateFor({
+      policies: this.deps.policies,
+      auth,
+      groupIds,
+      action: permission,
+      environment: SCRATCH_ENVIRONMENT,
+      connectionId: SCRATCH_CONNECTION_ID,
+      entities: [...new Set([...stmt.tables, stmt.target])],
+      hasWhere: true,
+      ...(this.deps.scratchMaxReadRows !== undefined
+        ? { defaults: { maxReadRows: this.deps.scratchMaxReadRows } }
+        : {}),
+    });
+    if (decision.effect !== 'ALLOW') {
+      throw refuse('AUTHORIZE', new AppError('FORBIDDEN', 'The change was denied by policy'), {
+        reasons: decision.reasons,
+        matchedRuleIds: decision.matchedRuleIds,
+        policyVersion: decision.policyVersion,
+      });
+    }
+    let dry: DdlDryRunResult;
+    try {
+      dry = await workspace.ddlDryRun(stmt);
+    } catch (err) {
+      throw refuse(
+        'PREVIEW',
+        isAppError(err) ? new AppError(err.code, err.message, err.details) : notSimulable(),
+      );
+    }
+    return {
+      workspace,
+      stmt,
+      permission,
+      capability,
+      decision,
+      dry,
+      targets: [structureTarget(dry)],
+      entity: dry.table.toUpperCase(),
+    };
+  }
+
   /** Before snapshot of the UPDATE targets through the read path, capped at maxWriteRows + 1. */
   private async updateTargets(
     auth: AuthState,
@@ -1117,10 +1279,12 @@ export class MutationService {
 
     // ---------------------------------------------------------------- RE-AUTHORIZE
     let write: WriteClassified | undefined;
+    let ddl: DdlClassified | null = null;
     let operation: string;
     let resolved:
       | { sankhya: SankhyaResolution }
       | { scratch: ScratchResolution }
+      | { scratchDdl: ScratchDdlResolution }
       | { action: ActionResolution };
     let decision: PolicyDecision;
     let targets: PreviewTarget[];
@@ -1135,10 +1299,17 @@ export class MutationService {
         lctx.capability = act!.action.permission;
         operation = actionWord(act!.action);
       } else {
-        write = parseWrite(classifyStatement(plan.sql));
-        lctx.capability = scratch ? 'TEMP.WRITE' : PERMISSION[write.kind];
-        operation = write.kind;
-        validateWrite(write);
+        const classified = classifyStatement(plan.sql);
+        ddl = scratch ? scratchDdlOf(classified) : null;
+        if (ddl) {
+          lctx.capability = DDL_PERMISSION[ddl.kind];
+          operation = ddl.kind;
+        } else {
+          write = parseWrite(classified);
+          lctx.capability = scratch ? 'TEMP.WRITE' : PERMISSION[write.kind];
+          operation = write.kind;
+          validateWrite(write);
+        }
       }
       const fresh: AuthState = { ...auth, grants: await this.deps.authz.grants(auth.user.id) };
       await this.assertPolicyVersion(plan);
@@ -1152,6 +1323,12 @@ export class MutationService {
         decision = a.decision;
         targets = a.targets;
         entity = a.table.name.toUpperCase();
+      } else if (ddl) {
+        const d = await this.resolveScratchDdl(fresh, ddl, plan.sql);
+        resolved = { scratchDdl: d };
+        decision = d.decision;
+        targets = d.targets;
+        entity = d.entity;
       } else if (scratch) {
         if (!SCRATCH_TABLE.test(write!.table))
           throw refuse('RE-AUTHORIZE', invalidPlan('The plan no longer matches its statement.'));
@@ -1175,7 +1352,9 @@ export class MutationService {
           ? resolved.sankhya.capability
           : 'action' in resolved
             ? resolved.action.capability
-            : resolved.scratch.capability;
+            : 'scratchDdl' in resolved
+              ? resolved.scratchDdl.capability
+              : resolved.scratch.capability;
       if (canonical(capability) !== canonical(plan.capability)) {
         throw refuse('RE-AUTHORIZE', invalidPlan('The capability changed after the preview.'));
       }
@@ -1236,7 +1415,9 @@ export class MutationService {
           ? await this.runSankhya(plan, write!, resolved.sankhya, guard)
           : 'action' in resolved
             ? await this.runAction(plan, resolved.action, guard)
-            : await this.runScratch(resolved.scratch);
+            : 'scratchDdl' in resolved
+              ? await this.runScratchDdl(resolved.scratchDdl)
+              : await this.runScratch(resolved.scratch);
     } catch (err) {
       // Nothing was sent (the runtime could not be built, for example): a failed execution.
       await this.deps.audit.recordPlanExecuted(lctx, {
@@ -1467,6 +1648,22 @@ export class MutationService {
    * entirely or not at all), then reads the table back and compares it with the dry-run result
    * taken at execute time.
    */
+  /** Runs the scratch DDL for real, then reads the table's structure back (VERIFIED on a match). */
+  private async runScratchDdl(d: ScratchDdlResolution): Promise<ExecutionStep[]> {
+    const key = d.targets[0]!.key;
+    try {
+      await d.workspace.execStatement(d.stmt);
+    } catch (err) {
+      return [{ key, outcome: 'error', errorCode: isAppError(err) ? err.code : 'INTERNAL_ERROR' }];
+    }
+    try {
+      const now = (await d.workspace.describe()).find((t) => t.name === d.dry.table) ?? null;
+      return [{ key, outcome: 'ok', verified: sameStructure(now, d.dry.after) }];
+    } catch {
+      return [{ key, outcome: 'ok' }];
+    }
+  }
+
   private async runScratch(s: ScratchResolution): Promise<ExecutionStep[]> {
     const steps: ExecutionStep[] = s.targets.map((t) => ({ key: t.key, outcome: 'ok' }));
     try {
@@ -1705,6 +1902,32 @@ function actionPlanOf(
   const parsed = parseActionStatement(plan.sql);
   if (!parsed) throw refuse('RE-AUTHORIZE', invalidPlan('The plan no longer matches its action.'));
   return parsed;
+}
+
+/** A CREATE / ALTER / DROP TABLE of a tmp_ table, or null. */
+function scratchDdlOf(c: Classified): DdlClassified | null {
+  return (c.kind === 'CREATE_TABLE' || c.kind === 'ALTER_TABLE' || c.kind === 'DROP_TABLE') &&
+    SCRATCH_TABLE.test(c.table)
+    ? c
+    : null;
+}
+
+/** A structure as plan values: compared by `targetsHash` at execute and kept by the audit. */
+function structureValues(s: TableStructure): RecordValues {
+  return { COLUMNS: s.columns.map((c) => `${c.name} ${c.type}`).join(', '), ROWS: s.rows };
+}
+
+function structureTarget(dry: DdlDryRunResult): PreviewTarget {
+  return {
+    key: { TABLE: dry.table },
+    before: dry.before ? structureValues(dry.before) : null,
+    after: dry.after ? structureValues(dry.after) : {},
+  };
+}
+
+function sameStructure(a: TableStructure | null, b: TableStructure | null): boolean {
+  if (a === null || b === null) return a === b;
+  return a.rows === b.rows && JSON.stringify(a.columns) === JSON.stringify(b.columns);
 }
 
 /** PARSE: AST classification only; anything the parser cannot positively identify is refused. */

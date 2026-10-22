@@ -1421,6 +1421,129 @@ describe('MutationService.execute', () => {
   });
 });
 
+describe('scratch DDL: structure preview, execute and read-back (A3/A4)', () => {
+  const DDL: Permission[] = ['TEMP.CREATE', 'TEMP.WRITE', 'TEMP.DROP', 'QUERY.SELECT'];
+
+  async function withTable(h: Harness, auth: AuthState) {
+    const ws = await h.app.services.scratch.workspace(auth.user.id);
+    await ws.exec('CREATE TABLE tmp_a (id int, v text)');
+    await ws.exec("INSERT INTO tmp_a VALUES (1, 'x'), (2, 'y'), (3, 'z')");
+    return ws;
+  }
+  const names = async (ws: { tables(): Promise<Array<{ name: string }>> }) =>
+    (await ws.tables()).map((t) => t.name).sort();
+
+  it('CTAS: previews the new structure and row count, creates nothing until execute', async () => {
+    const h = await setup({ GLOBAL_WRITE_ENABLED: 'true' });
+    const { auth } = await h.userWith(DDL);
+    const ws = await withTable(h, auth);
+    const p = await prepare(
+      h,
+      auth,
+      'CREATE TEMPORARY TABLE tmp_b AS SELECT id FROM tmp_a WHERE id > 1',
+    );
+    expect(p).toMatchObject({
+      previewKind: 'TRANSACTIONAL_DRY_RUN',
+      operation: 'CREATE_TABLE',
+      capability: { class: 'SCRATCH_ONLY', route: 'SCRATCH' },
+      impact: { entities: ['TMP_B'], environment: 'SANDBOX' },
+      preview: {
+        structure: {
+          table: 'tmp_b',
+          before: null,
+          after: { name: 'tmp_b', rows: 2, columns: [{ name: 'id', type: 'integer' }] },
+        },
+      },
+    });
+    expect(await names(ws)).toEqual(['tmp_a']);
+
+    const report = await execute(h, auth, p);
+    expect(report).toMatchObject({ status: 'success', verification: 'VERIFIED' });
+    expect((await ws.exec('SELECT id FROM tmp_b ORDER BY id')).rows).toEqual([[2], [3]]);
+    expect(h.mock.calls).toEqual([]);
+  });
+
+  it('CREATE TABLE with columns, ALTER and DROP: before/after structure and lost rows', async () => {
+    const h = await setup({ GLOBAL_WRITE_ENABLED: 'true' });
+    const { auth } = await h.userWith(DDL);
+    const ws = await withTable(h, auth);
+
+    const create = await prepare(h, auth, 'CREATE TABLE tmp_c (n numeric(10,2))');
+    expect(create.preview).toMatchObject({
+      structure: {
+        before: null,
+        after: { rows: 0, columns: [{ name: 'n', type: 'numeric(10,2)' }] },
+      },
+    });
+    expect(await execute(h, auth, create)).toMatchObject({ verification: 'VERIFIED' });
+
+    const alter = await prepare(h, auth, 'ALTER TABLE tmp_a ADD COLUMN w text');
+    expect(alter.preview).toMatchObject({
+      structure: {
+        before: { rows: 3, columns: [{ name: 'id' }, { name: 'v' }] },
+        after: { rows: 3, columns: [{ name: 'id' }, { name: 'v' }, { name: 'w', type: 'text' }] },
+      },
+    });
+    expect(await execute(h, auth, alter)).toMatchObject({ verification: 'VERIFIED' });
+
+    const drop = await prepare(h, auth, 'DROP TABLE tmp_a');
+    expect(drop).toMatchObject({
+      operation: 'DROP_TABLE',
+      preview: { lostRows: 3, structure: { before: { rows: 3 }, after: null } },
+    });
+    expect(await names(ws)).toEqual(['tmp_a', 'tmp_c']);
+    expect(await execute(h, auth, drop)).toMatchObject({ verification: 'VERIFIED' });
+    expect(await names(ws)).toEqual(['tmp_c']);
+    expect(h.mock.calls).toEqual([]);
+    expect(await h.audit('PLAN_EXECUTED')).toHaveLength(3);
+  });
+
+  it('needs TEMP.CREATE / TEMP.DROP and an ALLOW; a DENY is audited, nothing runs', async () => {
+    const h = await setup({ GLOBAL_WRITE_ENABLED: 'true' });
+    const noDrop = await h.userWith(['TEMP.CREATE', 'TEMP.WRITE', 'QUERY.SELECT']);
+    const ws = await withTable(h, noDrop.auth);
+    await expect(prepare(h, noDrop.auth, 'DROP TABLE tmp_a')).rejects.toMatchObject({
+      code: 'FORBIDDEN',
+    });
+    await h.policy({ actions: ['TEMP.CREATE'] });
+    await expect(
+      prepare(h, noDrop.auth, 'ALTER TABLE tmp_a ADD COLUMN w text'),
+    ).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(await h.audit('PLAN_CREATED')).toHaveLength(0);
+    expect(await h.audit('write.denied')).toHaveLength(2);
+    expect(await names(ws)).toEqual(['tmp_a']);
+  });
+
+  it('a structure changed after the preview gives TARGETS_CHANGED; the switch off is READ_ONLY_MODE', async () => {
+    const h = await setup({ GLOBAL_WRITE_ENABLED: 'true' });
+    const { auth } = await h.userWith(DDL);
+    const ws = await withTable(h, auth);
+    const p = await prepare(h, auth, 'DROP TABLE tmp_a');
+    await ws.exec("INSERT INTO tmp_a VALUES (4, 'w')");
+    await expect(execute(h, auth, p)).rejects.toMatchObject({ code: 'TARGETS_CHANGED' });
+    expect(await names(ws)).toEqual(['tmp_a']);
+
+    const off = await setup();
+    const o = await off.userWith(DDL);
+    await withTable(off, o.auth);
+    const q = await prepare(off, o.auth, 'DROP TABLE tmp_a');
+    await expect(execute(off, o.auth, q)).rejects.toMatchObject({ code: 'READ_ONLY_MODE' });
+  });
+
+  it('refuses native and custom DDL here, and a tmp_ table that reads Sankhya without materialize', async () => {
+    const h = await setup({ GLOBAL_WRITE_ENABLED: 'true' });
+    const { auth } = await h.userWith(DDL);
+    await expect(prepare(h, auth, 'DROP TABLE TGFPAR')).rejects.toMatchObject({
+      code: 'SQL_UNSUPPORTED',
+    });
+    // Without a Sankhya copier (only the query routes pass one) a CTAS from Sankhya is refused.
+    await expect(
+      prepare(h, auth, 'CREATE TEMPORARY TABLE tmp_x AS SELECT CODPARC FROM TGFPAR'),
+    ).rejects.toMatchObject({ code: 'OPERATION_NOT_SUPPORTED' });
+    expect(h.mock.calls).toEqual([]);
+  });
+});
+
 describe('execution report: before, expected and observed', () => {
   const SQL = "UPDATE TGFPAR SET NOMEPARC = 'Novo nome' WHERE CODPARC = 1";
   const storedReport = async (h: Harness, planId: string) =>
