@@ -13,6 +13,10 @@ describe('translateMessage', () => {
       'Result truncated to 100 rows. Add filters or an explicit LIMIT/OFFSET to page through the data.',
       'Resultado limitado a 100 linhas. Adicione filtros ou um LIMIT/OFFSET explícito para paginar.',
     ],
+    [
+      'Sankhya part (TGFPAR, TSICID) cut at 2 rows.',
+      'A parte do Sankhya (TGFPAR, TSICID) foi cortada em 2 linhas.',
+    ],
     ['Table not found', 'Tabela não encontrada.'],
     ['The change affects more than 50 rows.', 'A alteração afeta mais de 50 linhas.'],
     [

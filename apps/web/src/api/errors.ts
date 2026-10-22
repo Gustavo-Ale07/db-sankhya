@@ -75,6 +75,10 @@ const MESSAGES: [RegExp, (...m: string[]) => string][] = [
     /^Result truncated by the gateway at (\d+) rows\.$/,
     (n) => `O gateway cortou o resultado em ${n} linhas.`,
   ],
+  [
+    /^Sankhya part \(([^)]*)\) cut at (\d+) rows\.$/,
+    (tables, n) => `A parte do Sankhya (${tables}) foi cortada em ${n} linhas.`,
+  ],
   [/^Table not found$/, () => 'Tabela não encontrada.'],
   [
     /^The change affects more than (\d+) rows, the most its preview may read; the write limit is (\d+)\.$/,

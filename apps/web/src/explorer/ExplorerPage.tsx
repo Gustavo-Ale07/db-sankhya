@@ -52,6 +52,8 @@ interface Props {
   active: boolean;
   /** Selected connection. Undefined (loading, error, empty list) blocks running queries. */
   connectionId?: string | undefined;
+  /** Name of the selected connection, shown with the results read from it. */
+  connectionName?: string | undefined;
   /** False while the connection list is still loading, so no call goes out with a stale default. */
   connectionReady?: boolean;
 }
@@ -96,6 +98,7 @@ export function ExplorerPage({
   planRequest = null,
   active,
   connectionId,
+  connectionName,
   connectionReady = true,
 }: Props) {
   const { user } = useSession();
@@ -694,6 +697,7 @@ export function ExplorerPage({
                 tab={resultTab[tab.id] ?? 'results'}
                 onTab={(t) => setResultTab((m) => ({ ...m, [tab.id]: t }))}
                 {...(reopen ? { reopen } : {})}
+                {...(connectionName ? { connectionName } : {})}
               />
             </div>
           </div>

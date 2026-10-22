@@ -184,6 +184,7 @@ export function Layout({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: 
             planRequest={planRequest}
             active={view === 'explorer'}
             connectionId={connection?.id}
+            connectionName={connection?.name}
             connectionReady={!canQuery || !connectionList.isPending}
           />
         </div>

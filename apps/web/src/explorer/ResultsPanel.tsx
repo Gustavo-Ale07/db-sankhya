@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { translateMessage } from '../api/errors';
+import type { QueryResult } from '../api/types';
 import { ErrorBox } from '../components/ErrorBox';
 import { JsonView } from '../components/JsonView';
 import {
@@ -34,6 +35,51 @@ interface Props {
   tab: ResultTab;
   onTab: (t: ResultTab) => void;
   reopen?: ReopenPlan;
+  /** Name of the selected connection, shown next to a result read from Sankhya. */
+  connectionName?: string;
+}
+
+/** Where a result was read: the Sankhya gateway, the caller's tmp_ tables, or both. */
+const ORIGIN: Record<NonNullable<QueryResult['source']>, { label: string; title: string }> = {
+  sankhya: { label: 'Sankhya', title: 'Lido do Sankhya pelo gateway' },
+  scratch: {
+    label: 'temporária',
+    title: 'Lido só das suas tabelas tmp_* (scratch), sem chamar o gateway',
+  },
+  hybrid: {
+    label: 'híbrido',
+    title: 'Partes lidas do Sankhya, copiadas para o scratch e cruzadas com suas tabelas tmp_*',
+  },
+};
+
+function ResultOrigin({
+  result,
+  connectionName,
+}: {
+  result: QueryResult;
+  connectionName?: string;
+}) {
+  if (!result.source) return null;
+  const origin = ORIGIN[result.source];
+  return (
+    <>
+      <span className="badge font-semibold" data-testid="result-origin" title={origin.title}>
+        {origin.label}
+      </span>
+      {result.source !== 'scratch' && connectionName && (
+        <span data-testid="result-connection">Conexão: {connectionName}</span>
+      )}
+      {result.hybrid && (
+        <span data-testid="result-hybrid-parts" title="Partes do Sankhya copiadas para o scratch">
+          {result.hybrid.parts
+            .map(
+              (p) => `${p.tables.join(', ')}: ${p.rows} linha(s)${p.truncated ? ' (cortado)' : ''}`,
+            )
+            .join(' · ')}
+        </span>
+      )}
+    </>
+  );
 }
 
 function ReopenButton({ reopen }: { reopen: ReopenPlan }) {
@@ -119,7 +165,7 @@ export function MutationStatus({
   );
 }
 
-export function ResultsPanel({ run, tab, onTab, reopen }: Props) {
+export function ResultsPanel({ run, tab, onTab, reopen, connectionName }: Props) {
   const result = run.status === 'result' ? run.result : null;
   const columnNames = useMemo(() => result?.columns.map((c) => c.name) ?? [], [result]);
   const records = useMemo(
@@ -257,6 +303,7 @@ export function ResultsPanel({ run, tab, onTab, reopen }: Props) {
       >
         {result && (
           <>
+            <ResultOrigin result={result} {...(connectionName ? { connectionName } : {})} />
             <span>
               <strong className="text-fg">{result.rowCount}</strong> linha(s)
             </span>

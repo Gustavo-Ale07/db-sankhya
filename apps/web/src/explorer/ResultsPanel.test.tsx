@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { ApiError } from '../api/client';
 import { mergeOutcome, outcomeOf } from './runState';
-import { MutationStatus } from './ResultsPanel';
+import type { QueryResult } from '../api/types';
+import { MutationStatus, ResultsPanel } from './ResultsPanel';
 
 afterEach(cleanup);
 
@@ -102,5 +103,71 @@ describe('MutationStatus', () => {
   it('has no reopen button without a plan in memory', () => {
     render(<MutationStatus outcome={{ sent: true, unknown: false, report }} />);
     expect(screen.queryByRole('button', { name: 'Reabrir prévia' })).toBeNull();
+  });
+});
+
+describe('ResultsPanel origin', () => {
+  const base: QueryResult = {
+    type: 'result',
+    executionId: 'e',
+    connectionId: 'env',
+    kind: 'SELECT',
+    resource: null,
+    columns: [{ name: 'N', type: 'integer' }],
+    rows: [[1]],
+    rowCount: 1,
+    truncated: false,
+    apiCalls: 0,
+    durationMs: 5,
+    messages: [],
+  };
+  const show = (result: QueryResult, connectionName?: string) =>
+    render(
+      <ResultsPanel
+        run={{ status: 'result', sql: 'SELECT 1', result }}
+        tab="results"
+        onTab={() => {}}
+        {...(connectionName ? { connectionName } : {})}
+      />,
+    );
+
+  it('marks a Sankhya read with its connection', () => {
+    show({ ...base, source: 'sankhya', apiCalls: 1 }, 'Homologação');
+    expect(screen.getByTestId('result-origin').textContent).toBe('Sankhya');
+    expect(screen.getByTestId('result-connection').textContent).toContain('Homologação');
+    expect(screen.queryByTestId('result-hybrid-parts')).toBeNull();
+  });
+
+  it('marks a read of tmp_ tables as temporary, without a Sankhya connection', () => {
+    show({ ...base, source: 'scratch' }, 'Homologação');
+    expect(screen.getByTestId('result-origin').textContent).toBe('temporária');
+    expect(screen.queryByTestId('result-connection')).toBeNull();
+  });
+
+  it('lists the Sankhya parts a hybrid read copied, with the cut ones flagged', () => {
+    show(
+      {
+        ...base,
+        source: 'hybrid',
+        apiCalls: 2,
+        hybrid: {
+          parts: [
+            { tables: ['TGFPAR'], rows: 60, truncated: false },
+            { tables: ['TGFPRO', 'TGFGRU'], rows: 2, truncated: true },
+          ],
+        },
+      },
+      'Homologação',
+    );
+    expect(screen.getByTestId('result-origin').textContent).toBe('híbrido');
+    expect(screen.getByTestId('result-connection').textContent).toContain('Homologação');
+    const parts = screen.getByTestId('result-hybrid-parts').textContent;
+    expect(parts).toContain('TGFPAR: 60 linha(s)');
+    expect(parts).toContain('TGFPRO, TGFGRU: 2 linha(s) (cortado)');
+  });
+
+  it('shows no origin for a result of an older server without source', () => {
+    show(base);
+    expect(screen.queryByTestId('result-origin')).toBeNull();
   });
 });
