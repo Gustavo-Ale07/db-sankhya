@@ -219,25 +219,62 @@ from a version before the permission catalog changes what administrators can do 
 
 ### Controlled publication
 
-Publish a release with writes off and check it read-only before anyone relies on it.
+Publish a release with writes off and check it read-only before anyone relies on it. Each step
+says what to expect; stop and roll back at the first one that differs.
 
-1. **Before.** Note the running commit (`GET /api/meta`) as the rollback target, take the
-   `pre-upgrade.dump` above, and confirm `SAFE_MODE=true`, `GLOBAL_WRITE_ENABLED=false` and
-   `WRITE_TO_SANKHYA=false` in the environment. Do not change `.env` for the upgrade.
-2. **Build and start** the new commit as above. Migrations run on start; a release without new
-   files under `packages/database/migrations` changes no table.
+1. **Before.**
+   - Note the running commit (`GET /api/meta`): it is the rollback target. For the release after
+     `0ddc4bd`, it is `0ddc4bd`.
+   - Take the dump: `docker compose exec -T db sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' > pre-upgrade.dump`,
+     and check that the file is not empty.
+   - Check that the new release adds no migration:
+     `git diff --name-status <running commit>..<new commit> -- packages/database/migrations` prints
+     nothing (true from `0ddc4bd` to this release).
+   - Confirm `SAFE_MODE=true`, `GLOBAL_WRITE_ENABLED=false` and `WRITE_TO_SANKHYA=false` in the
+     environment. Do not change `.env` for the upgrade.
+2. **Build and start only the app container**, leaving `db` and every other service running:
+
+   ```bash
+   git fetch && git checkout <new commit>
+   GIT_COMMIT=$(git rev-parse --short HEAD) docker compose build app
+   docker compose up -d --no-deps app
+   ```
+
 3. **Health.** `GET /health/live` and `GET /health/ready` answer 200; `GET /api/meta` shows the new
-   commit; `docker compose logs app` has no `error` lines from the start.
-4. **Read-only smoke test** (as a user with `QUERY.SELECT`):
-   - **Status** shows writes unavailable and the three switches off;
+   commit (not `dev`); `docker compose logs app` has no `error` lines from the start.
+4. **Read-only smoke test**, as a user with `QUERY.SELECT`, `TEMP.CREATE` and `TEMP.MATERIALIZE`:
+   - **Status** shows writes unavailable and the switches as above (`globalWrite.effective`
+     `false`);
    - the schema tree loads; time the first `GET /api/schema` (the first catalog load reads the
-     dictionary in pages, see [sankhya.md](sankhya.md#data-dictionary)) and look for
-     `degraded` in its response;
+     dictionary in pages, see [sankhya.md](sankhya.md#data-dictionary)). Its response has no
+     `degraded`; if it has, note the list (for example `PK:truncated`) and the time, and keep
+     going only if the tree is still usable;
+   - the **Temporárias (tmp\_\*)** group is at the top of the tree, with the TTL note and no
+     tables (or only the user's own);
    - a `SELECT` of a few rows from a table you may read returns them; a column a policy denies is
      still refused;
    - expanding a large table in the schema tree lists all its columns;
+   - `CREATE TABLE tmp_smoke AS SELECT <two columns> FROM <a table you may read> WHERE <a few rows>`
+     in the editor opens the preview dialog: operation `CREATE_TABLE`, "A tabela tmp_smoke será
+     criada com N linhas", the columns and types, and the Sankhya part it reads. The preview only
+     reads Sankhya. **Confirmar criação** stays disabled, as for the `UPDATE` below
+     (`execution.available` is `false` in the `/api/query/preview` response), and
+     `/api/query/execute` would answer `READ_ONLY_MODE` (`GLOBAL_WRITE_ENABLED`): scratch commands
+     need the global switch even though they never reach Sankhya. That is the expected result with
+     the switches above; creating the table for real needs `GLOBAL_WRITE_ENABLED=true`, a
+     separate decision that is not part of the upgrade (with `WRITE_TO_SANKHYA=false` it would
+     still write nothing to Sankhya);
    - an `UPDATE` preview of a known column (on a row you choose, without executing) shows the
      plan; **Executar** stays disabled and `/api/query/execute` answers `READ_ONLY_MODE`.
 5. **Watch** the logs for `SANKHYA_*` errors and catalog read times during the first hour.
-6. **Rollback.** Check out the previous commit and rebuild it the same way. Restore the dump only
-   if a migration of the new release ran and must be undone.
+6. **Rollback** to the noted commit (`0ddc4bd` for this release), app container only:
+
+   ```bash
+   git checkout 0ddc4bd
+   GIT_COMMIT=$(git rev-parse --short HEAD) docker compose build app
+   docker compose up -d --no-deps app
+   ```
+
+   `GET /api/meta` shows `0ddc4bd`; repeat steps 3 and 4 up to the `SELECT`. Restore the dump
+   (see [Restore the database](#restore-the-database)) only if a migration of the new release ran
+   and must be undone; this release has none.

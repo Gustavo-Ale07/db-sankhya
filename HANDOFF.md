@@ -2,7 +2,7 @@
 
 ## Estado do git
 
-- Branch: `fix/metadata-on-demand`; `origin/fix/metadata-on-demand` = `7e3d408` até o push final (ver "Gates").
+- Branch: `fix/metadata-on-demand`; `origin/fix/metadata-on-demand` = `f356880` (gates verdes). O commit seguinte (só docs: guia de publicação + este HANDOFF) foi enviado só para o backup.
 - Backup remoto atualizado a cada etapa: `backup/rodada-2-2026-10-21`.
 - Nada foi enviado para `migration` ou `main`; não houve deploy nem acesso à VPS.
 
@@ -28,6 +28,16 @@
 - A mesma credencial: `DbExplorerSP.executeQuery` HTTP 200 / `status "1"`; `CRUDServiceProvider.loadRecords` em Parceiro/TGFPAR HTTP 200 / `status "1"` (50 registros).
 - Em uma frase: no portal da Sankhya, o usuário/app de integração dessas credenciais da sandbox precisa receber permissão para o serviço `DatasetSP.save` (escrita na entidade da tabela `AD_*` usada); autenticação e leitura já funcionam.
 - Como não houve marca, não há nada a conferir na produção.
+
+## Guia de publicação controlada (preparado, NÃO executado)
+
+`docs/operations.md#controlled-publication`: backup (`pre-upgrade.dump` + commit em execução `0ddc4bd`), conferir que não há migration nova desde `0ddc4bd`, build só do contêiner `app` com `GIT_COMMIT` (`docker compose build app` + `up -d --no-deps app`), switches inalterados (`SAFE_MODE=true`, `GLOBAL_WRITE_ENABLED=false`, `WRITE_TO_SANKHYA=false`, `.env` intocado), health, smoke só leitura e rollback para `0ddc4bd` sem restaurar dump.
+
+Smoke novo: `GET /api/schema` sem `degraded` (ou anotar a lista, ex. `PK:truncated`); grupo "Temporárias (tmp\_\*)" no topo da árvore; `CREATE TABLE tmp_smoke AS SELECT` pequeno mostra a prévia. **Atenção:** com `GLOBAL_WRITE_ENABLED=false` o "Confirmar criação" fica desabilitado (`execution.available=false`; o execute responderia `READ_ONLY_MODE`). Confirmar de verdade exige `GLOBAL_WRITE_ENABLED=true` — **decisão pendente do usuário**, fora do upgrade (mesmo assim nada iria ao Sankhya com `WRITE_TO_SANKHYA=false`).
+
+## Liberação da escrita na sandbox (checklist entregue ao usuário, não verificado)
+
+Portal (app da sandbox): o app/credencial está vinculado ao ambiente de testes e tem autorização para `DatasetSP.save` (ou, se o portal só autoriza os serviços da lista oficial, `CRUDServiceProvider.saveRecord`). ERP de testes: usuário de integração ativo, grupo com Incluir/Alterar na tela/entidade da tabela `AD_*` da marca, sem restrição a só consulta. Nenhuma nova tentativa de escrita até o usuário confirmar.
 
 ## PENDENTE
 
