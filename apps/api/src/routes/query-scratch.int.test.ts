@@ -440,3 +440,46 @@ describe('tmp_ DDL from the editor (A3/A4)', () => {
     expect(h.mock.calls).toEqual([]);
   });
 });
+
+describe('GET /api/scratch/tables?columns=1 (the "Temporárias" tree group, A5)', () => {
+  const describeTables = (h: Harness, cookie: string) =>
+    h.call(cookie, { method: 'GET', url: '/api/scratch/tables?columns=1' });
+
+  it('lists each tmp_ table with its columns, its rows and the inactivity TTL', async () => {
+    const h = await setup({ SCRATCH_TTL_MINUTES: '45' });
+    const cookie = await withIds(h);
+    await exec(h, cookie, 'CREATE TABLE tmp_n (id integer, note text)');
+    const res = await describeTables(h, cookie);
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json()).toEqual({
+      ttlMinutes: 45,
+      tables: [
+        { name: 'tmp_ids', rows: 3, columns: [{ name: 'id', type: 'integer' }] },
+        {
+          name: 'tmp_n',
+          rows: 0,
+          columns: [
+            { name: 'id', type: 'integer' },
+            { name: 'note', type: 'text' },
+          ],
+        },
+      ],
+    });
+    expect(h.mock.calls).toEqual([]);
+  });
+
+  it('never shows a column or a table the policy hides', async () => {
+    const h = await setup();
+    const cookie = await withIds(h);
+    await exec(h, cookie, 'CREATE TABLE tmp_n (id integer, secret text)');
+    await exec(h, cookie, 'CREATE TABLE tmp_hidden (id integer)');
+    await h.policy({ columns: ['tmp_n.secret'] });
+    await h.policy({ entities: ['tmp_hidden'] });
+    const body = (await describeTables(h, cookie)).json() as {
+      tables: { name: string; columns: { name: string }[] }[];
+    };
+    expect(body.tables.map((t) => t.name)).toEqual(['tmp_ids', 'tmp_n']);
+    expect(body.tables[1]!.columns.map((c) => c.name)).toEqual(['id']);
+    expect(JSON.stringify(body)).not.toContain('secret');
+  });
+});

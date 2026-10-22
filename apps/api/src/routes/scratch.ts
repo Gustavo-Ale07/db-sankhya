@@ -32,6 +32,7 @@ import {
   findVisibleTable,
   readCatalog,
   readTargets,
+  visibleCatalog,
 } from '../services/read-policy';
 import {
   MAX_SCRATCH_SQL_LENGTH,
@@ -200,7 +201,40 @@ export async function scratchRoutes(app: FastifyInstance): Promise<void> {
         throw err;
       }
       const workspace = await scratch.workspace(auth.user.id);
-      return { tables: await workspace.tables() };
+      if ((request.query as { columns?: string } | undefined)?.columns !== '1') {
+        return { tables: await workspace.tables() };
+      }
+      // With columns: the same deny rules as the Sankhya tree hide a table or a column, failing
+      // closed (no table) if they cannot be applied.
+      const structure = await workspace.describe();
+      const visible = await visibleCatalog(
+        {
+          policies,
+          auth,
+          groupIds: await authz.activeGroupIds(auth.user.id),
+          environment: SCRATCH_ENVIRONMENT,
+          connectionId: SCRATCH_CONNECTION_ID,
+        },
+        {
+          source: 'dictionary',
+          fetchedAt: new Date().toISOString(),
+          tables: structure.map((t) => ({
+            name: t.name,
+            columns: t.columns.map((c) => ({ ...c, pk: false })),
+            foreignKeys: [],
+          })),
+        },
+        (err) => request.log.error({ err }, 'Scratch tables could not be filtered by policy'),
+      );
+      const rows = new Map(structure.map((t) => [t.name, t.rows]));
+      return {
+        ttlMinutes: config.scratch.ttlMinutes,
+        tables: visible.tables.map((t) => ({
+          name: t.name,
+          rows: rows.get(t.name) ?? 0,
+          columns: t.columns.map((c) => ({ name: c.name, type: c.type })),
+        })),
+      };
     },
   );
 
