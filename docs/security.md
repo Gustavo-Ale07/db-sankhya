@@ -99,7 +99,9 @@ a group needs `ADMIN.ROLES` in addition to `ADMIN.GROUPS`.
 Nobody grants a permission they do not hold themselves. The actor's effective permissions must
 include every permission that a change would add. This applies when the actor:
 
-- assigns roles to a user, at creation or later;
+- assigns roles to a user at creation;
+- assigns roles later to a user, unless the actor holds `ADMIN.ROLES` and the user has already
+  chosen their own password (see below);
 - gives roles to a group;
 - adds members to a group (the actor must hold everything the group grants, active or not);
 - re-enables a group;
@@ -117,10 +119,22 @@ counts the roles of the target's disabled groups too, since those can be re-enab
 
 Deactivating an account is allowed, because it grants nothing.
 
+**Assigning is not holding.** Since `ADMIN` holds no `DATA.*` (separation of duties), nobody could
+otherwise make a writer through the interface. A role administrator (`ADMIN.ROLES`) may therefore
+give _another_ user a role with permissions the administrator lacks, such as `OPERATOR`, provided the
+user has already signed in and chosen their own password (`mustChangePassword` false; otherwise
+`FORBIDDEN` with `reason: password_not_own`). The administrator's own permissions do not change,
+they still cannot change their own roles, and once the user holds `DATA.*` the administrator can
+neither reset that password, reactivate the account nor strip the role (`stronger_account`).
+Creating an account with such a role, giving it to a group, and adding permissions to a role still
+need the actor to hold them, since the actor knows a new account's first password and can join a
+group.
+
 All of these refusals use `FORBIDDEN`, are audited as `denied`, and are checked inside the same
-transaction as the change. There is no exception for `ADMIN`. Because `ADMIN` holds no `DATA.*`, a
-plain `ADMIN` can neither create or promote `OPERATOR` users nor reset their passwords; that needs an
-administrator who also holds `OPERATOR`, such as a bootstrap admin with `BOOTSTRAP_ADMIN_ROLES=ADMIN,OPERATOR`.
+transaction as the change. There is no exception for `ADMIN`: a plain `ADMIN` can make another user
+an `OPERATOR` as above, but cannot reset that user's password or take the role back; that needs an
+administrator who also holds `OPERATOR`, such as a bootstrap admin with `BOOTSTRAP_ADMIN_ROLES=ADMIN,OPERATOR`,
+or deactivating the account.
 
 These changes run one at a time under a PostgreSQL advisory lock. A change that would leave no active
 user with `ADMIN.USERS` is refused, so two administrators who remove each other concurrently cannot
@@ -326,6 +340,13 @@ tokens, passwords, cookies or authorization headers.
 
 ## Known limitations
 
+- **A role administrator can make a writer.** "Assigning is not holding" (above) lets a holder of
+  `ADMIN.USERS` + `ADMIN.ROLES` give `OPERATOR` to an account whose owner chose its password. One who
+  creates an account, signs in once with the first password and changes it meets that condition
+  for an account they control, and as a policy administrator can also write the `ALLOW` it needs.
+  This is accepted: those permissions belong to full administrators. Review `user.create`,
+  `user.roles`, `auth.login` and `policy.*` in the audit log, and keep the write switches off where
+  no writer is expected.
 - **Segregation of duties against `ADMIN.USERS` + `ADMIN.ROLES`.** The rules above stop an
   administrator from granting what they do not hold, and the policy and approval permissions are
   kept apart from writing. They do not stop one person who holds `ADMIN.USERS` and `ADMIN.ROLES`

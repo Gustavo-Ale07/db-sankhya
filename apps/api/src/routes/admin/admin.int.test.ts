@@ -388,6 +388,117 @@ describe('policies: separation of duties', () => {
   });
 });
 
+describe('assigning roles beyond your own', () => {
+  const assign = (h: Harness, id: string, roles: string[]) =>
+    h.call(h.admin, { method: 'PUT', url: `/api/admin/users/${id}/roles`, payload: { roles } });
+
+  it('a plain ADMIN makes another user a writer without becoming one', async () => {
+    const h = await setup();
+    const target = await h.userWithRoles(['VIEWER']);
+    const res = await assign(h, target.id, ['VIEWER', 'OPERATOR']);
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json().item.directRoles).toEqual(expect.arrayContaining(['VIEWER', 'OPERATOR']));
+    const theirs = await h.call(target.cookie, { method: 'GET', url: '/api/auth/me' });
+    expect(theirs.json().user.permissions).toEqual(
+      expect.arrayContaining(['DATA.INSERT', 'DATA.UPDATE']),
+    );
+    const mine = await h.call(h.admin, { method: 'GET', url: '/api/auth/me' });
+    expect(mine.json().user.permissions).not.toContain('DATA.UPDATE');
+    expect(mine.json().user.permissions).not.toContain('DATA.INSERT');
+    expect(await h.auditRows('user.roles')).toHaveLength(1);
+
+    // The admin cannot sign in as the writer they made, nor strip them back.
+    const reset = await h.call(h.admin, {
+      method: 'POST',
+      url: `/api/admin/users/${target.id}/reset-password`,
+      payload: { password: 'Another!Strong#Pass7' },
+    });
+    expect(reset.statusCode).toBe(403);
+    expect(reset.json().error.details).toMatchObject({ reason: 'stronger_account' });
+    const strip = await assign(h, target.id, ['VIEWER']);
+    expect(strip.statusCode).toBe(403);
+    expect(strip.json().error.details).toMatchObject({ reason: 'stronger_account' });
+  });
+
+  it('still refuses it for oneself and through a group', async () => {
+    const h = await setup();
+    const self = await assign(h, h.adminId, ['ADMIN', 'OPERATOR']);
+    expect(self.statusCode).toBe(403);
+    expect(self.json().error.details).toMatchObject({ reason: 'self_change' });
+    const group = await h.call(h.admin, {
+      method: 'POST',
+      url: '/api/admin/groups',
+      payload: { name: 'Escrita' },
+    });
+    const viaGroup = await h.call(h.admin, {
+      method: 'PUT',
+      url: `/api/admin/groups/${group.json().item.id as string}/roles`,
+      payload: { roles: ['OPERATOR'] },
+    });
+    expect(viaGroup.statusCode).toBe(403);
+    expect(viaGroup.json().error.details).toMatchObject({ reason: 'beyond_own' });
+  });
+
+  it('refuses it while the target still has a password the admin chose', async () => {
+    const h = await setup();
+    const created = await h.call(h.admin, {
+      method: 'POST',
+      url: '/api/admin/users',
+      payload: { email: 'novo@example.com', name: 'Novo', password: PASSWORD, roles: ['VIEWER'] },
+    });
+    expect(created.statusCode, created.body).toBe(201);
+    const id = created.json().item.id as string;
+    const res = await assign(h, id, ['VIEWER', 'OPERATOR']);
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error.details).toEqual({
+      reason: 'password_not_own',
+      missing: ['DATA.INSERT', 'DATA.UPDATE'],
+    });
+    // A new account still cannot start with roles beyond the creator's own.
+    const direct = await h.call(h.admin, {
+      method: 'POST',
+      url: '/api/admin/users',
+      payload: {
+        email: 'outro@example.com',
+        name: 'Outro',
+        password: PASSWORD,
+        roles: ['OPERATOR'],
+      },
+    });
+    expect(direct.statusCode).toBe(403);
+    expect(direct.json().error.details).toMatchObject({ reason: 'beyond_own' });
+  });
+
+  it('an administrator made a writer this way can no longer change policies', async () => {
+    const h = await setup();
+    const other = await h.userWithRoles(['ADMIN']);
+    expect((await assign(h, other.id, ['ADMIN', 'OPERATOR'])).statusCode).toBe(200);
+    const res = await h.call(other.cookie, {
+      method: 'POST',
+      url: '/api/admin/policies',
+      payload: POLICY,
+    });
+    expect(res.statusCode, res.body).toBe(403);
+    expect(res.json().error.details).toEqual({
+      reason: 'separation_of_duties',
+      conflicting: ['DATA.INSERT', 'DATA.UPDATE'],
+    });
+    expect(await h.app.services.policies.list()).toEqual([]);
+  });
+
+  it('needs ADMIN.ROLES: a user administrator without it cannot assign at all', async () => {
+    const h = await setup();
+    const target = await h.userWithRoles(['VIEWER']);
+    const actor = await h.userWithRoles([], ['ADMIN.USERS']);
+    const res = await h.call(actor.cookie, {
+      method: 'PUT',
+      url: `/api/admin/users/${target.id}/roles`,
+      payload: { roles: ['VIEWER', 'OPERATOR'] },
+    });
+    expect(res.statusCode).toBe(403);
+  });
+});
+
 describe('connections', () => {
   it('masks secrets in every response and audit row; the env connection is read-only', async () => {
     const h = await setup();

@@ -71,8 +71,11 @@ Done by a policy administrator, for a **different** user (the writer).
    `SANKHYA.BUSINESS_ACTION.EXECUTE` and the `SANKHYA.ACTION.*` needed (`CANCELAR_NOTA`,
    `INCLUIR_NOTA`, `INCLUIR_ALTERAR_ITEM_NOTA`, `EXCLUIR_ITEM_NOTA`). The `OPERATOR` system role
    already carries `DATA.INSERT`/`DATA.UPDATE` and can be used instead for plain writes.
-2. **Usuários.** Open the writer, give them that role. Do not give them `ADMIN`; the API refuses a
-   write permission for anyone who edits policies.
+2. **Usuários → Papéis** on the writer's row: tick the role and save. A role administrator can do
+   this without holding the role's permissions ("assigning is not holding", see
+   [security.md](security.md)), but only after the writer has signed in once and chosen their own
+   password; until then the role stays greyed out. Nobody can do it for themselves. Do not also
+   give the writer `ADMIN`: a writer is refused every policy change (separation of duties).
 3. **Políticas → Nova política** (data writes):
    - Efeito: `ALLOW (permitir)`; Quem: `Um usuário` → the writer;
    - Ambientes: tick **only** `HOMOLOGATION` (none ticked means _all_, including production);

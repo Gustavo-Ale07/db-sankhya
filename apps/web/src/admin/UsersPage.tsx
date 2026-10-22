@@ -18,7 +18,8 @@ interface NewUser {
 
 /**
  * Checkbox list of role keys with each role's permissions as a hint. A role with a permission the
- * viewer lacks cannot be added (the server refuses it too); it can still be removed.
+ * viewer lacks cannot be added unless `beyondOwn` (the server decides the same way); it can still
+ * be removed.
  */
 function RolePicker({
   options,
@@ -26,12 +27,14 @@ function RolePicker({
   onChange,
   label,
   held,
+  beyondOwn = false,
 }: {
   options: { key: string; permissions?: Permission[] }[];
   value: string[];
   onChange: (next: string[]) => void;
   label: string;
   held: readonly Permission[];
+  beyondOwn?: boolean;
 }) {
   return (
     <fieldset className="space-y-1">
@@ -41,7 +44,11 @@ function RolePicker({
           <input
             type="checkbox"
             checked={value.includes(r.key)}
-            disabled={!value.includes(r.key) && !!r.permissions?.some((p) => !held.includes(p))}
+            disabled={
+              !beyondOwn &&
+              !value.includes(r.key) &&
+              !!r.permissions?.some((p) => !held.includes(p))
+            }
             onChange={(e) =>
               onChange(e.target.checked ? [...value, r.key] : value.filter((k) => k !== r.key))
             }
@@ -337,10 +344,18 @@ export function UsersPage() {
               Papéis atribuídos diretamente. Papéis recebidos por grupos continuam valendo, e a
               alteração vale a partir da próxima requisição do usuário.
             </p>
+            <p className="text-muted">
+              {editingRoles.user.mustChangePassword
+                ? 'Papéis com permissões que você não tem ficam disponíveis depois que este usuário entrar e definir a própria senha.'
+                : 'Você pode atribuir papéis com permissões que você não tem (por exemplo Operador); isso não muda as suas permissões.'}
+            </p>
             <RolePicker
               label="Papéis diretos"
               options={roleOptions}
               held={me?.permissions ?? []}
+              // Same rule as the server: another user (this modal is never for oneself) who
+              // chose their own password, assigned by a role administrator.
+              beyondOwn={assignsRoles && !editingRoles.user.mustChangePassword}
               value={editingRoles.roles}
               onChange={(next) => setEditingRoles({ ...editingRoles, roles: next })}
             />

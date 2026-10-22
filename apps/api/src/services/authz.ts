@@ -212,7 +212,8 @@ export class AuthzService {
   /**
    * Changes a user's direct roles. Nobody changes their own roles. Removing a role needs an actor
    * who covers the target as they are before the change: otherwise stripping a stronger account
-   * would make it weak enough for a password reset (account takeover).
+   * would make it weak enough for a password reset (account takeover). Adding roles follows
+   * `assertCanAssign`: a role administrator may give another user permissions they do not hold.
    */
   async setUserRoles(userId: string, roleKeys: readonly string[], actorId: string): Promise<void> {
     if (userId === actorId) throw selfChangeError();
@@ -226,9 +227,51 @@ export class AuthzService {
       const kept = new Set(await this.roleIdsByKey(roleKeys, tx));
       if (current.some((r) => !kept.has(r.id))) await this.assertCovers(actorId, userId, tx);
       const added = await this.addedRoleIds(roleKeys, current, tx);
-      await this.assertCanGrant(actorId, await this.permissionsOfRoles(added, tx), tx);
+      await this.assertCanAssign(actorId, userId, await this.permissionsOfRoles(added, tx), tx);
       await this.assignUserRoles(userId, roleKeys, tx);
     }, actorId);
+  }
+
+  /**
+   * Assigning is not holding: giving another user a role leaves the actor's own permissions as
+   * they were. That is what lets an ADMIN (no DATA.*, by separation of duties) make a writer.
+   * It is allowed beyond the actor's own permissions only when
+   * - the actor holds ADMIN.ROLES (the role administrators, who are full administrators anyway);
+   * - the target is someone else (`setUserRoles` refuses self changes before this);
+   * - the target has set their own password (`mustChangePassword` false): a password the actor
+   *   chose (new account, reset) would let them sign in as the writer they just made. Resets and
+   *   reactivations of the new writer then need `assertCovers`, which the actor no longer passes,
+   *   and removing the role needs it too.
+   * This is not a barrier against the role administrator: one who creates an account, signs in
+   * with its first password and changes it can then make it a writer. Trusting ADMIN.ROLES with
+   * that is deliberate (they are full administrators); `user.create`, `user.roles` and logins
+   * are audited.
+   * Roles given through groups, the permissions of a role and a new account's roles still follow
+   * `assertCanGrant`: an actor can join a group, and knows a new account's first password.
+   */
+  private async assertCanAssign(
+    actorId: string,
+    targetId: string,
+    granted: Set<Permission>,
+    db: Db,
+  ): Promise<void> {
+    const mine = (await this.grants(actorId, db)).permissions;
+    if ([...granted].every((p) => mine.has(p))) return;
+    if (!mine.has('ADMIN.ROLES')) return this.assertCanGrant(actorId, granted, db);
+    const [target] = await db
+      .select({ mustChangePassword: users.mustChangePassword })
+      .from(users)
+      .where(eq(users.id, targetId));
+    if (target?.mustChangePassword) {
+      throw new AppError(
+        'FORBIDDEN',
+        'This user must first sign in and choose their own password before receiving permissions you do not hold',
+        {
+          reason: 'password_not_own',
+          missing: [...granted].filter((p) => !mine.has(p)).sort(),
+        },
+      );
+    }
   }
 
   /** Refuses roles carrying permissions the actor lacks. Used when a user is created. */
@@ -239,7 +282,8 @@ export class AuthzService {
 
   /**
    * Nobody grants a permission they do not hold themselves (effective). There is no exception
-   * for ADMIN. Removals from a user are guarded by `assertCovers` instead.
+   * for ADMIN. Removals from a user are guarded by `assertCovers` instead; direct role assignment
+   * to another user follows `assertCanAssign`.
    */
   private async assertCanGrant(
     actorId: string,

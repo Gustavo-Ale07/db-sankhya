@@ -2,11 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ApiError, api } from '../api/client';
-import type { AdminConnection, Permission, User } from '../api/types';
+import type { AdminConnection, AdminUser, Permission, RoleInfo, User } from '../api/types';
 import { SessionContext } from '../app/session';
 import { ConnectionsPage, typedSecrets } from './ConnectionsPage';
 import { PoliciesPage } from './PoliciesPage';
 import { SecurityPage } from './SecurityPage';
+import { UsersPage } from './UsersPage';
 
 vi.mock('../api/client', async (orig) => ({
   ...(await orig<Record<string, unknown>>()),
@@ -25,12 +26,12 @@ const ME: User = {
   createdAt: '2026-01-01T00:00:00.000Z',
 };
 
-function renderPage(ui: React.ReactElement) {
+function renderPage(ui: React.ReactElement, user: User = ME) {
   const noop = () => Promise.resolve();
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
-      <SessionContext.Provider value={{ user: ME, meta: undefined, logout: noop, refresh: noop }}>
+      <SessionContext.Provider value={{ user, meta: undefined, logout: noop, refresh: noop }}>
         {ui}
       </SessionContext.Provider>
     </QueryClientProvider>,
@@ -183,5 +184,88 @@ describe('SecurityPage', () => {
     await waitFor(() =>
       expect(api.put).toHaveBeenCalledWith('/api/admin/security', { globalWriteEnabled: false }),
     );
+  });
+});
+
+describe('UsersPage', () => {
+  const ROLE_ADMIN: User = {
+    ...ME,
+    permissions: ['ADMIN.USERS', 'ADMIN.ROLES', 'ADMIN.POLICIES'] as Permission[],
+  };
+  const person = (over: Partial<AdminUser>): AdminUser => ({
+    ...ME,
+    id: 'u1',
+    email: 'homolog@example.com',
+    name: 'Homolog',
+    roles: ['VIEWER'],
+    permissions: ['QUERY.SELECT'] as Permission[],
+    directRoles: ['VIEWER'],
+    groupIds: [],
+    ...over,
+  });
+  const role = (key: string, permissions: string[]): RoleInfo => ({
+    id: key,
+    key,
+    name: key,
+    description: null,
+    system: true,
+    permissions: permissions as Permission[],
+  });
+  const mockLists = (users: AdminUser[]) =>
+    vi.mocked(api.get).mockImplementation(
+      (url: string) =>
+        Promise.resolve(
+          url === '/api/admin/roles'
+            ? {
+                items: [
+                  role('VIEWER', ['QUERY.SELECT']),
+                  role('OPERATOR', ['QUERY.SELECT', 'DATA.INSERT', 'DATA.UPDATE']),
+                ],
+              }
+            : { items: users },
+        ) as never,
+    );
+  const operatorBox = async (email: string) => {
+    fireEvent.click(
+      within(screen.getByTestId(`roles-${email}`).closest('tr')!).getByRole('button', {
+        name: 'Papéis',
+      }),
+    );
+    await waitFor(() => expect(openDialog()).toBeTruthy());
+    return within(openDialog()).getByRole('checkbox', { name: /Operador/ }) as HTMLInputElement;
+  };
+
+  it('lets a role administrator give another user Operador, which they do not hold', async () => {
+    mockLists([person({})]);
+    vi.mocked(api.put).mockResolvedValue({ item: person({}) });
+    renderPage(<UsersPage />, ROLE_ADMIN);
+    await screen.findByTestId('roles-homolog@example.com');
+    const box = await operatorBox('homolog@example.com');
+    await waitFor(() => expect(box.disabled).toBe(false));
+    fireEvent.click(box);
+    fireEvent.click(within(openDialog()).getByRole('button', { name: 'Salvar papéis' }));
+    await waitFor(() =>
+      expect(api.put).toHaveBeenCalledWith('/api/admin/users/u1/roles', {
+        roles: ['VIEWER', 'OPERATOR'],
+      }),
+    );
+  });
+
+  it('keeps Operador off while the user has not chosen their own password, and on oneself', async () => {
+    mockLists([
+      person({ mustChangePassword: true }),
+      person({ id: ME.id, email: ME.email, name: ME.name }),
+    ]);
+    renderPage(<UsersPage />, ROLE_ADMIN);
+    await screen.findByTestId('roles-homolog@example.com');
+    const box = await operatorBox('homolog@example.com');
+    await waitFor(() =>
+      expect(within(openDialog()).getByText(/definir a própria senha/)).toBeTruthy(),
+    );
+    expect(box.disabled).toBe(true);
+    const own = within(screen.getByTestId(`roles-${ME.email}`).closest('tr')!).getByRole('button', {
+      name: 'Papéis',
+    }) as HTMLButtonElement;
+    expect(own.disabled).toBe(true);
   });
 });

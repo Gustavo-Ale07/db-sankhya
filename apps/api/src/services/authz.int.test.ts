@@ -327,21 +327,40 @@ describe('AuthzService', () => {
       await users.resetPassword(target, 'New!Strong#Pass12', root);
     });
 
-    it('refuses assigning a user a role with permissions the actor lacks', async () => {
+    it('lets a role administrator assign another user a role beyond their own, never themselves', async () => {
       const admin = await newUser('admin@example.com', ['ADMIN']);
       const bia = await newUser('bia@example.com', ['VIEWER']);
-      await expect(authz.setUserRoles(bia, ['VIEWER', 'OPERATOR'], admin)).rejects.toMatchObject(
-        forbidden,
-      );
-      expect(await authz.directRoles(bia)).toEqual(['VIEWER']);
-      // Roles the actor covers are fine, and so is removing them from a target they cover.
-      await authz.setUserRoles(bia, ['ADMIN', 'VIEWER'], admin);
-      await authz.setUserRoles(bia, ['VIEWER'], admin);
-      const root = await newRoot();
-      await authz.setUserRoles(bia, ['OPERATOR'], root);
-      // Bia now holds DATA.* that the admin lacks: stripping her roles is refused too.
+      await authz.setUserRoles(bia, ['VIEWER', 'OPERATOR'], admin);
+      expect(await authz.directRoles(bia)).toEqual(['OPERATOR', 'VIEWER']);
+      // Assigning is not holding: the admin still lacks DATA.*.
+      expect((await authz.effectivePermissions(admin)).has('DATA.UPDATE')).toBe(false);
+      await expect(authz.setUserRoles(admin, ['ADMIN', 'OPERATOR'], admin)).rejects.toMatchObject({
+        code: 'FORBIDDEN',
+        details: { reason: 'self_change' },
+      });
+      // Bia now holds DATA.* that the admin lacks: stripping her roles is refused.
       await expect(authz.setUserRoles(bia, ['VIEWER'], admin)).rejects.toMatchObject(forbidden);
+      const root = await newRoot();
       await authz.setUserRoles(bia, ['VIEWER'], root);
+    });
+
+    it('refuses a role beyond the actor own without ADMIN.ROLES, or to a password the actor knows', async () => {
+      const bia = await newUser('bia@example.com', ['VIEWER']);
+      await seedRole('USERS_ONLY', ['ADMIN.USERS']);
+      const clerk = await newUser('clerk@example.com', ['USERS_ONLY']);
+      await expect(authz.setUserRoles(bia, ['VIEWER', 'OPERATOR'], clerk)).rejects.toMatchObject({
+        code: 'FORBIDDEN',
+        details: { reason: 'beyond_own' },
+      });
+      const admin = await newUser('admin@example.com', ['ADMIN']);
+      await users.resetPassword(bia, 'New!Strong#Pass12', admin);
+      await expect(authz.setUserRoles(bia, ['VIEWER', 'OPERATOR'], admin)).rejects.toMatchObject({
+        code: 'FORBIDDEN',
+        details: { reason: 'password_not_own', missing: ['DATA.INSERT', 'DATA.UPDATE'] },
+      });
+      expect(await authz.directRoles(bia)).toEqual(['VIEWER']);
+      // Roles the actor covers stay fine either way.
+      await authz.setUserRoles(bia, ['ADMIN', 'VIEWER'], admin);
     });
 
     it('refuses creating a user with roles the actor lacks', async () => {
