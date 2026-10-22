@@ -325,3 +325,118 @@ describe('POST /api/query hybrid reads (A2)', () => {
     expect(await tables(h, cookie)).toEqual(['tmp_ids']);
   });
 });
+
+const preview = (h: Harness, cookie: string, sql: string) =>
+  h.call(cookie, { method: 'POST', url: '/api/query/preview', payload: { sql } });
+const run = (h: Harness, cookie: string, p: { planId: string; token: string }) =>
+  h.call(cookie, {
+    method: 'POST',
+    url: '/api/query/execute',
+    payload: { planId: p.planId, token: p.token, idempotencyKey: `k-${p.planId}` },
+  });
+
+describe('tmp_ DDL from the editor (A3/A4)', () => {
+  const CTAS =
+    'CREATE TEMPORARY TABLE tmp_p AS SELECT CODPARC, NOMEPARC FROM TGFPAR WHERE CODPARC <= 5';
+
+  it('POST /api/query never runs tmp_ DDL: it points to the preview', async () => {
+    const h = await setup({ GLOBAL_WRITE_ENABLED: 'true' });
+    const cookie = await withIds(h);
+    for (const sql of ['CREATE TABLE tmp_x (a int)', 'DROP TABLE tmp_ids', CTAS]) {
+      const res = await query(h, cookie, { sql });
+      expect(res.statusCode, sql).toBe(400);
+      expect(res.json()).toMatchObject({
+        error: { code: 'SQL_UNSUPPORTED', details: { preview: '/api/query/preview' } },
+      });
+    }
+    expect(await tables(h, cookie)).toEqual(['tmp_ids']);
+    expect(h.mock.calls).toEqual([]);
+  });
+
+  it('CTAS from Sankhya: preview copies and drops, execute creates and verifies; reads only', async () => {
+    const h = await setup({ GLOBAL_WRITE_ENABLED: 'true' });
+    const cookie = await withIds(h);
+    const pre = await preview(h, cookie, CTAS);
+    expect(pre.statusCode, pre.body).toBe(200);
+    const body = pre.json();
+    expect(body).toMatchObject({
+      type: 'preview',
+      operation: 'CREATE_TABLE',
+      previewKind: 'TRANSACTIONAL_DRY_RUN',
+      capability: { class: 'SCRATCH_ONLY', route: 'HYBRID' },
+      preview: {
+        structure: { table: 'tmp_p', before: null, after: { rows: 5 } },
+        sankhyaParts: [{ tables: ['TGFPAR'], rows: 5, truncated: false }],
+      },
+      execution: { available: true },
+    });
+    expect(
+      body.preview.structure.after.columns.map((c: { name: string }) => c.name.toLowerCase()),
+    ).toEqual(['codparc', 'nomeparc']);
+    // The preview left nothing behind: no tmp_p, no ephemeral copy.
+    expect(await tables(h, cookie)).toEqual(['tmp_ids']);
+
+    const res = await run(h, cookie, body);
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json()).toMatchObject({ status: 'success', verification: 'VERIFIED' });
+    expect((await tables(h, cookie)).sort()).toEqual(['tmp_ids', 'tmp_p']);
+    // One read per run of the part (preview and execute), and no write of any kind.
+    expect(executeQueries(h.mock, 'FROM TGFPAR')).toHaveLength(2);
+    expect(writes(h.mock)).toEqual([]);
+  });
+
+  it('a CTAS mixing tmp_ and Sankhya tables, cut at MATERIALIZE_MAX_ROWS, says so', async () => {
+    const h = await setup({ GLOBAL_WRITE_ENABLED: 'true', MATERIALIZE_MAX_ROWS: '2' });
+    const cookie = await withIds(h);
+    const pre = await preview(
+      h,
+      cookie,
+      'CREATE TABLE tmp_j AS WITH p AS (SELECT CODPARC, NOMEPARC FROM TGFPAR) ' +
+        'SELECT t.id, p.nomeparc FROM tmp_ids t JOIN p ON p.codparc = t.id',
+    );
+    expect(pre.statusCode, pre.body).toBe(200);
+    expect(pre.json()).toMatchObject({
+      preview: {
+        structure: { after: { rows: 2 } },
+        sankhyaParts: [{ tables: ['TGFPAR'], rows: 2, truncated: true }],
+      },
+    });
+    expect(await tables(h, cookie)).toEqual(['tmp_ids']);
+    expect(writes(h.mock)).toEqual([]);
+  });
+
+  it('needs TEMP.MATERIALIZE and the policy of the Sankhya side, before any gateway call', async () => {
+    const h = await setup({ GLOBAL_WRITE_ENABLED: 'true' });
+    const cookie = await withIds(h, ['QUERY.SELECT', 'TEMP.CREATE', 'TEMP.WRITE']);
+    const res = await preview(h, cookie, CTAS);
+    expect(res.statusCode, res.body).toBe(403);
+    expect(codeOf(res)).toBe('FORBIDDEN');
+    expect(h.mock.calls).toEqual([]);
+
+    const h2 = await setup({ GLOBAL_WRITE_ENABLED: 'true' });
+    const c2 = await withIds(h2);
+    await h2.policy({ columns: ['TGFPAR.NOMEPARC'] });
+    const denied = await preview(h2, c2, CTAS);
+    expect(denied.statusCode, denied.body).toBe(403);
+    expect(codeOf(denied)).toBe('FORBIDDEN');
+    expect(executeQueries(h2.mock, 'TGFPAR')).toHaveLength(0);
+    expect(await tables(h2, c2)).toEqual(['tmp_ids']);
+  });
+
+  it('ALTER and DROP preview the structure; DROP reports the rows it loses', async () => {
+    const h = await setup({ GLOBAL_WRITE_ENABLED: 'true' });
+    const cookie = await withIds(h);
+    const alter = await preview(h, cookie, 'ALTER TABLE tmp_ids ADD COLUMN note text');
+    expect(alter.json()).toMatchObject({
+      operation: 'ALTER_TABLE',
+      preview: { structure: { before: { rows: 3 }, after: { rows: 3 } } },
+    });
+    expect((await run(h, cookie, alter.json())).json()).toMatchObject({ verification: 'VERIFIED' });
+    const drop = await preview(h, cookie, 'DROP TABLE tmp_ids');
+    expect(drop.json()).toMatchObject({ operation: 'DROP_TABLE', preview: { lostRows: 3 } });
+    expect(await tables(h, cookie)).toEqual(['tmp_ids']);
+    expect((await run(h, cookie, drop.json())).json()).toMatchObject({ verification: 'VERIFIED' });
+    expect(await tables(h, cookie)).toEqual([]);
+    expect(h.mock.calls).toEqual([]);
+  });
+});

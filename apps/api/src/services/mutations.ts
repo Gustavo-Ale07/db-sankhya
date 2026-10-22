@@ -71,6 +71,8 @@ import type {
 } from './scratch';
 import { analyzeScratchSql } from './scratch-guard';
 import type { ScratchStatement } from './scratch-guard';
+import { dropEphemeral, planScratchCreateAs } from './hybrid';
+import type { HybridPart } from './hybrid';
 import type { AuditLifecycleContext, AuditService } from './records';
 import type { SecuritySettingsService } from './security-settings';
 import { labelOf, reportForAudit, statusOf, valuesMatch, verifyByKey } from './verification';
@@ -104,6 +106,10 @@ export interface PreparedMutation {
     structure?: DdlDryRunResult;
     /** Scratch DROP TABLE: the rows the table holds now, lost with it. */
     lostRows?: number;
+    /** CREATE TABLE tmp_… AS reading Sankhya: each part copied for the preview (cut or not). */
+    sankhyaParts?: SankhyaCopy[];
+    /** The Sankhya connection those parts were read from; execute reads them from it again. */
+    sourceConnectionId?: string;
   };
   impact: { entities: string[]; rows: number; environment: Environment };
   requires: { strongConfirmation: string | null; approval: boolean };
@@ -116,10 +122,30 @@ export interface PreparedMutation {
   permitted: boolean;
 }
 
+/** One Sankhya part copied into the caller's workspace (a read only). */
+export interface SankhyaCopy {
+  tables: string[];
+  rows: number;
+  truncated: boolean;
+}
+
+/**
+ * Copies the Sankhya parts of a scratch statement into ephemeral tables of the workspace, through
+ * the Sankhya read path and its policies (QUERY.SELECT and TEMP.MATERIALIZE). Only the query
+ * routes provide one; without it a scratch table cannot be filled from Sankhya.
+ */
+export type SankhyaCopier = (
+  workspace: ScratchWorkspace,
+  parts: readonly HybridPart[],
+  sourceConnectionId: string,
+) => Promise<SankhyaCopy[]>;
+
 export interface PrepareContext {
   auth: AuthState;
   connectionId: string;
   sql: string;
+  /** Fills a CREATE TABLE tmp_… AS from Sankhya (see `SankhyaCopier`). */
+  copier?: SankhyaCopier;
   /**
    * Accept DATA.PREVIEW in place of the statement permission (Sankhya writes only). Set only by
    * POST /api/query/preview; every other caller (rollback plans included) keeps needing the
@@ -153,6 +179,8 @@ export interface ExecuteContext {
   token: string;
   strongConfirmation?: string;
   idempotencyKey?: string;
+  /** The same copier the preview used, for a CREATE TABLE tmp_… AS from Sankhya. */
+  copier?: SankhyaCopier;
   meta?: { ip?: string | null; requestId?: string | null };
 }
 
@@ -253,6 +281,9 @@ interface ScratchDdlResolution {
   /** One target: the table, its structure before and after (see `structureTarget`). */
   targets: PreviewTarget[];
   entity: string;
+  /** Ephemeral copies of Sankhya parts, still in the workspace: the caller drops them. */
+  ephemeral: HybridPart[];
+  copies: SankhyaCopy[];
 }
 
 /** AUTHORIZE → PREVIEW of a business action, at prepare and again at execute. */
@@ -283,7 +314,8 @@ export class MutationService {
       const ddl = scratchDdlOf(classified);
       if (ddl) {
         environment = SCRATCH_ENVIRONMENT;
-        const d = await this.resolveScratchDdl(auth, ddl, sql);
+        const d = await this.resolveScratchDdl(auth, ddl, sql, ctx.copier, ctx.connectionId);
+        await this.dropCopies(d);
         return await this.finishPlan(ctx, {
           operation: ddl.kind,
           kind: ddl.kind,
@@ -297,6 +329,9 @@ export class MutationService {
           previewKind: 'TRANSACTIONAL_DRY_RUN',
           previewLabels: ['TRANSACTIONAL_DRY_RUN'],
           structure: d.dry,
+          ...(d.copies.length > 0
+            ? { sankhyaParts: d.copies, sourceConnectionId: ctx.connectionId }
+            : {}),
         });
       }
 
@@ -603,6 +638,8 @@ export class MutationService {
       previewLabels: PreviewKind[];
       /** Scratch DDL: the structure dry run, shown as BEFORE/AFTER. */
       structure?: DdlDryRunResult;
+      sankhyaParts?: SankhyaCopy[];
+      sourceConnectionId?: string;
     },
   ): Promise<PreparedMutation> {
     const { auth, sql } = ctx;
@@ -617,6 +654,8 @@ export class MutationService {
       ...(o.structure && o.kind === 'DROP_TABLE'
         ? { lostRows: o.structure.before?.rows ?? 0 }
         : {}),
+      ...(o.sankhyaParts ? { sankhyaParts: o.sankhyaParts } : {}),
+      ...(o.sourceConnectionId ? { sourceConnectionId: o.sourceConnectionId } : {}),
     };
     const created = await this.deps.plans.create({
       userId: auth.user.id,
@@ -1040,6 +1079,8 @@ export class MutationService {
     auth: AuthState,
     ddl: DdlClassified,
     sql: string,
+    copier: SankhyaCopier | undefined,
+    sourceConnectionId: string | undefined,
   ): Promise<ScratchDdlResolution> {
     const permission = DDL_PERMISSION[ddl.kind];
     if (!auth.grants.permissions.has(permission)) {
@@ -1057,12 +1098,18 @@ export class MutationService {
       );
     }
     const capability = resolveCapability(ddl, { catalog: { tables: [] }, scratchTables: names });
-    if (capability.class === 'UNSUPPORTED' || capability.route !== 'SCRATCH') {
+    // HYBRID: a CREATE TABLE tmp_… AS whose query reads Sankhya, copied first by the copier.
+    const fromSankhya = capability.route === 'HYBRID' && ddl.kind === 'CREATE_TABLE';
+    if (
+      capability.class === 'UNSUPPORTED' ||
+      (capability.route !== 'SCRATCH' && !fromSankhya) ||
+      (fromSankhya && (copier === undefined || sourceConnectionId === undefined))
+    ) {
       throw refuse(
         'AUTHORIZE',
         new AppError(
           'OPERATION_NOT_SUPPORTED',
-          capability.route === 'HYBRID'
+          fromSankhya
             ? 'A scratch table filled from Sankhya rows is previewed through /api/query/preview.'
             : capability.reason,
           { capability: capability.class },
@@ -1070,14 +1117,20 @@ export class MutationService {
       );
     }
     let stmt: ScratchStatement;
+    let parts: HybridPart[] = [];
     try {
-      stmt = analyzeScratchSql(sql);
+      if (fromSankhya) {
+        ({ statement: stmt, parts } = planScratchCreateAs(sql));
+      } else {
+        stmt = analyzeScratchSql(sql);
+      }
     } catch (err) {
       throw refuse(
         'VALIDATE',
         isAppError(err) ? new AppError(err.code, err.message, err.details) : notSimulable(),
       );
     }
+    const ephemeral = new Set(parts.map((p) => p.into));
     if (stmt.target === null || stmt.action !== permission) {
       throw refuse(
         'VALIDATE',
@@ -1092,7 +1145,8 @@ export class MutationService {
       action: permission,
       environment: SCRATCH_ENVIRONMENT,
       connectionId: SCRATCH_CONNECTION_ID,
-      entities: [...new Set([...stmt.tables, stmt.target])],
+      // The ephemeral copies are judged on the Sankhya side, by the copier.
+      entities: [...new Set([...stmt.tables.filter((t) => !ephemeral.has(t)), stmt.target])],
       hasWhere: true,
       ...(this.deps.scratchMaxReadRows !== undefined
         ? { defaults: { maxReadRows: this.deps.scratchMaxReadRows } }
@@ -1106,9 +1160,13 @@ export class MutationService {
       });
     }
     let dry: DdlDryRunResult;
+    let copies: SankhyaCopy[] = [];
     try {
+      if (parts.length > 0) copies = await copier!(workspace, parts, sourceConnectionId!);
       dry = await workspace.ddlDryRun(stmt);
     } catch (err) {
+      await this.dropCopies({ workspace, ephemeral: parts });
+      if (err instanceof Refusal) throw err;
       throw refuse(
         'PREVIEW',
         isAppError(err) ? new AppError(err.code, err.message, err.details) : notSimulable(),
@@ -1123,7 +1181,20 @@ export class MutationService {
       dry,
       targets: [structureTarget(dry)],
       entity: dry.table.toUpperCase(),
+      ephemeral: parts,
+      copies,
     };
+  }
+
+  /** Drops the ephemeral Sankhya copies of a scratch DDL; never throws. */
+  private async dropCopies(d: Pick<ScratchDdlResolution, 'workspace' | 'ephemeral'>) {
+    if (d.ephemeral.length === 0) return;
+    await dropEphemeral(d.workspace, d.ephemeral, (err) =>
+      this.deps.logger?.error(
+        { errorName: err instanceof Error ? err.name : typeof err },
+        'An ephemeral copy could not be dropped',
+      ),
+    );
   }
 
   /** Before snapshot of the UPDATE targets through the read path, capped at maxWriteRows + 1. */
@@ -1280,6 +1351,8 @@ export class MutationService {
     // ---------------------------------------------------------------- RE-AUTHORIZE
     let write: WriteClassified | undefined;
     let ddl: DdlClassified | null = null;
+    // Holds ephemeral Sankhya copies until the run ends (dropped on every path).
+    let ddlResolution: ScratchDdlResolution | undefined;
     let operation: string;
     let resolved:
       | { sankhya: SankhyaResolution }
@@ -1324,7 +1397,16 @@ export class MutationService {
         targets = a.targets;
         entity = a.table.name.toUpperCase();
       } else if (ddl) {
-        const d = await this.resolveScratchDdl(fresh, ddl, plan.sql);
+        const source = (plan.preview as { sourceConnectionId?: unknown } | null)
+          ?.sourceConnectionId;
+        const d = await this.resolveScratchDdl(
+          fresh,
+          ddl,
+          plan.sql,
+          ctx.copier,
+          typeof source === 'string' ? source : undefined,
+        );
+        ddlResolution = d;
         resolved = { scratchDdl: d };
         decision = d.decision;
         targets = d.targets;
@@ -1401,6 +1483,7 @@ export class MutationService {
       // right before the first write.
       await this.assertPolicyVersion(plan);
     } catch (err) {
+      if (ddlResolution) await this.dropCopies(ddlResolution);
       await this.auditExecuteRefusal(lctx, plan, err);
       if (err instanceof Refusal) throw new AppError(err.code, err.message, err.details);
       throw err;
@@ -1416,7 +1499,9 @@ export class MutationService {
           : 'action' in resolved
             ? await this.runAction(plan, resolved.action, guard)
             : 'scratchDdl' in resolved
-              ? await this.runScratchDdl(resolved.scratchDdl)
+              ? await this.runScratchDdl(resolved.scratchDdl).finally(() =>
+                  this.dropCopies(resolved.scratchDdl),
+                )
               : await this.runScratch(resolved.scratch);
     } catch (err) {
       // Nothing was sent (the runtime could not be built, for example): a failed execution.

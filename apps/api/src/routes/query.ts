@@ -8,10 +8,12 @@ import type { AuthState } from '../context';
 import type { Catalog } from '../services/metadata';
 import { ENV_CONNECTION_ID } from '../services/connections';
 import { dropEphemeral, isScratchName, planScratchRead } from '../services/hybrid';
-import type { ScratchRead } from '../services/hybrid';
+import type { HybridPart, ScratchRead } from '../services/hybrid';
 import { materialize } from '../services/materialize';
 import { ApprovalsService } from '../services/approvals';
 import { MutationService } from '../services/mutations';
+import type { SankhyaCopier, SankhyaCopy } from '../services/mutations';
+import type { ScratchWorkspace } from '../services/scratch';
 import { PlansService } from '../services/plans';
 import { executeRead } from '../services/read-executor';
 import type { PolicyDecision as ReadDecision } from '../services/read-executor';
@@ -193,10 +195,16 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
       }
       return sankhyaRead(request, reply, auth, body.sql, executionId, body.connectionId);
     }
-    // INSERT / UPDATE / DELETE get a pointer to the preview; nothing is planned or sent here, so
-    // the first Ctrl+Enter can never write.
+    // INSERT / UPDATE / DELETE and DDL of tmp_ tables get a pointer to the preview; nothing is
+    // planned or sent here, so the first Ctrl+Enter can never write.
     const previewable =
-      classified.kind === 'INSERT' || classified.kind === 'UPDATE' || classified.kind === 'DELETE';
+      classified.kind === 'INSERT' ||
+      classified.kind === 'UPDATE' ||
+      classified.kind === 'DELETE' ||
+      ((classified.kind === 'CREATE_TABLE' ||
+        classified.kind === 'ALTER_TABLE' ||
+        classified.kind === 'DROP_TABLE') &&
+        isScratchName(classified.table));
     const err = await denyMutation(
       request,
       auth,
@@ -507,106 +515,23 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
       const hybridParts: Array<{ tables: string[]; rows: number; truncated: boolean }> = [];
       workspace = await app.services.scratch.workspace(auth.user.id);
       if (parts.length > 0) {
-        const sourceId = requested ?? defaultConnection();
-        const defaults = { maxReadRows: config.materializeMaxRows };
-        const target = await evaluateFor({
-          policies,
-          auth,
-          groupIds,
-          action: 'TEMP.MATERIALIZE',
-          environment: SCRATCH_ENVIRONMENT,
-          connectionId: SCRATCH_CONNECTION_ID,
-          entities: parts.map((p) => p.into),
-          defaults,
-        });
-        if (target.effect !== 'ALLOW') throw forbidden(target);
-        const access = await authorizeConnection({
-          policies,
-          auth,
-          groupIds,
-          action: 'QUERY.SELECT',
-          connectionId: sourceId,
-          connections,
-          defaults,
-        });
-        if (!access.ok) throw connectionDenied();
-        const sourceAccess = await evaluateFor({
-          policies,
-          auth,
-          groupIds,
-          action: 'TEMP.MATERIALIZE',
-          environment: access.environment,
-          connectionId: sourceId,
-          entities: [],
-          columns: [],
-          defaults,
-        });
-        if (sourceAccess.effect !== 'ALLOW') throw forbidden(sourceAccess);
-
-        const decideWith = async (a: ReadAnalysis, catalog: Catalog): Promise<ReadDecision> => {
-          const targets = readTargets(
-            a,
-            await readCatalog(catalog, a, (name) => metadata.table(sourceId, name)),
-          );
-          const check = {
-            policies,
+        hybridParts.push(
+          ...(await copySankhyaParts({
             auth,
             groupIds,
-            environment: access.environment,
-            connectionId: sourceId,
-            entities: targets.entities,
-            columns: targets.columns,
-            defaults,
-          };
-          const select = await evaluateFor({ ...check, action: 'QUERY.SELECT' });
-          if (select.effect !== 'ALLOW') {
-            denied = select;
-            return { effect: 'DENY', reason: 'The read was denied by policy' };
-          }
-          const copy = await evaluateFor({ ...check, action: 'TEMP.MATERIALIZE' });
-          if (copy.effect !== 'ALLOW') {
-            denied = copy;
-            return { effect: 'DENY', reason: DENIED };
-          }
-          apiCalls += 1;
-          return {
-            effect: 'ALLOW',
-            maxRows: Math.min(
-              target.limits.maxReadRows,
-              select.limits.maxReadRows,
-              copy.limits.maxReadRows,
-            ),
-          };
-        };
-        const runtime = await connections.getRuntime(sourceId);
-        const catalog = await metadata.get(sourceId);
-        // One part at a time, each read exactly once.
-        for (const part of parts) {
-          copied.push(part);
-          const out = await materialize({
-            runtime,
             workspace,
-            sql: part.sql,
-            into: part.into,
-            maxRows: Math.min(config.sankhya.maxRows, config.materializeMaxRows),
-            decide: decideWith,
-            findTable: (name) =>
-              findVisibleTable(
-                {
-                  policies,
-                  auth,
-                  groupIds,
-                  environment: access.environment,
-                  connectionId: sourceId,
-                },
-                name,
-                (n) => metadata.table(sourceId, n),
-              ),
-            catalog,
+            parts,
+            requested,
             signal: controller.signal,
-          });
-          hybridParts.push({ tables: part.tables, rows: out.rows, truncated: out.truncated });
-        }
+            copied,
+            onDenied: (d) => {
+              denied = d;
+            },
+            onCall: () => {
+              apiCalls += 1;
+            },
+          })),
+        );
       }
 
       const out = await workspace.execStatement(statement, controller.signal, {
@@ -711,6 +636,153 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
     }
   }
 
+  /**
+   * Copies each Sankhya part once into its ephemeral scratch table, through the Sankhya read
+   * path: QUERY.SELECT and TEMP.MATERIALIZE on the source (columns included) and TEMP.MATERIALIZE
+   * on the scratch side, capped at min(SANKHYA_MAX_ROWS, MATERIALIZE_MAX_ROWS, policy). Every
+   * authorization of the source happens before its first gateway call. Reads only.
+   */
+  async function copySankhyaParts(o: {
+    auth: AuthState;
+    groupIds: string[];
+    workspace: ScratchWorkspace;
+    parts: readonly HybridPart[];
+    requested: string | undefined;
+    signal: AbortSignal;
+    /** Every part a copy was started for (the caller drops them). */
+    copied?: HybridPart[];
+    onDenied: (decision: PolicyDecision) => void;
+    onCall: () => void;
+  }): Promise<SankhyaCopy[]> {
+    const { auth, groupIds, workspace, parts, requested } = o;
+    const forbidden = (decision: PolicyDecision) => {
+      o.onDenied(decision);
+      return new AppError('FORBIDDEN', DENIED);
+    };
+    const result: SankhyaCopy[] = [];
+    const sourceId = requested ?? defaultConnection();
+    const defaults = { maxReadRows: config.materializeMaxRows };
+    const target = await evaluateFor({
+      policies,
+      auth,
+      groupIds,
+      action: 'TEMP.MATERIALIZE',
+      environment: SCRATCH_ENVIRONMENT,
+      connectionId: SCRATCH_CONNECTION_ID,
+      entities: parts.map((p) => p.into),
+      defaults,
+    });
+    if (target.effect !== 'ALLOW') throw forbidden(target);
+    const access = await authorizeConnection({
+      policies,
+      auth,
+      groupIds,
+      action: 'QUERY.SELECT',
+      connectionId: sourceId,
+      connections,
+      defaults,
+    });
+    if (!access.ok) throw connectionDenied();
+    const sourceAccess = await evaluateFor({
+      policies,
+      auth,
+      groupIds,
+      action: 'TEMP.MATERIALIZE',
+      environment: access.environment,
+      connectionId: sourceId,
+      entities: [],
+      columns: [],
+      defaults,
+    });
+    if (sourceAccess.effect !== 'ALLOW') throw forbidden(sourceAccess);
+
+    const decideWith = async (a: ReadAnalysis, catalog: Catalog): Promise<ReadDecision> => {
+      const targets = readTargets(
+        a,
+        await readCatalog(catalog, a, (name) => metadata.table(sourceId, name)),
+      );
+      const check = {
+        policies,
+        auth,
+        groupIds,
+        environment: access.environment,
+        connectionId: sourceId,
+        entities: targets.entities,
+        columns: targets.columns,
+        defaults,
+      };
+      const select = await evaluateFor({ ...check, action: 'QUERY.SELECT' });
+      if (select.effect !== 'ALLOW') {
+        o.onDenied(select);
+        return { effect: 'DENY', reason: 'The read was denied by policy' };
+      }
+      const copy = await evaluateFor({ ...check, action: 'TEMP.MATERIALIZE' });
+      if (copy.effect !== 'ALLOW') {
+        o.onDenied(copy);
+        return { effect: 'DENY', reason: DENIED };
+      }
+      o.onCall();
+      return {
+        effect: 'ALLOW',
+        maxRows: Math.min(
+          target.limits.maxReadRows,
+          select.limits.maxReadRows,
+          copy.limits.maxReadRows,
+        ),
+      };
+    };
+    const runtime = await connections.getRuntime(sourceId);
+    const catalog = await metadata.get(sourceId);
+    // One part at a time, each read exactly once.
+    for (const part of parts) {
+      o.copied?.push(part);
+      const out = await materialize({
+        runtime,
+        workspace,
+        sql: part.sql,
+        into: part.into,
+        maxRows: Math.min(config.sankhya.maxRows, config.materializeMaxRows),
+        decide: decideWith,
+        findTable: (name) =>
+          findVisibleTable(
+            {
+              policies,
+              auth,
+              groupIds,
+              environment: access.environment,
+              connectionId: sourceId,
+            },
+            name,
+            (n) => metadata.table(sourceId, n),
+          ),
+        catalog,
+        signal: o.signal,
+      });
+      result.push({ tables: part.tables, rows: out.rows, truncated: out.truncated });
+    }
+    return result;
+  }
+
+  /** The copier of a CREATE TABLE tmp_… AS from Sankhya (preview and execute). */
+  function copierFor(request: FastifyRequest, auth: AuthState): SankhyaCopier {
+    return async (workspace, parts, sourceConnectionId) => {
+      requirePermission(request, 'QUERY.SELECT');
+      requirePermission(request, 'TEMP.MATERIALIZE');
+      const groupIds = await authz.activeGroupIds(auth.user.id);
+      return copySankhyaParts({
+        auth,
+        groupIds,
+        workspace,
+        parts,
+        requested: sourceConnectionId,
+        // Not tied to the request: a plan runs to its end once confirmed.
+        signal: new AbortController().signal,
+        onDenied: () => undefined,
+        onCall: () => undefined,
+      });
+    };
+  }
+
   function defaultConnection(): string {
     if (config.sankhya.envConnection) return ENV_CONNECTION_ID;
     throw new AppError(
@@ -732,6 +804,7 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
       auth,
       sql: body.sql,
       connectionId: body.connectionId ?? defaultConnection(),
+      copier: copierFor(request, auth),
       // The only caller that lets DATA.PREVIEW stand in for the statement permission.
       allowPreviewOnly: true,
       meta: { ip: clientIp(request), requestId: request.id },
@@ -740,7 +813,7 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
     const globalWrite = (await security.globalWriteState()).effective;
     const available =
       globalWrite &&
-      (prepared.capability.route === 'SCRATCH' ||
+      (prepared.capability.class === 'SCRATCH_ONLY' ||
         (config.writeToSankhya &&
           !(config.safeMode && prepared.impact.environment === 'PRODUCTION')));
     // The plan token is the caller's own confirmation credential (bound to this session by an
@@ -774,6 +847,7 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
       auth,
       planId: body.planId,
       token: body.token,
+      copier: copierFor(request, auth),
       idempotencyKey: body.idempotencyKey,
       ...(body.strongConfirmation !== undefined
         ? { strongConfirmation: body.strongConfirmation }

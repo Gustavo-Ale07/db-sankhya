@@ -7,7 +7,7 @@
  */
 import { randomBytes } from 'node:crypto';
 import { AppError, isAppError } from '@dbx/shared';
-import { splitHybrid } from '@dbx/sql-engine';
+import { classifyStatement, splitCreateAs, splitHybrid } from '@dbx/sql-engine';
 import type { ScratchWorkspace } from './scratch';
 import { analyzeScratchSql } from './scratch-guard';
 import type { ScratchStatement } from './scratch-guard';
@@ -72,6 +72,61 @@ export function planScratchRead(sql: string, hybrid: boolean): ScratchRead {
     throw err;
   }
   return { parts, statement: selectOnly(statement) };
+}
+
+/**
+ * Plans `CREATE [TEMPORARY] TABLE tmp_x AS <query>` whose query reads Sankhya: a query of Sankhya
+ * tables only is copied whole into one ephemeral table, a mixed one is split like a hybrid read;
+ * the CREATE then reads the ephemeral tables in the workspace. Throws SQL_UNSUPPORTED (before any
+ * gateway call) for anything else.
+ */
+export function planScratchCreateAs(sql: string): ScratchRead {
+  const ca = splitCreateAs(sql);
+  if (ca === null) {
+    throw new AppError(
+      'SQL_UNSUPPORTED',
+      'Only CREATE TABLE tmp_… AS SELECT … can fill a scratch table from Sankhya.',
+    );
+  }
+  const run = randomBytes(5).toString('hex');
+  const query = classifyStatement(ca.query);
+  if (query.kind !== 'SELECT') {
+    throw new AppError('SQL_UNSUPPORTED', 'The query of a CREATE TABLE … AS must be a SELECT.');
+  }
+  let parts: HybridPart[];
+  let rewritten: string;
+  if (!query.tables.some(isScratchName)) {
+    parts = [{ sql: ca.query, tables: query.tables, into: `tmp__hyb_${run}_1` }];
+    rewritten = `SELECT * FROM ${parts[0]!.into}`;
+  } else {
+    const split = splitHybrid(ca.query, isScratchName, {
+      maxParts: MAX_HYBRID_PARTS,
+      maxGroups: MAX_HYBRID_SUBQUERIES,
+    });
+    if (split.overflow) {
+      throw unsupported(
+        `more than ${MAX_HYBRID_PARTS} Sankhya parts or ${MAX_HYBRID_SUBQUERIES} subqueries`,
+      );
+    }
+    if (split.parts.length === 0) throw unsupported('no Sankhya part could be separated');
+    parts = split.parts.map((p, i) => ({
+      sql: p.sql,
+      tables: p.tables,
+      into: `tmp__hyb_${run}_${i + 1}`,
+    }));
+    rewritten = split.rewrite(parts.map((p) => p.into));
+  }
+  let statement: ScratchStatement;
+  try {
+    statement = analyzeScratchSql(ca.head + rewritten);
+  } catch (err) {
+    if (isAppError(err) && err.code !== 'SQL_FORBIDDEN') throw unsupported(err.message);
+    throw err;
+  }
+  if (statement.command !== 'CREATE TABLE') {
+    throw new AppError('SQL_UNSUPPORTED', 'Only CREATE TABLE … AS is planned here.');
+  }
+  return { parts, statement };
 }
 
 /** Drops the ephemeral tables of a hybrid read; never throws (they expire with the workspace). */
