@@ -128,7 +128,7 @@ test('refuses a mutation under the default policy and leaves the row unchanged',
 });
 
 test('materializes a Sankhya read into a scratch table and queries it', async () => {
-  await nav('Scratch').click();
+  await nav('Scratch (avançado)').click();
   await page.getByTestId('materialize-source').fill('SELECT CODPROD, DESCRPROD FROM TGFPRO');
   await page.getByTestId('materialize-into').fill('tmp_e2e_produtos');
   await page.getByTestId('materialize-run').click();

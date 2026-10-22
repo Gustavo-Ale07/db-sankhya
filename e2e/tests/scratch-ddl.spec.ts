@@ -73,7 +73,7 @@ async function runScratch(sql: string) {
 }
 
 test('scratch: create a table, insert rows and join them with materialized Sankhya data', async () => {
-  await nav(page, 'Scratch').click();
+  await nav(page, 'Scratch (avançado)').click();
 
   const created = await runScratch(
     `CREATE TABLE ${REGIONS} (uf varchar(2) PRIMARY KEY, regiao text)`,

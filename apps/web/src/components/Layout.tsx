@@ -49,7 +49,6 @@ const NAV: { view: View; label: string; permission?: Permission }[] = [
   { view: 'explorer', label: 'Editor SQL' },
   { view: 'history', label: 'Histórico' },
   { view: 'saved', label: 'Consultas salvas' },
-  { view: 'scratch', label: 'Scratch', permission: 'QUERY.SELECT' },
   { view: 'users', label: 'Usuários', permission: 'ADMIN.USERS' },
   { view: 'groups', label: 'Grupos', permission: 'ADMIN.GROUPS' },
   { view: 'roles', label: 'Papéis', permission: 'ADMIN.ROLES' },
@@ -59,6 +58,8 @@ const NAV: { view: View; label: string; permission?: Permission }[] = [
   { view: 'approvals', label: 'Aprovações', permission: 'APPROVAL.DECIDE' },
   { view: 'audit', label: 'Auditoria', permission: 'AUDIT.READ' },
   { view: 'status', label: 'Status' },
+  // Secondary: tmp_ tables are created, filled and crossed with Sankhya in the editor itself.
+  { view: 'scratch', label: 'Scratch (avançado)', permission: 'QUERY.SELECT' },
 ];
 
 export function Layout({ theme, onToggleTheme }: { theme: Theme; onToggleTheme: () => void }) {

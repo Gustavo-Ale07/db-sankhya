@@ -61,6 +61,15 @@ export function ScratchPage({ connectionId, connectionName }: Props) {
     <div className="grid gap-4 p-3 text-xs lg:grid-cols-2" data-testid="scratch-page">
       <section className="space-y-2" aria-label="Tabelas scratch">
         <h2 className="text-sm font-semibold">Tabelas scratch (tmp_*)</h2>
+        <p
+          className="rounded border border-accent/60 bg-accent/10 px-3 py-2"
+          role="note"
+          data-testid="scratch-editor-hint"
+        >
+          O caminho principal agora é o Editor SQL: lá as tabelas tmp_* aparecem no grupo
+          Temporárias, e CREATE/ALTER/DROP/INSERT/UPDATE/DELETE passam pela prévia com confirmação.
+          Esta página fica para cópias avançadas e diagnóstico.
+        </p>
         <p className="text-muted">
           Área de trabalho privada. Somente tabelas tmp_* são aceitas; limites e permissões são
           aplicados pelo servidor.

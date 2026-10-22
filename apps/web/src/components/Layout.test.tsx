@@ -191,6 +191,17 @@ describe('Layout navigation gating', () => {
     expect(screen.getByTestId('current-user').textContent).toContain('Leitor');
   });
 
+  it('puts the Scratch page last, as an advanced page: tmp_ tables live in the editor', () => {
+    renderLayout(META);
+    expect(navLabels()).toEqual([
+      'Editor SQL',
+      'Histórico',
+      'Consultas salvas',
+      'Status',
+      'Scratch (avançado)',
+    ]);
+  });
+
   it('shows Aprovações only with APPROVAL.DECIDE', () => {
     renderLayout(META);
     expect(navLabels()).not.toContain('Aprovações');
