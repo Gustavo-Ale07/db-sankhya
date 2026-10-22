@@ -197,7 +197,9 @@ describe('MetadataService', () => {
         .sort(),
     ).toEqual(['CODEMP', 'CODLOCAL', 'CODPROD']);
 
-    // The same catalog query failing leaves pk false and marks the catalog degraded.
+    // The same catalog query failing leaves pk false and marks the catalog degraded: the paged
+    // read and the single read it falls back to.
+    mock.inject({ type: 'malformed' }, { sqlIncludes: view });
     mock.inject({ type: 'malformed' }, { sqlIncludes: view });
     const failed = await service().get(conn.id, { refresh: true });
     expect(failed.tables.every((t) => t.columns.every((c) => !c.pk))).toBe(true);
@@ -492,7 +494,7 @@ describe('MetadataService, a gateway that cuts at its row cap without saying so'
       paged
         .slice(1)
         .every((q) =>
-          /WHERE K.TABLE_NAME > '[A-Z0-9_$#]+' OR (K.TABLE_NAME = '[A-Z0-9_$#]+' AND K.COLUMN_NAME > '[A-Z0-9_$#]+') ORDER BY K.TABLE_NAME, K.COLUMN_NAME$/.test(
+          /WHERE K\.TABLE_NAME > '[A-Z0-9_$#]+' OR \(K\.TABLE_NAME = '[A-Z0-9_$#]+' AND K\.COLUMN_NAME > '[A-Z0-9_$#]+'\) ORDER BY K\.TABLE_NAME, K\.COLUMN_NAME$/.test(
             q,
           ),
         ),

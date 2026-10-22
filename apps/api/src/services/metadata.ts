@@ -174,7 +174,7 @@ function pkSql(dialect: Dialect, table?: string): string {
 }
 
 /** A key of the primary key read: `TABLE.COLUMN`, both plain database names. */
-const PK_KEY = /^([A-Za-z0-9_$#]{1,128}).([A-Za-z0-9_$#]{1,128})$/;
+const PK_KEY = /^([A-Za-z0-9_$#]{1,128})\.([A-Za-z0-9_$#]{1,128})$/;
 
 /**
  * The primary key columns of every table, by table and column name: a big schema outgrows the
