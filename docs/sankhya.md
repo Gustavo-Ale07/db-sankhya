@@ -255,7 +255,9 @@ listed in `BUSINESS_ACTIONS_ENABLED` (empty by default), and the write switches 
 - **"Não autorizado".** When the gateway answers `"status":"0"` with `"statusMessage":"Não
 autorizado"` (as `DatasetSP.save` did in the base de testes), the step fails with
   `SANKHYA_WRITE_NOT_AUTHORIZED` and the editor shows "Gravação via API não liberada para este
-  usuário no Gateway (DatasetSP.save)" instead of the raw error. The call is not repeated.
+  usuário no Gateway (DatasetSP.save)" instead of the raw error. The call is not repeated. What to
+  release on the Sankhya side, and how to grant writes on `HOMOLOGATION` only, is in
+  [homologation.md](homologation.md).
 
 ## Mock gateway
 

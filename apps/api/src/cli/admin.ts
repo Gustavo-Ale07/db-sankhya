@@ -4,6 +4,7 @@
  *
  *   admin bootstrap --email <e-mail> [--name <name>] [--force-additional]
  *   admin reset-password --email <e-mail>
+ *   admin grant-homolog-writes --email <e-mail> --entities <T1,T2> [--actions]
  *
  * Development: `pnpm --filter @dbx/api admin <command>`. Production bundle: `node dist/admin.mjs`.
  */
@@ -18,6 +19,7 @@ import { ConfigError, loadConfig, secretValues } from '../config';
 import type { AppConfig } from '../config';
 import { AuthzService } from '../services/authz';
 import { createBootstrapService, generateOneTimePassword } from '../services/bootstrap';
+import { grantHomologWrites, parseEntities } from './homolog-writes';
 import { AuditService } from '../services/records';
 import { UsersService } from '../services/users';
 
@@ -31,12 +33,17 @@ export interface AdminCliDeps {
 const USAGE = `Usage:
   admin bootstrap --email <e-mail> [--name <name>] [--force-additional]
   admin reset-password --email <e-mail>
+  admin grant-homolog-writes --email <e-mail> --entities <T1,T2> [--actions]
 
 bootstrap        creates an administrator (roles from BOOTSTRAP_ADMIN_ROLES). Refused when users
                  already exist, unless --force-additional is given.
 reset-password   replaces a user's password, unlocks the account and revokes its sessions.
+grant-homolog-writes
+                 gives the user role HOMOLOG_WRITER (DATA.INSERT, DATA.UPDATE; --actions adds the
+                 business action permissions) and ALLOW rules for HOMOLOGATION only, on the
+                 listed tables (and TGFCAB, TGFITE for the actions). No PRODUCTION rule, no switch.
 
-Both print a one-time password that must be changed at the next login.
+bootstrap and reset-password print a one-time password that must be changed at the next login.
 --email defaults to BOOTSTRAP_ADMIN_EMAIL.
 `;
 
@@ -55,6 +62,8 @@ export async function runAdminCli(argv: readonly string[], deps: AdminCliDeps): 
         email: { type: 'string' },
         name: { type: 'string' },
         'force-additional': { type: 'boolean', default: false },
+        entities: { type: 'string' },
+        actions: { type: 'boolean', default: false },
         help: { type: 'boolean', short: 'h', default: false },
       },
     });
@@ -68,12 +77,20 @@ export async function runAdminCli(argv: readonly string[], deps: AdminCliDeps): 
     stderr(USAGE);
     return values.help ? 0 : 2;
   }
-  if (command !== 'bootstrap' && command !== 'reset-password') {
+  if (
+    command !== 'bootstrap' &&
+    command !== 'reset-password' &&
+    command !== 'grant-homolog-writes'
+  ) {
     stderr(`Unknown command: ${command}\n\n${USAGE}`);
     return 2;
   }
   if (command === 'reset-password' && (values.name || values['force-additional'])) {
     stderr(`reset-password accepts only --email\n\n${USAGE}`);
+    return 2;
+  }
+  if ((values.entities !== undefined || values.actions) !== (command === 'grant-homolog-writes')) {
+    stderr(`--entities and --actions belong to grant-homolog-writes only\n\n${USAGE}`);
     return 2;
   }
   const address = (values.email ?? config.bootstrapAdmin.email ?? '').trim().toLowerCase();
@@ -101,6 +118,21 @@ export async function runAdminCli(argv: readonly string[], deps: AdminCliDeps): 
           'The password below is shown only once and must be changed at the first login.\n',
       );
       stdout(`one-time password: ${password}\n`);
+      return 0;
+    }
+
+    if (command === 'grant-homolog-writes') {
+      const result = await grantHomologWrites(database.db, config, {
+        email: address,
+        entities: parseEntities(values.entities),
+        actions: values.actions,
+      });
+      stderr(
+        `${address}: role ${result.role} (${result.permissions.join(', ')}).\n` +
+          `ALLOW rules for HOMOLOGATION only: ${result.rules.join(', ')}.\n` +
+          'Writes still need GLOBAL_WRITE_ENABLED and WRITE_TO_SANKHYA; actions also need ' +
+          'their ids in BUSINESS_ACTIONS_ENABLED.\n',
+      );
       return 0;
     }
 

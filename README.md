@@ -85,19 +85,20 @@ No Sankhya account or database server is needed. See [Development](docs/developm
 
 ## Documentation
 
-| Document                                   | Contents                                                     |
-| ------------------------------------------ | ------------------------------------------------------------ |
-| [Architecture](docs/architecture.md)       | modules, read path, write lifecycle, approvals, rollback     |
-| [Capabilities](docs/capabilities.md)       | what each statement can do and by which route                |
-| [Security](docs/security.md)               | threat model, authentication, authorization, policy engine   |
-| [Permissions](docs/permissions.md)         | permission reference, seeded roles, where each is checked    |
-| [Sankhya](docs/sankhya.md)                 | gateway services, limits, unverified behaviour, environments |
-| [Deployment](docs/deployment.md)           | Docker Compose, reverse proxy, enabling writes, hardening    |
-| [Operations](docs/operations.md)           | backup and restore, master key, write switches, runbook      |
-| [SQL dialect](docs/sql-dialect.md)         | accepted SQL and known refusals                              |
-| [Troubleshooting](docs/troubleshooting.md) | startup errors, login, query and write error codes           |
-| [Development](docs/development.md)         | local setup, layout, scripts, conventions                    |
-| [Decision records](docs/adr/README.md)     | architecture decisions                                       |
+| Document                                   | Contents                                                       |
+| ------------------------------------------ | -------------------------------------------------------------- |
+| [Architecture](docs/architecture.md)       | modules, read path, write lifecycle, approvals, rollback       |
+| [Capabilities](docs/capabilities.md)       | what each statement can do and by which route                  |
+| [Security](docs/security.md)               | threat model, authentication, authorization, policy engine     |
+| [Permissions](docs/permissions.md)         | permission reference, seeded roles, where each is checked      |
+| [Sankhya](docs/sankhya.md)                 | gateway services, limits, unverified behaviour, environments   |
+| [Deployment](docs/deployment.md)           | Docker Compose, reverse proxy, enabling writes, hardening      |
+| [Homologation](docs/homologation.md)       | writes on the base de testes: seed, UI steps, "Não autorizado" |
+| [Operations](docs/operations.md)           | backup and restore, master key, write switches, runbook        |
+| [SQL dialect](docs/sql-dialect.md)         | accepted SQL and known refusals                                |
+| [Troubleshooting](docs/troubleshooting.md) | startup errors, login, query and write error codes             |
+| [Development](docs/development.md)         | local setup, layout, scripts, conventions                      |
+| [Decision records](docs/adr/README.md)     | architecture decisions                                         |
 
 ## Security
 

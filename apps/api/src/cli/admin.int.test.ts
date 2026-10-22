@@ -6,8 +6,10 @@ import { isWeakPassword, loadConfig } from '../config';
 import type { AppConfig } from '../config';
 import { AuthzService } from '../services/authz';
 import { checkLocalPassword } from '../services/identity';
+import { PolicyService } from '../services/policy';
 import { SessionsService } from '../services/sessions';
 import { UsersService } from '../services/users';
+import type { Environment, Permission } from '@dbx/shared';
 import { runAdminCli } from './admin';
 
 const STRONG = 'Some!Strong#Pass9';
@@ -125,5 +127,119 @@ describe('admin CLI', () => {
     expect((await cli(['frobnicate'])).code).toBe(2);
     expect((await cli(['bootstrap', '--email', 'a@example.com', '--bogus'])).code).toBe(2);
     expect((await cli(['bootstrap', '--email', 'not-an-email'])).code).toBe(2);
+  });
+});
+
+describe('admin grant-homolog-writes', () => {
+  const writer = async (roles: string[] = ['VIEWER']) =>
+    users.create({ email: 'writer@example.com', name: 'Writer', password: STRONG, roles });
+  const decide = async (
+    userId: string,
+    action: Permission,
+    environment: Environment,
+    entities: string[],
+  ) => {
+    const policies = new PolicyService(database.db, { error: () => {}, warn: () => {} });
+    const authz = new AuthzService(database.db);
+    const permissions = await authz.effectivePermissions(userId);
+    return (
+      await policies.evaluate(
+        {
+          userId,
+          groupIds: [],
+          action,
+          environment,
+          connectionId: 'env-default',
+          entities,
+          hasWhere: true,
+        },
+        new Set(permissions),
+      )
+    ).effect;
+  };
+
+  it('grants INSERT/UPDATE on the listed tables for HOMOLOGATION only', async () => {
+    const u = await writer();
+    const r = await cli([
+      'grant-homolog-writes',
+      '--email',
+      'writer@example.com',
+      '--entities',
+      'ad_dbx_teste, TSIUSU',
+    ]);
+    expect(r.code, r.stderr).toBe(0);
+    expect(r.stderr).toMatch(/HOMOLOGATION only/);
+    const permissions = await new AuthzService(database.db).effectivePermissions(u.id);
+    for (const p of ['DATA.INSERT', 'DATA.UPDATE', 'DATA.PREVIEW', 'QUERY.SELECT'] as const)
+      expect(permissions.has(p), p).toBe(true);
+    for (const p of ['DATA.DELETE', 'SANKHYA.BUSINESS_ACTION.EXECUTE', 'ADMIN.POLICIES'] as const)
+      expect(permissions.has(p), p).toBe(false);
+
+    expect(await decide(u.id, 'DATA.UPDATE', 'HOMOLOGATION', ['AD_DBX_TESTE'])).toBe('ALLOW');
+    expect(await decide(u.id, 'DATA.INSERT', 'HOMOLOGATION', ['AD_DBX_TESTE'])).toBe('ALLOW');
+    // Never production, never another table, never a delete.
+    expect(await decide(u.id, 'DATA.UPDATE', 'PRODUCTION', ['AD_DBX_TESTE'])).not.toBe('ALLOW');
+    expect(await decide(u.id, 'DATA.UPDATE', 'SANDBOX', ['AD_DBX_TESTE'])).not.toBe('ALLOW');
+    expect(await decide(u.id, 'DATA.UPDATE', 'HOMOLOGATION', ['TGFPAR'])).not.toBe('ALLOW');
+    expect(await decide(u.id, 'DATA.DELETE', 'HOMOLOGATION', ['AD_DBX_TESTE'])).not.toBe('ALLOW');
+
+    const audit = await database.db.select().from(auditEvents);
+    expect(audit.map((a) => a.action)).toContain('policy.homolog_grant');
+  });
+
+  it('--actions adds the business action permissions and a TGFCAB/TGFITE rule; again changes nothing', async () => {
+    const u = await writer();
+    const argv = ['grant-homolog-writes', '--email', 'writer@example.com', '--entities', 'TGFPAR'];
+    expect((await cli([...argv, '--actions'])).code).toBe(0);
+    const policies = new PolicyService(database.db, { error: () => {}, warn: () => {} });
+    const first = await policies.list();
+    expect((await cli([...argv, '--actions'])).code).toBe(0);
+    expect(await policies.list()).toEqual(first);
+    expect(first.filter((r) => r.subjectId === u.id)).toHaveLength(2);
+    for (const r of first) expect(r.environments).toEqual(['HOMOLOGATION']);
+
+    for (const a of [
+      'SANKHYA.BUSINESS_ACTION.EXECUTE',
+      'SANKHYA.ACTION.CANCELAR_NOTA',
+      'SANKHYA.ACTION.INCLUIR_NOTA',
+      'SANKHYA.ACTION.INCLUIR_ALTERAR_ITEM_NOTA',
+      'SANKHYA.ACTION.EXCLUIR_ITEM_NOTA',
+    ] as const) {
+      expect(await decide(u.id, a, 'HOMOLOGATION', ['TGFCAB', 'TGFITE']), a).toBe('ALLOW');
+      expect(await decide(u.id, a, 'PRODUCTION', ['TGFCAB', 'TGFITE']), a).not.toBe('ALLOW');
+    }
+    // The action rule does not open DATA.* on the note tables.
+    expect(await decide(u.id, 'DATA.UPDATE', 'HOMOLOGATION', ['TGFCAB'])).not.toBe('ALLOW');
+  });
+
+  it('refuses a policy administrator (separation of duties) and changes nothing', async () => {
+    await writer(['ADMIN']);
+    const r = await cli([
+      'grant-homolog-writes',
+      '--email',
+      'writer@example.com',
+      '--entities',
+      'TGFPAR',
+    ]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toMatch(/separation of duties/);
+    const policies = new PolicyService(database.db, { error: () => {}, warn: () => {} });
+    expect(await policies.list()).toEqual([]);
+  });
+
+  it('refuses patterns, missing tables and the flags on other commands', async () => {
+    await writer();
+    const grant = (entities: string) =>
+      cli(['grant-homolog-writes', '--email', 'writer@example.com', '--entities', entities]);
+    expect((await grant('*')).code).toBe(1);
+    expect((await grant('TGF*')).code).toBe(1);
+    expect((await grant('dbo.TGFPAR')).code).toBe(1);
+    expect((await cli(['grant-homolog-writes', '--email', 'writer@example.com'])).code).toBe(2);
+    expect(
+      (await cli(['grant-homolog-writes', '--email', 'nobody@example.com', '--entities', 'X']))
+        .code,
+    ).toBe(1);
+    expect((await cli(['bootstrap', '--email', 'a@example.com', '--entities', 'X'])).code).toBe(2);
+    expect((await cli(['reset-password', '--email', 'a@example.com', '--actions'])).code).toBe(2);
   });
 });
