@@ -226,9 +226,15 @@ listed in `BUSINESS_ACTIONS_ENABLED` (empty by default), and the write switches 
 | `CACSP.excluirItemNota`        | `SANKHYA.ACTION.EXCLUIR_ITEM_NOTA`         | `TGFITE`           | the item `NUNOTA` + `SEQUENCIA` is gone                                                                                                    | `post_excluiitemmovimento` |
 | `SelecaoDocumentoSP.faturar`   | none (stub)                                | none               | **not enabled**: the page does not say which fields are required; prepare answers `OPERATION_NOT_SUPPORTED`                                | `post_faturamovimento`     |
 
-- **Both permissions are needed**: `SANKHYA.BUSINESS_ACTION.EXECUTE` and the action's own. The
-  policy decides on the action's own permission with every table it writes, so `incluirNota` needs
-  an `ALLOW` that covers `TGFCAB` and `TGFITE`. An approver needs both as well.
+- **Both permissions are needed, and the policy decides on both**: `SANKHYA.BUSINESS_ACTION.EXECUTE`
+  and the action's own. A `DENY` on either refuses the action, and each needs an `ALLOW`; when both
+  allow, the stricter limits of the two apply. An approver needs both as well.
+- **Every table and column is decided.** The policy sees every table the action touches:
+  `incluirNota` needs `TGFCAB` and `TGFITE`; the item actions need `TGFITE` and the note
+  `TGFCAB` they work under (its row is read before any call, so an item of a missing note is
+  refused at preview). Every column the request body sends or sets is part of the decision (for
+  example `TGFCAB.DTNEG` for `incluirNota`, `TGFCAB.STATUSNOTA` for `cancelarNota`), and
+  `excluirItemNota`, which removes the whole item, is decided on every column, like `*`.
 - **Validated only against the bundled mock.** The mock implements each service from the same
   documentation page; it is not the ERP. Test each action in `HOMOLOGATION` and check the note in
   the ERP before listing its id for a `PRODUCTION` connection. `BUSINESS_ACTIONS_ENABLED` applies

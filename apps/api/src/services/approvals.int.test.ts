@@ -476,7 +476,7 @@ describe('ApprovalsService: business action plans', () => {
     route: 'SANKHYA_ACTION',
     reason: 'typed business action',
     action: 'SANKHYA.ACTION.CANCELAR_NOTA',
-    actions: ['SANKHYA.ACTION.CANCELAR_NOTA'],
+    actions: ['SANKHYA.ACTION.CANCELAR_NOTA', 'SANKHYA.BUSINESS_ACTION.EXECUTE'],
   };
   const actionPlan = (sql: string, capability: Capability = ACTION_CAPABILITY) =>
     plansService.create(
@@ -514,6 +514,9 @@ describe('ApprovalsService: business action plans', () => {
     await rule('ALLOW', approver, ['SANKHYA.ACTION.CANCELAR_NOTA'], ['TGFPAR']);
     await expectCode(service.decide(approval.id, approver, 'APPROVE', null), 'FORBIDDEN');
     await rule('ALLOW', approver, ['SANKHYA.ACTION.CANCELAR_NOTA'], ['TGFCAB']);
+    // Both permissions are decided by policy: the generic one needs its ALLOW too.
+    await expectCode(service.decide(approval.id, approver, 'APPROVE', null), 'FORBIDDEN');
+    await rule('ALLOW', approver, ['SANKHYA.BUSINESS_ACTION.EXECUTE'], ['TGFCAB']);
     await service.decide(approval.id, approver, 'APPROVE', null);
     expect(await planStatus(plan.id)).toBe('APPROVED');
   });
@@ -528,6 +531,12 @@ describe('ApprovalsService: business action plans', () => {
       actions: ['SANKHYA.ACTION.CANCELAR_NOTA', 'DATA.UPDATE'],
     });
     await expectCode(service.request(widened.id, requester), 'VALIDATION_ERROR');
+    // The generic permission left out of the frozen capability: its policy would go unchecked.
+    const narrowed = await actionPlan(STATEMENT, {
+      ...ACTION_CAPABILITY,
+      actions: ['SANKHYA.ACTION.CANCELAR_NOTA'],
+    });
+    await expectCode(service.request(narrowed.id, requester), 'VALIDATION_ERROR');
     const sqlUnderAction = await actionPlan("UPDATE TGFCAB SET STATUSNOTA = 'C' WHERE NUNOTA = 7");
     await expectCode(service.request(sqlUnderAction.id, requester), 'VALIDATION_ERROR');
     expect(await database.db.select().from(approvals)).toHaveLength(0);

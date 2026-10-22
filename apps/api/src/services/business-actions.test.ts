@@ -146,4 +146,41 @@ describe('the note services (bodies as their documentation pages show)', () => {
     });
     expect(excluir.input.safeParse({ nunota: 9 }).success).toBe(false);
   });
+
+  it('every column a request body sends is declared in writes(), for the policy', () => {
+    // Flags of the request, not columns.
+    const FLAGS = new Set(['INFORMARPRECO', 'IGNOREDESCPROMOQTD']);
+    const sent = (body: unknown, out = new Set<string>()): Set<string> => {
+      if (Array.isArray(body)) body.forEach((b) => sent(b, out));
+      else if (body && typeof body === 'object')
+        for (const [k, v] of Object.entries(body)) {
+          if (/^[A-Z][A-Z0-9_]*$/.test(k) && !FLAGS.has(k)) out.add(k);
+          sent(v, out);
+        }
+      return out;
+    };
+    const add = { nunota: 9, codprod: 7, qtdneg: 4, vlrunit: 3, codvol: 'UN' };
+    const full = { ...add, sequencia: 2, codlocalorig: 0, vlrdesc: 1, percdesc: 0 };
+    const cases: Array<[typeof incluir, unknown]> = [
+      [incluir, nota],
+      [incluir, { ...nota, informarPreco: false }],
+      [item, add],
+      [item, full],
+      [excluir, { nunota: 9, sequencia: 2 }],
+    ];
+    for (const [a, raw] of cases) {
+      const input = a.input.parse(raw);
+      const declared = new Set(Object.values(a.writes(input)).flat());
+      const body = sent(a.requestBody(input));
+      expect(body.size, a.id).toBeGreaterThan(0);
+      for (const col of body) expect(declared.has(col), `${a.id} ${col}`).toBe(true);
+    }
+  });
+
+  it('item actions also name the note (TGFCAB) they work under', () => {
+    expect(item.parent).toBe('TGFCAB');
+    expect(excluir.parent).toBe('TGFCAB');
+    expect(actionEntities(item)).toEqual(['TGFITE', 'TGFCAB']);
+    expect(actionEntities(excluir)).toEqual(['TGFITE', 'TGFCAB']);
+  });
 });

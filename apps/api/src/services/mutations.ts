@@ -805,7 +805,7 @@ export class MutationService {
     rawInput: unknown,
     onEnvironment?: (environment: Environment) => void,
   ): Promise<ActionResolution> {
-    // The generic permission and the action's own; the policy decides on the latter.
+    // The generic permission and the action's own: both must be held and allowed by policy.
     const permission = action.permission;
     for (const p of [BUSINESS_ACTION_PERMISSION, permission]) {
       if (!auth.grants.permissions.has(p)) {
@@ -896,28 +896,56 @@ export class MutationService {
       ? await this.actionChildren(connectionId, action.children, input, pk)
       : undefined;
     const childEntity = children?.table.name.toUpperCase();
-    const decision = await evaluateFor({
-      policies,
-      auth,
-      groupIds,
-      action: permission,
-      environment,
-      connectionId,
-      entities: childEntity ? [entity, childEntity] : [entity],
-      columns: [
-        ...selected.map((name) => ({ table: entity, name })),
-        ...(children ? children.columns.map((name) => ({ table: childEntity!, name })) : []),
-      ],
-      hasWhere: true,
-      defaults: { maxReadRows: this.deps.maxReadRows },
-    });
-    if (decision.effect !== 'ALLOW') {
-      throw refuse('AUTHORIZE', new AppError('FORBIDDEN', 'The action was denied by policy'), {
-        reasons: decision.reasons,
-        matchedRuleIds: decision.matchedRuleIds,
-        policyVersion: decision.policyVersion,
+    const parentCatalog = action.parent
+      ? await tableCatalog(metadata, connectionId, action.parent)
+      : undefined;
+    const parentTable = parentCatalog ? catalogTable(parentCatalog, action.parent!) : undefined;
+    const parentEntity = parentTable?.name.toUpperCase();
+    const entities = [
+      ...new Set([
+        entity,
+        ...(childEntity ? [childEntity] : []),
+        ...(parentEntity ? [parentEntity] : []),
+      ]),
+    ];
+    // Every column the request body sends, besides the ones read and verified. A delete removes
+    // the whole row: decided on every column (`columns` unknown counts as `*`).
+    const columns: PolicyColumn[] | undefined =
+      kind === 'delete'
+        ? undefined
+        : uniqueColumns([
+            ...selected.map((name) => ({ table: entity, name })),
+            ...(children ? children.columns.map((name) => ({ table: childEntity!, name })) : []),
+            ...Object.entries(action.writes(input)).flatMap(([t, names]) =>
+              names.map((name) => ({ table: t.toUpperCase(), name: name.toUpperCase() })),
+            ),
+          ]);
+    // Both permissions are decided: a rule on either one (a DENY in particular) applies.
+    const decisions: PolicyDecision[] = [];
+    for (const p of [permission, BUSINESS_ACTION_PERMISSION]) {
+      const d = await evaluateFor({
+        policies,
+        auth,
+        groupIds,
+        action: p,
+        environment,
+        connectionId,
+        entities,
+        ...(columns ? { columns } : {}),
+        hasWhere: true,
+        defaults: { maxReadRows: this.deps.maxReadRows },
       });
+      if (d.effect !== 'ALLOW') {
+        throw refuse('AUTHORIZE', new AppError('FORBIDDEN', 'The action was denied by policy'), {
+          permission: p,
+          reasons: d.reasons,
+          matchedRuleIds: d.matchedRuleIds,
+          policyVersion: d.policyVersion,
+        });
+      }
+      decisions.push(d);
     }
+    const decision = strictest(decisions[0]!, decisions[1]!);
     const written = 1 + (children?.rows.length ?? 0);
     if (decision.limits.maxWriteRows < written) {
       throw refuse(
@@ -930,6 +958,25 @@ export class MutationService {
     }
 
     // ---------------------------------------------------------------- PREVIEW
+    if (parentTable) {
+      // The row the action works under (the note of an item) must exist and be readable.
+      const parentPk = parentTable.columns.filter((c) => c.pk).map((c) => c.name.toUpperCase());
+      if (parentPk.length === 0 || !parentPk.every((k) => key[k] !== undefined)) {
+        throw refuse(
+          'PLAN',
+          new AppError(
+            'OPERATION_NOT_SUPPORTED',
+            `${parentEntity}: the action key does not name its row.`,
+          ),
+        );
+      }
+      await this.actionRow(auth, groupIds, connectionId, environment, parentCatalog!, {
+        entity: parentEntity!,
+        pk: parentPk,
+        key: Object.fromEntries(parentPk.map((k) => [k, key[k]!])),
+        selected: parentPk,
+      });
+    }
     const targetKey: RecordValues = {};
     let target: PreviewTarget;
     if (kind === 'create') {
@@ -979,9 +1026,9 @@ export class MutationService {
     const capability: Capability = {
       class: 'SUPPORTED',
       route: 'SANKHYA_ACTION',
-      reason: `Business action ${action.id} on ${childEntity ? `${entity} and ${childEntity}` : entity}.`,
+      reason: `Business action ${action.id} on ${entities.join(', ')}.`,
       action: permission,
-      actions: [permission],
+      actions: [permission, BUSINESS_ACTION_PERMISSION],
     };
     return {
       action,
@@ -2385,6 +2432,41 @@ function catalogTable(catalog: Catalog, name: string): CatalogTable {
       new AppError('RESOURCE_NOT_FOUND', `Table ${name} is not in the catalog of this connection`),
     );
   return t;
+}
+
+/** Policy columns without repeats. */
+function uniqueColumns(columns: PolicyColumn[]): PolicyColumn[] {
+  const seen = new Map(columns.map((c) => [`${c.table}.${c.name}`, c]));
+  return [...seen.values()];
+}
+
+/**
+ * The two decisions of a business action (its own permission and the generic one) as one: the
+ * lower row limits, every confirmation either asks for, and snapshots only when both keep them.
+ */
+function strictest(a: PolicyDecision, b: PolicyDecision): PolicyDecision {
+  const x = a.limits;
+  const y = b.limits;
+  return {
+    effect: 'ALLOW',
+    reasons: [...a.reasons, ...b.reasons],
+    matchedRuleIds: [...new Set([...a.matchedRuleIds, ...b.matchedRuleIds])],
+    limits: {
+      maxReadRows: Math.min(x.maxReadRows, y.maxReadRows),
+      maxWriteRows: Math.min(x.maxWriteRows, y.maxWriteRows),
+      requireWhere: x.requireWhere || y.requireWhere,
+      requirePreview: x.requirePreview || y.requirePreview,
+      requireConfirmation: x.requireConfirmation || y.requireConfirmation,
+      requireStrongConfirmation: x.requireStrongConfirmation || y.requireStrongConfirmation,
+      requireApproval: x.requireApproval || y.requireApproval,
+      auditSnapshots: x.auditSnapshots && y.auditSnapshots,
+    },
+    rowLimitsFromRules: {
+      maxReadRows: a.rowLimitsFromRules.maxReadRows || b.rowLimitsFromRules.maxReadRows,
+      maxWriteRows: a.rowLimitsFromRules.maxWriteRows || b.rowLimitsFromRules.maxWriteRows,
+    },
+    policyVersion: a.policyVersion,
+  };
 }
 
 function columnOf(name: string, known: Set<string>): string {

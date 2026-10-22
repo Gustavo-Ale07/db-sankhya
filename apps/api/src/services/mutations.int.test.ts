@@ -1813,7 +1813,7 @@ describe('execution report: before, expected and observed', () => {
     await h.policy({
       name: 'actions allowed',
       effect: 'ALLOW',
-      actions: ACTION_PERMISSIONS,
+      actions: [...ACTION_PERMISSIONS, 'SANKHYA.BUSINESS_ACTION.EXECUTE'],
     });
     const { cookie } = await h.userWith([
       'QUERY.SELECT',
@@ -1858,11 +1858,12 @@ describe('business actions', () => {
   ];
   const BASE = '/api/actions/CACSP.cancelarNota';
   const INPUT = { nunota: 7, justificativa: 'Nota emitida em duplicidade' };
+  // Both permissions are decided by policy: the action's own and the generic one.
   const allowActions = (h: Harness) =>
     h.policy({
       name: 'actions allowed',
       effect: 'ALLOW',
-      actions: ACTION_PERMISSIONS,
+      actions: [...ACTION_PERMISSIONS, 'SANKHYA.BUSINESS_ACTION.EXECUTE'],
     });
   const actionCalls = (mock: MockSankhya) =>
     mock.calls.filter((c) => c.serviceName === 'CACSP.cancelarNota');
@@ -2197,6 +2198,44 @@ describe('business actions', () => {
     expect(h.mock.calls).toEqual([]);
   });
 
+  it('a DENY on the generic permission blocks every action, before any read', async () => {
+    const h = await setup(WRITES);
+    await allowActions(h);
+    await h.policy({ name: 'no actions', actions: ['SANKHYA.BUSINESS_ACTION.EXECUTE'] });
+    const { cookie } = await h.userWith(ACTOR);
+    const res = await prepareAction(h, cookie);
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error.code).toBe('FORBIDDEN');
+    expect(h.mock.calls.filter((c) => c.serviceName.startsWith('CACSP.'))).toEqual([]);
+    expect(await h.audit('PLAN_CREATED')).toEqual([]);
+  });
+
+  it('an ALLOW on the own permission only (not the generic one) is refused', async () => {
+    const h = await setup(WRITES);
+    await h.policy({ name: 'own only', effect: 'ALLOW', actions: ACTION_PERMISSIONS });
+    const { cookie } = await h.userWith(ACTOR);
+    const res = await prepareAction(h, cookie);
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error.code).toBe('FORBIDDEN');
+    expect(actionCalls(h.mock)).toEqual([]);
+  });
+
+  it('a column the action sets is decided by policy (STATUSNOTA)', async () => {
+    const h = await setup(WRITES);
+    await allowActions(h);
+    await h.policy({
+      name: 'status is closed',
+      actions: ['SANKHYA.ACTION.CANCELAR_NOTA'],
+      entities: ['TGFCAB'],
+      columns: ['TGFCAB.STATUSNOTA'],
+    });
+    const { cookie } = await h.userWith(ACTOR);
+    const res = await prepareAction(h, cookie);
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error.code).toBe('FORBIDDEN');
+    expect(actionCalls(h.mock)).toEqual([]);
+  });
+
   it('prepare carries the contract and the mock-only warning', async () => {
     const h = await setup(WRITES);
     await allowActions(h);
@@ -2333,7 +2372,7 @@ describe('business actions', () => {
       await h.policy({
         name: 'notes only',
         effect: 'ALLOW',
-        actions: ['SANKHYA.ACTION.INCLUIR_NOTA'],
+        actions: ['SANKHYA.ACTION.INCLUIR_NOTA', 'SANKHYA.BUSINESS_ACTION.EXECUTE'],
         entities: ['TGFCAB'],
       });
       const { cookie } = await h.userWith(ACTOR);
@@ -2341,6 +2380,69 @@ describe('business actions', () => {
       expect(res.statusCode).toBe(403);
       expect(res.json().error.code).toBe('FORBIDDEN');
       expect(h.mock.calls.filter((c) => c.serviceName.startsWith('CACSP.'))).toEqual([]);
+    });
+
+    it('incluirNota: a DENY on a column the body sends (TGFCAB.DTNEG) refuses it', async () => {
+      const h = await setup(WRITES);
+      await allowActions(h);
+      await h.policy({
+        name: 'no backdating',
+        actions: ['SANKHYA.ACTION.INCLUIR_NOTA'],
+        entities: ['TGFCAB'],
+        columns: ['TGFCAB.DTNEG'],
+      });
+      const { cookie } = await h.userWith(ACTOR);
+      const res = await prepareAction(h, cookie, NOTA, INCLUIR);
+      expect(res.statusCode).toBe(403);
+      expect(res.json().error.code).toBe('FORBIDDEN');
+      expect(calls(h.mock, 'CACSP.incluirNota')).toEqual([]);
+    });
+
+    it('item actions need the policy to allow the note (TGFCAB) too', async () => {
+      const h = await setup(WRITES);
+      await h.policy({
+        name: 'items only',
+        effect: 'ALLOW',
+        actions: [...ACTION_PERMISSIONS, 'SANKHYA.BUSINESS_ACTION.EXECUTE'],
+        entities: ['TGFITE'],
+      });
+      const { cookie } = await h.userWith(ACTOR);
+      for (const [url, input] of [
+        [ITEM, { nunota: 9, codprod: 7, qtdneg: 4, vlrunit: 3, codvol: 'UN' }],
+        [EXCLUIR, { nunota: 9, sequencia: 1 }],
+      ] as const) {
+        const res = await prepareAction(h, cookie, input, url);
+        expect(res.statusCode, url).toBe(403);
+        expect(res.json().error.code, url).toBe('FORBIDDEN');
+      }
+      expect(h.mock.calls.filter((c) => c.serviceName.startsWith('CACSP.'))).toEqual([]);
+    });
+
+    it('excluirItemNota is decided on every column of the item', async () => {
+      const h = await setup(WRITES);
+      await allowActions(h);
+      await h.policy({
+        name: 'item price is closed',
+        actions: ['SANKHYA.ACTION.EXCLUIR_ITEM_NOTA'],
+        entities: ['TGFITE'],
+        columns: ['TGFITE.VLRUNIT'],
+      });
+      const { cookie } = await h.userWith(ACTOR);
+      const res = await prepareAction(h, cookie, { nunota: 9, sequencia: 1 }, EXCLUIR);
+      expect(res.statusCode).toBe(403);
+      expect(res.json().error.code).toBe('FORBIDDEN');
+      expect(calls(h.mock, 'CACSP.excluirItemNota')).toEqual([]);
+    });
+
+    it('incluirAlterarItemNota on a missing note is refused at preview, nothing is called', async () => {
+      const h = await setup(WRITES);
+      await allowActions(h);
+      const { cookie } = await h.userWith(ACTOR);
+      const input = { nunota: 99999, codprod: 7, qtdneg: 4, vlrunit: 3, codvol: 'UN' };
+      const res = await prepareAction(h, cookie, input, ITEM);
+      expect(res.statusCode, res.body).toBe(400);
+      expect(res.json().error.code).toBe('RESOURCE_NOT_FOUND');
+      expect(calls(h.mock, 'CACSP.incluirAlterarItemNota')).toEqual([]);
     });
 
     it('incluirNota with informarPreco and an item without price is invalid', async () => {

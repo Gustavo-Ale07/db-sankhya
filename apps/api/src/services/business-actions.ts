@@ -30,7 +30,8 @@ export type ActionKind = 'update' | 'create' | 'delete';
 export type ActionPermission = Extract<Permission, `SANKHYA.ACTION.${string}`>;
 
 /** The permission every action also needs, besides its own. */
-export const BUSINESS_ACTION_PERMISSION: Permission = 'SANKHYA.BUSINESS_ACTION.EXECUTE';
+export const BUSINESS_ACTION_PERMISSION =
+  'SANKHYA.BUSINESS_ACTION.EXECUTE' as const satisfies Permission;
 
 /** Shown with every action: none of them has run against a real gateway yet. */
 export const ACTION_WARNING = 'validado só no mock; testar em HOMOLOGAÇÃO antes de produção';
@@ -51,6 +52,11 @@ export interface BusinessAction<I extends Record<string, unknown> = Record<strin
   permission: ActionPermission;
   /** The table (catalog name) of the row the action creates, changes or removes. */
   entity: string;
+  /**
+   * The table (catalog name) of the row the action works under, when it is not `entity` (the
+   * note of an item): the policy covers it too, and the row is read before any call.
+   */
+  parent?: string;
   description: string;
   /** The official documentation page the request body follows. */
   contract: string;
@@ -67,6 +73,11 @@ export interface BusinessAction<I extends Record<string, unknown> = Record<strin
   effect(input: I): Record<string, ActionValue>;
   /** Gateway request body, as in `contract`. */
   requestBody(input: I): unknown;
+  /**
+   * Every column the request body sends or sets, by table (catalog name): the policy decides on
+   * all of them. A delete removes the whole row and is decided on every column instead.
+   */
+  writes(input: I): Record<string, string[]>;
   /** create: the generated key in the gateway's `responseBody`, or undefined when absent. */
   createdKey?(responseBody: unknown): Record<string, number> | undefined;
   /** create: the child rows created with the row. */
@@ -139,6 +150,7 @@ const cancelarNota: BusinessAction<CancelarNotaInput> = {
   requestBody: (i) => ({
     notasCanceladas: { nunota: [v(i.nunota)], justificativa: i.justificativa },
   }),
+  writes: () => ({ TGFCAB: ['NUNOTA', 'STATUSNOTA'] }),
 };
 
 // ---------------------------------------------------------------------- CACSP.incluirNota
@@ -225,6 +237,27 @@ const incluirNota: BusinessAction<IncluirNotaInput> = {
       },
     },
   }),
+  writes: (i) => ({
+    TGFCAB: [
+      'NUNOTA',
+      'CODPARC',
+      'DTNEG',
+      'CODTIPOPER',
+      'CODTIPVENDA',
+      'CODVEND',
+      'CODEMP',
+      'TIPMOV',
+    ],
+    TGFITE: [
+      'NUNOTA',
+      'SEQUENCIA',
+      'CODPROD',
+      'QTDNEG',
+      'CODLOCALORIG',
+      'CODVOL',
+      ...(i.informarPreco ? ['VLRUNIT', 'PERCDESC'] : []),
+    ],
+  }),
   createdKey: (body) => pkOf(body, ['NUNOTA']),
   children: {
     entity: 'TGFITE',
@@ -266,6 +299,8 @@ const incluirAlterarItemNota: BusinessAction<ItemNotaInput> = {
   module: 'mgecom',
   permission: 'SANKHYA.ACTION.INCLUIR_ALTERAR_ITEM_NOTA',
   entity: 'TGFITE',
+  // The item belongs to a note, and the ERP recomputes the note's totals.
+  parent: 'TGFCAB',
   description:
     'Adds an item to a note (TGFITE), or changes one by its sequence. The TOP must allow it.',
   contract: `${DOCS}/post_incaltitemmovimento`,
@@ -295,6 +330,21 @@ const incluirAlterarItemNota: BusinessAction<ItemNotaInput> = {
       },
     },
   }),
+  writes: (i) => ({
+    TGFCAB: ['NUNOTA', 'VLRNOTA'],
+    TGFITE: [
+      'NUNOTA',
+      'SEQUENCIA',
+      'CODPROD',
+      'QTDNEG',
+      'VLRUNIT',
+      'VLRTOT',
+      'CODVOL',
+      ...(i.codlocalorig !== undefined ? ['CODLOCALORIG'] : []),
+      ...(i.vlrdesc !== undefined ? ['VLRDESC'] : []),
+      ...(i.percdesc !== undefined ? ['PERCDESC'] : []),
+    ],
+  }),
   createdKey: (body) => pkOf(body, ['NUNOTA', 'SEQUENCIA']),
 };
 
@@ -308,6 +358,7 @@ const excluirItemNota: BusinessAction<ExcluirItemNotaInput> = {
   module: 'mgecom',
   permission: 'SANKHYA.ACTION.EXCLUIR_ITEM_NOTA',
   entity: 'TGFITE',
+  parent: 'TGFCAB',
   description: 'Removes one item (TGFITE) of a note by its sequence.',
   contract: `${DOCS}/post_excluiitemmovimento`,
   input: excluirItemNotaInput,
@@ -318,6 +369,8 @@ const excluirItemNota: BusinessAction<ExcluirItemNotaInput> = {
   requestBody: (i) => ({
     nota: { itens: { item: { NUNOTA: v(i.nunota), SEQUENCIA: v(i.sequencia) } } },
   }),
+  // The whole item goes (decided on every column, see resolveAction); the note's totals change.
+  writes: () => ({ TGFCAB: ['NUNOTA', 'VLRNOTA'], TGFITE: ['NUNOTA', 'SEQUENCIA'] }),
 };
 
 /** Known services that stay disabled: their contract could not be confirmed. */
@@ -366,7 +419,8 @@ export function actionEnabled(
 
 /** Every table the action writes: its entity, then the entity of its child rows. */
 export function actionEntities(action: BusinessAction): string[] {
-  return action.children ? [action.entity, action.children.entity] : [action.entity];
+  const all = [action.entity, action.children?.entity, action.parent];
+  return [...new Set(all.filter((e): e is string => e !== undefined))];
 }
 
 /** A word for the plan summary and the strong phrase: `CACSP.cancelarNota` → `CACSP_CANCELARNOTA`. */
