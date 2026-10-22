@@ -71,6 +71,16 @@ describe('resolveCapability', () => {
     expect(c.reason).toMatch(/native DDL forbidden/);
   });
 
+  it('a tmp_ table is scratch with or without TEMPORARY (it never becomes an artifact)', () => {
+    expect(resolve('CREATE TABLE tmp_b (a int)')).toMatchObject({
+      class: 'SCRATCH_ONLY',
+      route: 'SCRATCH',
+      action: 'TEMP.CREATE',
+    });
+    expect(resolve('CREATE TABLE tmp_b AS SELECT a FROM tmp_a').route).toBe('SCRATCH');
+    expect(resolve('CREATE TABLE tmp_b AS SELECT CODPARC FROM TGFPAR').route).toBe('HYBRID');
+  });
+
   it('scratch DDL and writes are SCRATCH_ONLY', () => {
     expect(resolve('CREATE TEMP TABLE tmp_a (a int)')).toMatchObject({
       class: 'SCRATCH_ONLY',
@@ -171,6 +181,7 @@ describe('resolveCapability', () => {
       );
       expect(r('DROP TABLE tmp_cat', leakyCatalog).class).toBe('UNSUPPORTED');
       expect(r('CREATE TEMP TABLE tmp_cat (A INT)', leakyCatalog).class).toBe('UNSUPPORTED');
+      expect(r('CREATE TABLE tmp_cat (A INT)', leakyCatalog).class).toBe('UNSUPPORTED');
     });
 
     it('renaming a scratch table onto a native name is UNSUPPORTED', () => {

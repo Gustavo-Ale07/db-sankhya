@@ -128,7 +128,8 @@ export function resolveCapability(c: Classified, ctx: CapabilityContext): Capabi
 
     case 'CREATE_TABLE': {
       const touched = ddlTables(c.ast, c.table);
-      if (c.temporary && isScratchName(c.table)) {
+      // A tmp_ table lives in the caller's scratch, TEMPORARY or not; it is never an artifact.
+      if (isScratchName(c.table)) {
         const foreign = touched.find((t) => !isScratchName(t));
         if (foreign !== undefined) {
           return unsupported(`${c.table}: a scratch table may not reference ${foreign}.`);
