@@ -98,6 +98,67 @@ export function splitHybrid(
   };
 }
 
+export interface CreateAs {
+  /** `CREATE … TABLE <name> AS `, exactly as written (with the space after AS). */
+  head: string;
+  /** The query, as written, without wrapping parentheses. */
+  query: string;
+}
+
+const CREATE_MODIFIERS = /^(temp|temporary|global|local|unlogged)$/i;
+
+/**
+ * Splits `CREATE [TEMP] TABLE [IF NOT EXISTS] <name> AS <query>` into its head and its query,
+ * lexically, so the query keeps the exact text the user wrote. Null for anything else (a column
+ * list, a second statement, a query that is not a SELECT / WITH).
+ */
+export function splitCreateAs(sql: string): CreateAs | null {
+  const tokens = tokenize(sql, { ansi: true }).filter(isSignificant);
+  const word = (i: number, re: RegExp) => tokens[i]?.type === 'word' && re.test(tokens[i]!.text);
+  let i = 0;
+  if (!word(i++, /^create$/i)) return null;
+  while (word(i, CREATE_MODIFIERS)) i++;
+  if (!word(i++, /^table$/i)) return null;
+  if (word(i, /^if$/i)) {
+    if (!word(i + 1, /^not$/i) || !word(i + 2, /^exists$/i)) return null;
+    i += 3;
+  }
+  if (tokens[i]?.type !== 'word') return null;
+  i++;
+  if (tokens[i]?.text === '.' && tokens[i + 1]?.type === 'word') i += 2;
+  if (!word(i++, /^as$/i)) return null;
+  const rest = tokens.slice(i);
+  // One statement: a trailing semicolon is fine, a second statement is not.
+  const semi = rest.findIndex((t) => t.text === ';');
+  if (semi !== -1 && semi !== rest.length - 1) return null;
+  const body = semi === -1 ? rest : rest.slice(0, -1);
+  if (body.length === 0) return null;
+  let first = 0;
+  let last = body.length - 1;
+  // `AS (query)`: drop the parentheses when they wrap the whole query.
+  if (body[0]!.text === '(' && body[last]!.text === ')' && closes(body, 0) === last) {
+    first = 1;
+    last -= 1;
+  }
+  if (first > last || body[first]!.type !== 'word' || !/^(select|with)$/i.test(body[first]!.text)) {
+    return null;
+  }
+  return {
+    head: sql.slice(0, body[0]!.start),
+    query: sql.slice(body[first]!.start, body[last]!.end),
+  };
+}
+
+/** Index of the `)` that closes the `(` at `open`, or -1. */
+function closes(tokens: ReadonlyArray<{ text: string }>, open: number): number {
+  let depth = 0;
+  for (let i = open; i < tokens.length; i++) {
+    if (tokens[i]!.text === '(') depth++;
+    else if (tokens[i]!.text === ')' && --depth === 0) return i;
+  }
+  return -1;
+}
+
 function refuse(): string {
   throw new Error('An overflowing split cannot be rewritten.');
 }

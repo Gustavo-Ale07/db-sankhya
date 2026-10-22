@@ -29,8 +29,8 @@ export type {
   CapabilityRoute,
 } from './capability';
 export { classifyStatement } from './classify';
-export { splitHybrid } from './hybrid';
-export type { HybridPart, HybridSplit } from './hybrid';
+export { splitCreateAs, splitHybrid } from './hybrid';
+export type { CreateAs, HybridPart, HybridSplit } from './hybrid';
 export type { Classified, DdlKind, WriteKind as ClassifiedWriteKind } from './classify';
 export { convertWriteNode } from './parser';
 export * from './ddl';

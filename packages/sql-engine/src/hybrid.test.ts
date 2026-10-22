@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { splitHybrid } from './hybrid';
+import { splitCreateAs, splitHybrid } from './hybrid';
 
 const scratch = (t: string) => /^tmp_/i.test(t);
 
@@ -64,5 +64,34 @@ describe('splitHybrid', () => {
     const ok = splitHybrid(sql, scratch, { maxParts: 3, maxGroups: 3 });
     expect(ok.overflow).toBe(false);
     expect(ok.parts).toHaveLength(3);
+  });
+});
+
+describe('splitCreateAs', () => {
+  it('separates the head of a CREATE … AS from its query, keeping the text', () => {
+    expect(
+      splitCreateAs('CREATE TEMPORARY TABLE tmp_x AS SELECT A, B FROM TGFPAR WHERE A > 1'),
+    ).toEqual({
+      head: 'CREATE TEMPORARY TABLE tmp_x AS ',
+      query: 'SELECT A, B FROM TGFPAR WHERE A > 1',
+    });
+    expect(
+      splitCreateAs('create table tmp_x as\n  with p as (select 1 as a) select * from p'),
+    ).toEqual({
+      head: 'create table tmp_x as\n  ',
+      query: 'with p as (select 1 as a) select * from p',
+    });
+    expect(splitCreateAs('CREATE TABLE tmp_x AS (SELECT A FROM TGFPAR)')).toEqual({
+      head: 'CREATE TABLE tmp_x AS ',
+      query: 'SELECT A FROM TGFPAR',
+    });
+  });
+
+  it('is null for anything that is not a CREATE TABLE … AS query', () => {
+    expect(splitCreateAs('CREATE TABLE tmp_x (a int)')).toBeNull();
+    expect(splitCreateAs("CREATE TABLE tmp_x (a text DEFAULT 'AS SELECT')")).toBeNull();
+    expect(splitCreateAs('SELECT A AS B FROM T')).toBeNull();
+    expect(splitCreateAs('INSERT INTO tmp_x SELECT 1')).toBeNull();
+    expect(splitCreateAs('CREATE TABLE tmp_x AS SELECT 1; DROP TABLE tmp_y')).toBeNull();
   });
 });
