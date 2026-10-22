@@ -17,6 +17,11 @@ const root = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 export const E2E_DIR = join(tmpdir(), `dbx-e2e-${PORT}`);
 const PASSWORD_FILE = join(E2E_DIR, 'bootstrap-password.txt');
 export const BASE_URL = `http://localhost:${PORT}`;
+/**
+ * The main server's mock gateway appends the service name of every call here (never a body):
+ * editor-tmp.spec.ts proves a tmp_ session made no write call. start-server.mjs empties E2E_DIR.
+ */
+export const MOCK_CALL_LOG = join(E2E_DIR, 'mock-calls.log');
 
 /**
  * A second server, two ports up, whose mock gateway cuts every result at 50 rows without
@@ -91,7 +96,10 @@ export default defineConfig({
       use: { ...devices['Desktop Chrome'], viewport: { width: 1440, height: 900 } },
     },
   ],
-  webServer: [server(PORT), server(CUT_PORT, CUT_GATEWAY)],
+  webServer: [
+    server(PORT, { SANKHYA_MOCK_CALL_LOG: MOCK_CALL_LOG }),
+    server(CUT_PORT, CUT_GATEWAY),
+  ],
 });
 
 function server(port: number, extra: Record<string, string> = {}) {

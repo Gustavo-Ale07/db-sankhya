@@ -146,6 +146,34 @@ describe('mock Sankhya gateway', () => {
     }
   }, 60_000);
 
+  it('reports each gateway call by service name to onCall, never its body', async () => {
+    const seen: string[][] = [];
+    const logged = await createMockSankhya({ onCall: (...args) => void seen.push(args) });
+    try {
+      const auth = await logged.handle({
+        method: 'POST',
+        url: '/authenticate',
+        headers: { 'x-token': MOCK_CREDENTIALS.xToken },
+        body: new URLSearchParams({
+          client_id: MOCK_CREDENTIALS.clientId,
+          client_secret: MOCK_CREDENTIALS.clientSecret,
+          grant_type: 'client_credentials',
+        }).toString(),
+      });
+      const t =
+        auth.kind === 'response' ? (JSON.parse(auth.body) as { access_token: string }) : undefined;
+      await logged.handle({
+        method: 'POST',
+        url: '/gateway/v1/mge/service.sbr?serviceName=DbExplorerSP.executeQuery',
+        headers: { authorization: `Bearer ${t!.access_token}` },
+        body: JSON.stringify({ requestBody: { sql: 'SELECT CODPROD FROM TGFPRO' } }),
+      });
+      expect(seen).toEqual([['DbExplorerSP.executeQuery']]);
+    } finally {
+      await logged.close();
+    }
+  });
+
   it('executeQuery with silentCut cuts at the row cap without saying so', async () => {
     const capped = await createMockSankhya({ queryRowCap: 5, silentCut: true });
     try {

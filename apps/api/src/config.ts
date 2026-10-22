@@ -165,6 +165,8 @@ const envSchema = z.object({
   SANKHYA_MOCK_ROW_CAP: optionalInt(1, 100_000),
   SANKHYA_MOCK_SILENT_CUT: bool(false),
   SANKHYA_MOCK_DICTIONARY_PADDING: optionalInt(0, 100_000),
+  /** File the mock appends each gateway call's service name to (the E2E asserts no write call). */
+  SANKHYA_MOCK_CALL_LOG: optionalText,
   SCRATCH_MAX_WORKSPACES: int(20, 1, 1000),
   SCRATCH_MAX_ROWS: int(100_000, 100, 10_000_000),
   SCRATCH_MAX_TABLES: int(20, 1, 500),
@@ -203,7 +205,13 @@ export interface SankhyaConfig {
   /** Rows a read returns at most (the result is flagged as truncated beyond it). */
   maxRows: number;
   /** SANKHYA_MOCK_*: options of the built-in mock gateway, empty unless a test sets them. */
-  mockGateway: { queryRowCap?: number; silentCut?: boolean; dictionaryPadding?: number };
+  mockGateway: {
+    queryRowCap?: number;
+    silentCut?: boolean;
+    dictionaryPadding?: number;
+    /** File each gateway call's service name is appended to (never its body). */
+    callLog?: string;
+  };
   /** Set only when every SANKHYA_* credential is present. */
   envConnection?: EnvSankhyaConnection;
   /**
@@ -360,6 +368,7 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
     ...(e.SANKHYA_MOCK_DICTIONARY_PADDING !== undefined
       ? { dictionaryPadding: e.SANKHYA_MOCK_DICTIONARY_PADDING }
       : {}),
+    ...(e.SANKHYA_MOCK_CALL_LOG ? { callLog: e.SANKHYA_MOCK_CALL_LOG } : {}),
   };
   if (Object.keys(mockGateway).length && (isProduction || sankhyaMode !== 'mock'))
     problems.push(

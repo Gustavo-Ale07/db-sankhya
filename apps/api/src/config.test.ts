@@ -264,6 +264,13 @@ describe('Sankhya runtime configuration', () => {
         SANKHYA_MOCK_DICTIONARY_PADDING: '120',
       }).sankhya.mockGateway,
     ).toEqual({ queryRowCap: 50, silentCut: true, dictionaryPadding: 120 });
+    expect(
+      loadConfig({ SANKHYA_MODE: 'mock', SANKHYA_MOCK_CALL_LOG: '/tmp/e2e/calls.log' }).sankhya
+        .mockGateway,
+    ).toEqual({ callLog: '/tmp/e2e/calls.log' });
+    expect(
+      problemsOf({ SANKHYA_MODE: 'live', SANKHYA_MOCK_CALL_LOG: '/tmp/x.log' }).join(),
+    ).toMatch(/SANKHYA_MOCK_\*/);
     expect(problemsOf({ SANKHYA_MODE: 'live', SANKHYA_MOCK_SILENT_CUT: 'true' }).join()).toMatch(
       /SANKHYA_MOCK_\* .*SANKHYA_MODE=mock/,
     );

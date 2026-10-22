@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { lookup } from 'node:dns/promises';
+import { appendFileSync } from 'node:fs';
 import { asc, eq } from 'drizzle-orm';
 import { connections } from '@dbx/database';
 import type { ConnectionRow, Database } from '@dbx/database';
@@ -327,8 +328,7 @@ export class ConnectionsService {
 
   private mockGateway(): Promise<MockGateway> {
     if (!this.mock) {
-      const start =
-        this.deps.mockGateway ?? (() => createMockSankhya(this.config.sankhya.mockGateway));
+      const start = this.deps.mockGateway ?? (() => createMockSankhya(mockOptions(this.config)));
       const mock = start();
       this.mock = mock;
       // A failed start must not stay cached.
@@ -498,4 +498,15 @@ function notFound() {
 
 function duplicateName() {
   return new AppError('CONFLICT', 'A connection with this name already exists');
+}
+
+/** The mock gateway's options; SANKHYA_MOCK_CALL_LOG becomes a service-name-only call log. */
+function mockOptions(config: AppConfig) {
+  const { callLog, ...options } = config.sankhya.mockGateway;
+  return callLog
+    ? {
+        ...options,
+        onCall: (serviceName: string) => appendFileSync(callLog, serviceName + '\n'),
+      }
+    : options;
 }

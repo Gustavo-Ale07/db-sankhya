@@ -79,6 +79,8 @@ export interface MockSankhyaOptions {
   unpagedDictionary?: boolean;
   /** Fictitious TDDCAM rows ahead of the demo tables' rows (see seedMockDataset). */
   dictionaryPadding?: number;
+  /** Told the service name of every authenticated gateway call (never its body), as it arrives. */
+  onCall?: (serviceName: string) => void;
   now?: () => number;
 }
 
@@ -225,6 +227,7 @@ export async function createMockSankhya(opts: MockSankhyaOptions = {}): Promise<
 
     const serviceName = url.searchParams.get('serviceName') ?? '';
     calls.push({ serviceName, requestBody: bodyOf(req.body) });
+    opts.onCall?.(serviceName);
     const fault = takeFault(serviceName, req.body);
     if (fault) {
       const early = await applyFault(fault, req.signal);
