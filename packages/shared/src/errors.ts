@@ -39,6 +39,8 @@ export const ERROR_HTTP_STATUS = {
   QUERY_TIMEOUT: 504,
   QUERY_CANCELLED: 499,
   SANKHYA_AUTH_ERROR: 502,
+  /** The gateway answered "não autorizado" to a write: its integration user may not write. */
+  SANKHYA_WRITE_NOT_AUTHORIZED: 403,
   SANKHYA_RATE_LIMITED: 429,
   SANKHYA_UNAVAILABLE: 503,
   SANKHYA_API_ERROR: 502,

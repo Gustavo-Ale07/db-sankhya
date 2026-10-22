@@ -41,6 +41,7 @@ import type { ApprovalsService } from './approvals';
 import { gatesHold } from './approvals';
 import type { AuthzService } from './authz';
 import {
+  BUSINESS_ACTION_PERMISSION,
   actionEnabled,
   actionStatement,
   actionWord,
@@ -75,7 +76,14 @@ import { dropEphemeral, planScratchCreateAs } from './hybrid';
 import type { HybridPart } from './hybrid';
 import type { AuditLifecycleContext, AuditService } from './records';
 import type { SecuritySettingsService } from './security-settings';
-import { labelOf, reportForAudit, statusOf, valuesMatch, verifyByKey } from './verification';
+import {
+  labelOf,
+  reportForAudit,
+  statusOf,
+  valuesMatch,
+  verifyByKey,
+  verifyChildren,
+} from './verification';
 import type { ExecutionReport, ExecutionStep, VerifyResult } from './verification';
 
 export type { ExecutionReport, ExecutionStep } from './verification';
@@ -294,11 +302,26 @@ interface ActionResolution {
   capability: Capability;
   decision: PolicyDecision;
   table: CatalogTable;
-  /** Exactly one: the row the action changes, with its real before values. */
+  /** The table of the child rows created with the row, when the action has any. */
+  childTable?: CatalogTable;
+  /** The row the action creates, changes or removes, then the child rows it creates. */
   targets: PreviewTarget[];
 }
 
 const invalidPlan = (message: string) => new AppError('CONFIRMATION_INVALID', message);
+
+/**
+ * The error code of a write step that threw. A "não autorizado" inside an HTTP 200 envelope is
+ * the gateway's service layer refusing this integration user's write (DatasetSP.save or an
+ * action), not a token problem: it gets its own code so the UI can say what to ask for.
+ */
+function stepErrorCode(err: unknown): string {
+  if (!isAppError(err)) return 'WRITE_OUTCOME_UNKNOWN';
+  if (err.code === 'SANKHYA_AUTH_ERROR' && err.details?.httpStatus === 200) {
+    return 'SANKHYA_WRITE_NOT_AUTHORIZED';
+  }
+  return err.code;
+}
 
 export class MutationService {
   constructor(private readonly deps: MutationDeps) {}
@@ -632,6 +655,8 @@ export class MutationService {
       decision: PolicyDecision;
       targets: PreviewTarget[];
       entity: string;
+      /** Every table the plan writes, when more than `entity` (a business action's child rows). */
+      entities?: string[];
       /** The TDDINS instance a Sankhya plan saves through, frozen in the plan (see execute). */
       entityName?: string | undefined;
       previewKind: PreviewKind;
@@ -680,7 +705,7 @@ export class MutationService {
       previewKind,
       previewLabels,
       preview,
-      impact: { entities: [entity], rows: affected, environment },
+      impact: { entities: o.entities ?? [entity], rows: affected, environment },
       requires: {
         strongConfirmation: needsPhrase
           ? strongConfirmationPhrase(environment, operation, affected, entity)
@@ -729,9 +754,10 @@ export class MutationService {
   /**
    * PARSE → … → IMPACT of a typed business action (Task 11.3). The input is validated against the
    * action's schema, the connection must allow the action (live connections only run the actions
-   * listed in BUSINESS_ACTIONS_ENABLED), the PolicyEngine decides on the action's permission with
-   * `entities = [action.entity]`, and the row is read for real (IMPACT_ANALYSIS) with the
-   * expected effect applied (SIMULATED_PREVIEW). Nothing is called: the plan runs only through
+   * listed in BUSINESS_ACTIONS_ENABLED), the PolicyEngine decides on the action's own permission
+   * with every table it writes (`actionEntities`), and the row an update or delete names is read
+   * for real (IMPACT_ANALYSIS) with the expected effect applied (SIMULATED_PREVIEW); a create
+   * previews the row (and child rows) it will add. Nothing is called: the plan runs only through
    * `execute`.
    */
   async prepareAction(ctx: PrepareActionContext): Promise<PreparedAction> {
@@ -755,6 +781,9 @@ export class MutationService {
           decision: a.decision,
           targets: a.targets,
           entity: a.table.name.toUpperCase(),
+          entities: [a.table.name, ...(a.childTable ? [a.childTable.name] : [])].map((n) =>
+            n.toUpperCase(),
+          ),
           entityName: a.table.entityName,
           previewKind: 'IMPACT_ANALYSIS',
           previewLabels: ['IMPACT_ANALYSIS', 'SIMULATED_PREVIEW'],
@@ -776,12 +805,17 @@ export class MutationService {
     rawInput: unknown,
     onEnvironment?: (environment: Environment) => void,
   ): Promise<ActionResolution> {
+    // The generic permission and the action's own; the policy decides on the latter.
     const permission = action.permission;
-    if (!auth.grants.permissions.has(permission)) {
-      throw refuse(
-        'AUTHORIZE',
-        new AppError('FORBIDDEN', 'You do not have permission for this action', { permission }),
-      );
+    for (const p of [BUSINESS_ACTION_PERMISSION, permission]) {
+      if (!auth.grants.permissions.has(p)) {
+        throw refuse(
+          'AUTHORIZE',
+          new AppError('FORBIDDEN', 'You do not have permission for this action', {
+            permission: p,
+          }),
+        );
+      }
     }
     const parsed = action.input.safeParse(rawInput);
     if (!parsed.success) {
@@ -796,6 +830,7 @@ export class MutationService {
       );
     }
     const input = parsed.data;
+    const kind = action.kind(input);
     const { policies, connections, metadata } = this.deps;
     const groupIds = await this.deps.authz.activeGroupIds(auth.user.id);
     const access = await authorizeConnection({
@@ -829,10 +864,12 @@ export class MutationService {
     const known = new Set(table.columns.map((c) => c.name.toUpperCase()));
     const pk = table.columns.filter((c) => c.pk).map((c) => c.name.toUpperCase());
     const key = action.key(input);
+    const keyNames = Object.keys(key);
+    // update and delete name the whole key; create only the part the input fixes.
     if (
       pk.length === 0 ||
-      pk.length !== Object.keys(key).length ||
-      !pk.every((k) => key[k] !== undefined)
+      !keyNames.every((k) => pk.includes(k)) ||
+      (kind === 'create' ? keyNames.length >= pk.length : keyNames.length !== pk.length)
     ) {
       throw refuse(
         'PLAN',
@@ -855,6 +892,10 @@ export class MutationService {
     const selected = [...new Set([...pk, ...action.columns, ...Object.keys(effect)])].map((c) =>
       columnOf(c, known),
     );
+    const children = action.children
+      ? await this.actionChildren(connectionId, action.children, input, pk)
+      : undefined;
+    const childEntity = children?.table.name.toUpperCase();
     const decision = await evaluateFor({
       policies,
       auth,
@@ -862,8 +903,11 @@ export class MutationService {
       action: permission,
       environment,
       connectionId,
-      entities: [entity],
-      columns: selected.map((name) => ({ table: entity, name })),
+      entities: childEntity ? [entity, childEntity] : [entity],
+      columns: [
+        ...selected.map((name) => ({ table: entity, name })),
+        ...(children ? children.columns.map((name) => ({ table: childEntity!, name })) : []),
+      ],
       hasWhere: true,
       defaults: { maxReadRows: this.deps.maxReadRows },
     });
@@ -874,22 +918,139 @@ export class MutationService {
         policyVersion: decision.policyVersion,
       });
     }
-    if (decision.limits.maxWriteRows < 1) {
+    const written = 1 + (children?.rows.length ?? 0);
+    if (decision.limits.maxWriteRows < written) {
       throw refuse(
         'PREVIEW',
         new AppError('WRITE_ROW_LIMIT_EXCEEDED', 'The action changes more rows than allowed.', {
           maxWriteRows: decision.limits.maxWriteRows,
+          affectedRows: written,
         }),
       );
     }
 
-    // ---------------------------------------------------------------- PREVIEW (the real row)
-    const where = pk.map((k) => `${k} = ${literalSql(key[k]!)}`).join(' AND ');
+    // ---------------------------------------------------------------- PREVIEW
+    const targetKey: RecordValues = {};
+    let target: PreviewTarget;
+    if (kind === 'create') {
+      // Nothing to read: the row does not exist yet and its key comes from the gateway.
+      for (const k of pk) targetKey[k] = key[k] ?? null;
+      const after: RecordValues = { ...targetKey };
+      for (const [c, v] of Object.entries(effect)) after[c.toUpperCase()] = v;
+      target = { key: targetKey, before: null, after };
+    } else {
+      const before = await this.actionRow(auth, groupIds, connectionId, environment, catalog, {
+        entity,
+        pk,
+        key,
+        selected,
+      });
+      // A row already in the target state would read back as VERIFIED whether or not the
+      // action did anything: refuse it instead.
+      if (
+        kind === 'update' &&
+        Object.entries(effect).every(([c, v]) => valuesMatch(v, before[c.toUpperCase()]))
+      ) {
+        throw refuse(
+          'PREVIEW',
+          new AppError('OPERATION_NOT_SUPPORTED', `${entity}: the row is already in that state.`),
+        );
+      }
+      for (const k of pk) targetKey[k] = before[k] ?? null;
+      if (!keyComplete(targetKey, pk)) {
+        throw refuse(
+          'PREVIEW',
+          new AppError(
+            'OPERATION_NOT_SUPPORTED',
+            `${entity}: the row has no complete primary key.`,
+          ),
+        );
+      }
+      const after: RecordValues = kind === 'delete' ? {} : { ...before };
+      if (kind === 'update')
+        for (const [c, v] of Object.entries(effect)) after[c.toUpperCase()] = v;
+      target = { key: targetKey, before, after };
+    }
+    // The child rows are created with the row: their keys come from the gateway as well.
+    const childTargets: PreviewTarget[] = (children?.rows ?? []).map((row) => {
+      const childKey: RecordValues = Object.fromEntries(children!.pk.map((k) => [k, null]));
+      return { key: childKey, before: null, after: { ...childKey, ...row } };
+    });
+    const capability: Capability = {
+      class: 'SUPPORTED',
+      route: 'SANKHYA_ACTION',
+      reason: `Business action ${action.id} on ${childEntity ? `${entity} and ${childEntity}` : entity}.`,
+      action: permission,
+      actions: [permission],
+    };
+    return {
+      action,
+      input,
+      environment,
+      capability,
+      decision,
+      table,
+      ...(children ? { childTable: children.table } : {}),
+      targets: [target, ...childTargets],
+    };
+  }
+
+  /**
+   * The child table of an action (the items of a new note): it must be writable and verifiable
+   * by key, its key being the parent's key plus one column. Returns the rows to create with
+   * catalog column names, and every column of the table the action touches.
+   */
+  private async actionChildren(
+    connectionId: string,
+    spec: NonNullable<BusinessAction['children']>,
+    input: Record<string, unknown>,
+    parentPk: string[],
+  ): Promise<{ table: CatalogTable; pk: string[]; rows: RecordValues[]; columns: string[] }> {
+    const table = catalogTable(
+      await tableCatalog(this.deps.metadata, connectionId, spec.entity),
+      spec.entity,
+    );
+    writeInstance(table);
+    const known = new Set(table.columns.map((c) => c.name.toUpperCase()));
+    const pk = table.columns.filter((c) => c.pk).map((c) => c.name.toUpperCase());
+    if (
+      !table.entityName ||
+      pk.length !== parentPk.length + 1 ||
+      !parentPk.every((k) => pk.includes(k))
+    ) {
+      throw refuse(
+        'PLAN',
+        new AppError(
+          'OPERATION_NOT_SUPPORTED',
+          `${table.name.toUpperCase()}: the rows created with the action cannot be verified by key.`,
+        ),
+      );
+    }
+    const rows = spec
+      .rows(input)
+      .map((row) =>
+        Object.fromEntries(Object.entries(row).map(([c, v]) => [columnOf(c, known), v])),
+      );
+    const columns = [...new Set([...pk, ...rows.flatMap((r) => Object.keys(r))])];
+    return { table, pk, rows, columns };
+  }
+
+  /** The one row an update or delete action names, read for real under QUERY.SELECT. */
+  private async actionRow(
+    auth: AuthState,
+    groupIds: string[],
+    connectionId: string,
+    environment: Environment,
+    catalog: Catalog,
+    q: { entity: string; pk: string[]; key: Record<string, number | string>; selected: string[] },
+  ): Promise<RecordValues> {
+    const { policies, connections } = this.deps;
+    const where = q.pk.map((k) => `${k} = ${literalSql(q.key[k]!)}`).join(' AND ');
     const runtime = await connections.getRuntime(connectionId);
     const out = await executeRead({
       runtime,
       catalog,
-      sql: `SELECT ${selected.join(', ')} FROM ${entity} WHERE ${where}`,
+      sql: `SELECT ${q.selected.join(', ')} FROM ${q.entity} WHERE ${where}`,
       maxRows: 2,
       signal: new AbortController().signal,
       decide: async (analysis) => {
@@ -914,53 +1075,20 @@ export class MutationService {
       throw refuse(
         'PREVIEW',
         out.rows.length === 0
-          ? new AppError('RESOURCE_NOT_FOUND', `${entity}: the row does not exist.`)
+          ? new AppError('RESOURCE_NOT_FOUND', `${q.entity}: the row does not exist.`)
           : new AppError(
               'OPERATION_NOT_SUPPORTED',
-              `${entity}: the key matches more than one row.`,
+              `${q.entity}: the key matches more than one row.`,
             ),
       );
     }
     const index = out.columns.map((c) => c.toUpperCase());
     const before: RecordValues = {};
-    for (const name of selected) {
+    for (const name of q.selected) {
       const i = index.indexOf(name);
       before[name] = i === -1 ? null : toValue(out.rows[0]![i]);
     }
-    // A row already in the target state would read back as VERIFIED whether or not the action
-    // did anything: refuse it instead.
-    if (Object.entries(effect).every(([c, v]) => valuesMatch(v, before[c.toUpperCase()]))) {
-      throw refuse(
-        'PREVIEW',
-        new AppError('OPERATION_NOT_SUPPORTED', `${entity}: the row is already in that state.`),
-      );
-    }
-    const targetKey: RecordValues = {};
-    for (const k of pk) targetKey[k] = before[k] ?? null;
-    if (!keyComplete(targetKey, pk)) {
-      throw refuse(
-        'PREVIEW',
-        new AppError('OPERATION_NOT_SUPPORTED', `${entity}: the row has no complete primary key.`),
-      );
-    }
-    const after: RecordValues = { ...before };
-    for (const [c, v] of Object.entries(effect)) after[c.toUpperCase()] = v;
-    const capability: Capability = {
-      class: 'SUPPORTED',
-      route: 'SANKHYA_ACTION',
-      reason: `Business action ${action.id} on ${entity}.`,
-      action: 'SANKHYA.BUSINESS_ACTION.EXECUTE',
-      actions: ['SANKHYA.BUSINESS_ACTION.EXECUTE'],
-    };
-    return {
-      action,
-      input,
-      environment,
-      capability,
-      decision,
-      table,
-      targets: [{ key: targetKey, before, after }],
-    };
+    return before;
   }
 
   /**
@@ -1518,7 +1646,16 @@ export class MutationService {
       throw err;
     }
 
-    if (!scratch) steps = await this.readableValues(auth, plan, entity, steps);
+    if (!scratch) {
+      // The child rows of an action belong to their own table: checked against it.
+      const child = 'action' in resolved ? resolved.action.childTable : undefined;
+      steps = child
+        ? [
+            ...(await this.readableValues(auth, plan, entity, steps.slice(0, 1))),
+            ...(await this.readableValues(auth, plan, child.name.toUpperCase(), steps.slice(1))),
+          ]
+        : await this.readableValues(auth, plan, entity, steps);
+    }
 
     // ---------------------------------------------------------------- AUDIT
     const report: ExecutionReport = {
@@ -1650,7 +1787,7 @@ export class MutationService {
         steps[i] = { key: keys[i]!, outcome: 'ok' };
       } catch (err) {
         // Anything but a definite gateway answer may have been applied: unknown, never retried.
-        const code = isAppError(err) ? err.code : 'WRITE_OUTCOME_UNKNOWN';
+        const code = stepErrorCode(err);
         steps[i] = {
           key: t.key,
           outcome: code === 'WRITE_OUTCOME_UNKNOWN' ? 'unknown' : 'error',
@@ -1683,7 +1820,9 @@ export class MutationService {
 
   /**
    * One business action call, never retried, guarded like a save; then the row is read back by
-   * key and compared with the action's expected effect.
+   * key and compared with the action's expected effect. A created row is read by the key the
+   * gateway answered (none: unverified); a removed row is verified when it is gone; the child
+   * rows created with it are read back under its key.
    */
   private async runAction(
     plan: PlanRow,
@@ -1691,16 +1830,34 @@ export class MutationService {
     guard: () => Promise<AppError | null>,
   ): Promise<ExecutionStep[]> {
     const runtime = await this.deps.connections.getRuntime(plan.connectionId);
-    const t = a.targets[0]!;
+    const kind = a.action.kind(a.input);
+    const [t, ...childTargets] = a.targets as [PreviewTarget, ...PreviewTarget[]];
     const expected = Object.fromEntries(
       Object.entries(a.action.effect(a.input)).map(([c, v]) => [c.toUpperCase(), v]),
     );
-    const values = { before: pick(t.before, expected), expected };
+    const values = { before: kind === 'delete' ? t.before : pick(t.before, expected), expected };
+    const childValues = childTargets.map((c) => ({
+      before: null,
+      expected: Object.fromEntries(Object.entries(c.after).filter(([k]) => !(k in c.key))),
+    }));
+    const children = (outcome: ExecutionStep['outcome'], errorCode?: string): ExecutionStep[] =>
+      childTargets.map((c, i) => ({
+        key: c.key,
+        outcome,
+        ...(errorCode ? { errorCode } : {}),
+        ...childValues[i]!,
+      }));
     const stop = await guard();
-    if (stop) return [{ key: t.key, outcome: 'not_attempted', errorCode: stop.code, ...values }];
+    if (stop) {
+      return [
+        { key: t.key, outcome: 'not_attempted', errorCode: stop.code, ...values },
+        ...children('not_attempted', stop.code),
+      ];
+    }
     let step: ExecutionStep;
+    let responseBody: unknown;
     try {
-      await runtime.client.call(
+      const envelope = await runtime.client.call(
         {
           module: a.action.module,
           serviceName: a.action.id,
@@ -1708,24 +1865,57 @@ export class MutationService {
         },
         { idempotent: false },
       );
+      responseBody = envelope.responseBody;
       step = { key: t.key, outcome: 'ok' };
     } catch (err) {
       // Anything but a definite gateway answer may have been applied: unknown, never retried.
-      const code = isAppError(err) ? err.code : 'WRITE_OUTCOME_UNKNOWN';
+      const code = stepErrorCode(err);
       step = {
         key: t.key,
         outcome: code === 'WRITE_OUTCOME_UNKNOWN' ? 'unknown' : 'error',
         errorCode: code,
       };
     }
-    if (step.outcome === 'error') return [{ ...step, ...values }];
+    if (step.outcome === 'error') {
+      return [{ ...step, ...values }, ...children('error', step.errorCode)];
+    }
+    let key: Record<string, unknown> = t.key;
+    if (kind === 'create') {
+      const created = step.outcome === 'ok' ? a.action.createdKey?.(responseBody) : undefined;
+      // Without the generated key nothing can be read back: the steps stay unverified.
+      if (!created) return [{ ...step, ...values }, ...children(step.outcome, step.errorCode)];
+      const fixed = Object.entries(t.key).filter(([, v]) => v !== null);
+      key = { ...created, ...Object.fromEntries(fixed) };
+    }
     const pk = a.table.columns.filter((c) => c.pk).map((c) => c.name.toUpperCase());
     const [result] = await verifyByKey(runtime.client, {
       entityName: a.table.entityName!,
       pk,
-      targets: [{ key: t.key, expected }],
+      targets: [{ key, expected }],
     });
-    return [{ ...readBack(step, result), ...values }];
+    // A removed row is verified by its absence: a row still there fails it.
+    const read: VerifyResult | undefined =
+      kind === 'delete'
+        ? result?.verified === undefined
+          ? undefined
+          : { verified: !result.verified }
+        : result;
+    const main: ExecutionStep = { ...readBack({ ...step, key }, read), ...values };
+    if (!a.childTable || childTargets.length === 0) return [main];
+    const childPk = a.childTable.columns.filter((c) => c.pk).map((c) => c.name.toUpperCase());
+    const kids = await verifyChildren(runtime.client, {
+      entityName: a.childTable.entityName!,
+      pk: childPk,
+      parentKey: Object.fromEntries(pk.map((k) => [k, key[k]])),
+      expected: childValues.map((c) => c.expected),
+    });
+    return [
+      main,
+      ...children(step.outcome, step.errorCode).map((c, i) => {
+        const r = kids[i];
+        return { ...readBack(r?.key ? { ...c, key: r.key } : c, r), ...childValues[i]! };
+      }),
+    ];
   }
 
   /**

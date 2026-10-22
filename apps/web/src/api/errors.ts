@@ -43,6 +43,8 @@ export const ERROR_MESSAGES: Record<string, string> = {
   QUERY_CANCELLED: 'Consulta cancelada.',
   SANKHYA_AUTH_ERROR:
     'O gateway Sankhya recusou a autenticação. Verifique as credenciais da conexão.',
+  SANKHYA_WRITE_NOT_AUTHORIZED:
+    'Gravação via API não liberada para este usuário no Gateway (DatasetSP.save).',
   SANKHYA_RATE_LIMITED: 'O gateway Sankhya limitou as requisições. Aguarde e tente novamente.',
   SANKHYA_UNAVAILABLE: 'O gateway Sankhya está indisponível no momento.',
   SANKHYA_API_ERROR: 'O Sankhya recusou a operação.',

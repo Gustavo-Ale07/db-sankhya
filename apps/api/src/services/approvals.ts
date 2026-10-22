@@ -18,7 +18,11 @@ import type {
 import { classifyStatement } from '@dbx/sql-engine';
 import type { AuthzService } from './authz';
 import type { ConsumePlanInput, ConsumedPlan, PlansService } from './plans';
-import { parseActionStatement } from './business-actions';
+import {
+  BUSINESS_ACTION_PERMISSION,
+  actionEntities,
+  parseActionStatement,
+} from './business-actions';
 import { SCRATCH_CONNECTION_ID } from './read-policy';
 import { SCRATCH_TABLE_NAME } from './scratch-guard';
 import type { PolicyService, PolicySnapshot } from './policy';
@@ -81,7 +85,12 @@ interface PlanScope {
   /** Target table plus the tables the statement reads. */
   entities: string[];
   hasWhere: boolean;
+  /** Permissions that must also be held, without a policy of their own (business actions). */
+  held?: Permission[];
 }
+
+/** Every permission a user must hold for the scope. */
+const heldOf = (scope: PlanScope): Permission[] => [...scope.actions, ...(scope.held ?? [])];
 
 /** A user as the checks see them, read once per call. */
 interface Subject {
@@ -133,14 +142,20 @@ function scopeOf(plan: PlanRow): PlanScope | undefined {
   if (cap.class !== 'SUPPORTED' && cap.class !== 'SCRATCH_ONLY') return undefined;
   if (cap.route === 'SANKHYA_ACTION') {
     // A business action plan: its statement must still parse to a registered action whose
-    // permission is the only frozen capability action.
+    // own permission is the only frozen capability action; the generic one must be held too.
     const parsed = cap.class === 'SUPPORTED' ? parseActionStatement(plan.sql) : undefined;
     if (!parsed) return undefined;
     const perm = parsed.action.permission;
     const acts = cap.actions;
     if (cap.action !== perm || !Array.isArray(acts) || acts.length !== 1 || acts[0] !== perm)
       return undefined;
-    return { actions: [perm], primary: perm, entities: [parsed.action.entity], hasWhere: true };
+    return {
+      actions: [perm],
+      primary: perm,
+      entities: actionEntities(parsed.action),
+      hasWhere: true,
+      held: [BUSINESS_ACTION_PERMISSION],
+    };
   }
   if (cap.route !== 'SANKHYA_SAVE' && cap.route !== 'SCRATCH' && cap.route !== 'HYBRID')
     return undefined;
@@ -262,7 +277,7 @@ export class ApprovalsService {
     // Only an owner who could run the plan may queue it for a second person: a plan previewed
     // through DATA.PREVIEW alone is refused at execution, so it never reaches an approver.
     const grants = await this.deps.authz.grants(userId);
-    if (!scope.actions.every((a) => grants.permissions.has(a)))
+    if (!heldOf(scope).every((a) => grants.permissions.has(a)))
       throw new AppError('FORBIDDEN', 'You do not have permission for this action');
     if (plan.status === 'EXPIRED' || (plan.status === 'PENDING' && current.expired))
       throw expired();
@@ -530,7 +545,7 @@ export class ApprovalsService {
       throw forbidden('You do not have permission to decide approvals.', 'permission_missing');
     const scope = scopeOf(plan);
     if (!scope) throw forbidden('This plan cannot be approved.', 'plan_undecidable');
-    if (!scope.actions.every((a) => subject.permissions.has(a)))
+    if (!heldOf(scope).every((a) => subject.permissions.has(a)))
       throw forbidden('You do not hold every permission this plan needs.', 'permission_missing');
     for (const action of scope.actions) {
       for (const entity of scope.entities) {
@@ -574,7 +589,7 @@ export class ApprovalsService {
       throw forbidden('The requester is no longer active.', 'requester_inactive');
     const scope = scopeOf(plan);
     if (!scope) throw forbidden('This plan cannot be executed.', 'plan_undecidable');
-    if (!scope.actions.every((a) => subject.permissions.has(a)))
+    if (!heldOf(scope).every((a) => subject.permissions.has(a)))
       throw forbidden(
         'The requester no longer holds the permissions this plan needs.',
         'requester_permission_missing',

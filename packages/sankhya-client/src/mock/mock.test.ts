@@ -295,6 +295,130 @@ describe('mock Sankhya gateway', () => {
     expect(row.rows[0]!.statusnota).toBe('C');
   });
 
+  describe('note services (bodies as documented; mock-only behaviour)', () => {
+    const v = (x: string | number) => ({ $: String(x) });
+    const items = (nunota: number) =>
+      mock.db.query<{ sequencia: number; codprod: number; qtdneg: number; vlrunit: number }>(
+        `SELECT SEQUENCIA AS sequencia, CODPROD AS codprod, QTDNEG AS qtdneg, VLRUNIT AS vlrunit
+           FROM TGFITE WHERE NUNOTA = $1 ORDER BY SEQUENCIA`,
+        [nunota],
+      );
+    const incluirNota = (informarPreco: boolean, item: Record<string, unknown>) =>
+      call(
+        'CACSP.incluirNota',
+        {
+          nota: {
+            cabecalho: {
+              NUNOTA: {},
+              CODPARC: v(3),
+              DTNEG: v('15/03/2026'),
+              CODTIPOPER: v(1000),
+              CODTIPVENDA: v(0),
+              CODVEND: v(0),
+              CODEMP: v(1),
+              TIPMOV: v('P'),
+            },
+            itens: {
+              INFORMARPRECO: informarPreco ? 'True' : 'False',
+              item: [
+                {
+                  NUNOTA: {},
+                  IGNOREDESCPROMOQTD: v('True'),
+                  CODPROD: v(5),
+                  QTDNEG: v(2),
+                  CODLOCALORIG: v(0),
+                  CODVOL: v('UN'),
+                  ...item,
+                },
+              ],
+            },
+          },
+        },
+        'mgecom',
+      );
+
+    it('CACSP.incluirNota creates the note and its items and answers pk.NUNOTA', async () => {
+      const { body } = await incluirNota(true, { VLRUNIT: v(12.5), PERCDESC: v(0) });
+      expect(body.status).toBe('1');
+      const nunota = Number(body.responseBody.pk.NUNOTA.$);
+      const cab = await mock.db.query<{ codparc: number; tipmov: string; statusnota: string }>(
+        'SELECT CODPARC AS codparc, TIPMOV AS tipmov, STATUSNOTA AS statusnota FROM TGFCAB WHERE NUNOTA = $1',
+        [nunota],
+      );
+      expect(cab.rows).toEqual([{ codparc: 3, tipmov: 'P', statusnota: 'A' }]);
+      const rows = (await items(nunota)).rows.map((r) => ({
+        ...r,
+        qtdneg: Number(r.qtdneg),
+        vlrunit: Number(r.vlrunit),
+      }));
+      expect(rows).toEqual([{ sequencia: 1, codprod: 5, qtdneg: 2, vlrunit: 12.5 }]);
+    });
+
+    it('CACSP.incluirNota without INFORMARPRECO prices the item from the product', async () => {
+      const { body } = await incluirNota(false, {});
+      expect(body.status).toBe('1');
+      const price = await mock.db.query<{ vlrvenda: number }>(
+        'SELECT VLRVENDA AS vlrvenda FROM TGFPRO WHERE CODPROD = 5',
+      );
+      const [row] = (await items(Number(body.responseBody.pk.NUNOTA.$))).rows;
+      expect(Number(row!.vlrunit)).toBe(Number(price.rows[0]!.vlrvenda));
+    });
+
+    it('CACSP.incluirNota refuses a body missing a documented field', async () => {
+      const { body } = await incluirNota(true, { CODVOL: undefined, VLRUNIT: v(1) });
+      expect(body.status).toBe('0');
+    });
+
+    it('CACSP.incluirAlterarItemNota adds, then changes an item; excluirItemNota removes it', async () => {
+      const open = await mock.db.query<{ nunota: number }>(
+        "SELECT NUNOTA AS nunota FROM TGFCAB WHERE STATUSNOTA <> 'C' ORDER BY NUNOTA DESC LIMIT 1",
+      );
+      const nunota = open.rows[0]!.nunota;
+      const item = (sequencia: string | number, qtdneg: number) =>
+        call(
+          'CACSP.incluirAlterarItemNota',
+          {
+            nota: {
+              NUNOTA: String(nunota),
+              itens: {
+                item: {
+                  NUNOTA: v(nunota),
+                  SEQUENCIA: v(sequencia),
+                  CODPROD: v(7),
+                  QTDNEG: v(qtdneg),
+                  VLRUNIT: v(3),
+                  VLRTOT: v(qtdneg * 3),
+                  CODVOL: v('UN'),
+                },
+              },
+            },
+          },
+          'mgecom',
+        );
+      const added = await item('', 4);
+      expect(added.body.status).toBe('1');
+      const sequencia = Number(added.body.responseBody.pk.SEQUENCIA.$);
+      expect(Number(added.body.responseBody.pk.NUNOTA.$)).toBe(nunota);
+      const find = async () =>
+        (await items(nunota)).rows.find((r) => r.sequencia === sequencia)?.qtdneg;
+      expect(Number(await find())).toBe(4);
+      expect((await item(sequencia, 6)).body.status).toBe('1');
+      expect(Number(await find())).toBe(6);
+      expect((await item(9_999, 6)).body.status).toBe('0');
+
+      const excluir = () =>
+        call(
+          'CACSP.excluirItemNota',
+          { nota: { itens: { item: { NUNOTA: v(nunota), SEQUENCIA: v(sequencia) } } } },
+          'mgecom',
+        );
+      const removed = await excluir();
+      expect(removed.body.status).toBe('1');
+      expect(await find()).toBeUndefined();
+      expect((await excluir()).body.status).toBe('0');
+    });
+  });
+
   it('the expired-token fault answers 403 GTW3403', async () => {
     mock.inject({ type: 'tokenExpired' });
     const { status, body } = await call('DbExplorerSP.executeQuery', { sql: 'SELECT 1' });

@@ -832,6 +832,13 @@ describe('read audit', () => {
 
 /** Every write switch on: SAFE_MODE off, GLOBAL_WRITE_ENABLED and WRITE_TO_SANKHYA on. */
 const WRITES = { SAFE_MODE: 'false', GLOBAL_WRITE_ENABLED: 'true', WRITE_TO_SANKHYA: 'true' };
+/** The own permission of every registered business action. */
+const ACTION_PERMISSIONS: Permission[] = [
+  'SANKHYA.ACTION.CANCELAR_NOTA',
+  'SANKHYA.ACTION.INCLUIR_NOTA',
+  'SANKHYA.ACTION.INCLUIR_ALTERAR_ITEM_NOTA',
+  'SANKHYA.ACTION.EXCLUIR_ITEM_NOTA',
+];
 
 const saves = (mock: MockSankhya) => mock.calls.filter((c) => c.serviceName === 'DatasetSP.save');
 
@@ -1120,6 +1127,28 @@ describe('MutationService.execute', () => {
     expect(report.verification).toBe('FAILED');
     expect(report.steps[0]).toMatchObject({ outcome: 'ok', verified: false });
     expect(await partner(h.mock, 1)).toBe(before);
+  });
+
+  it('"Não autorizado" from DatasetSP.save: SANKHYA_WRITE_NOT_AUTHORIZED, failed, not replayed, audited', async () => {
+    const h = await setup(WRITES);
+    const { auth } = await h.userWith(WRITER);
+    const before = await partner(h.mock, 1);
+    const p = await prepare(h, auth, SQL);
+    h.mock.inject({ type: 'notAuthorizedEnvelope' }, { service: 'DatasetSP.save' });
+    const report = await execute(h, auth, p);
+    expect(report).toMatchObject({
+      // Refused before anything was written: nothing to read back, so never VERIFIED.
+      status: 'failed',
+      verification: 'UNVERIFIED',
+      steps: [{ key: { CODPARC: 1 }, outcome: 'error', errorCode: 'SANKHYA_WRITE_NOT_AUTHORIZED' }],
+    });
+    expect(saves(h.mock)).toHaveLength(1);
+    expect(await partner(h.mock, 1)).toBe(before);
+    const [executed] = await h.audit('PLAN_EXECUTED');
+    expect(executed).toMatchObject({
+      planId: p.planId,
+      errorCode: 'SANKHYA_WRITE_NOT_AUTHORIZED',
+    });
   });
 
   it('a save timeout: the step is unknown with WRITE_OUTCOME_UNKNOWN, never retried', async () => {
@@ -1784,9 +1813,13 @@ describe('execution report: before, expected and observed', () => {
     await h.policy({
       name: 'actions allowed',
       effect: 'ALLOW',
-      actions: ['SANKHYA.BUSINESS_ACTION.EXECUTE'],
+      actions: ACTION_PERMISSIONS,
     });
-    const { cookie } = await h.userWith(['QUERY.SELECT', 'SANKHYA.BUSINESS_ACTION.EXECUTE']);
+    const { cookie } = await h.userWith([
+      'QUERY.SELECT',
+      'SANKHYA.BUSINESS_ACTION.EXECUTE',
+      'SANKHYA.ACTION.CANCELAR_NOTA',
+    ]);
     const status = (
       await h.mock.db.query<{ statusnota: string }>(
         'SELECT statusnota FROM tgfcab WHERE nunota = 7',
@@ -1818,14 +1851,18 @@ describe('execution report: before, expected and observed', () => {
 });
 
 describe('business actions', () => {
-  const ACTOR: Permission[] = ['QUERY.SELECT', 'SANKHYA.BUSINESS_ACTION.EXECUTE'];
+  const ACTOR: Permission[] = [
+    'QUERY.SELECT',
+    'SANKHYA.BUSINESS_ACTION.EXECUTE',
+    ...ACTION_PERMISSIONS,
+  ];
   const BASE = '/api/actions/CACSP.cancelarNota';
   const INPUT = { nunota: 7, justificativa: 'Nota emitida em duplicidade' };
   const allowActions = (h: Harness) =>
     h.policy({
       name: 'actions allowed',
       effect: 'ALLOW',
-      actions: ['SANKHYA.BUSINESS_ACTION.EXECUTE'],
+      actions: ACTION_PERMISSIONS,
     });
   const actionCalls = (mock: MockSankhya) =>
     mock.calls.filter((c) => c.serviceName === 'CACSP.cancelarNota');
@@ -1865,7 +1902,7 @@ describe('business actions', () => {
       action: 'CACSP.cancelarNota',
       previewKind: 'IMPACT_ANALYSIS',
       previewLabels: ['IMPACT_ANALYSIS', 'SIMULATED_PREVIEW'],
-      capability: { route: 'SANKHYA_ACTION', action: 'SANKHYA.BUSINESS_ACTION.EXECUTE' },
+      capability: { route: 'SANKHYA_ACTION', action: 'SANKHYA.ACTION.CANCELAR_NOTA' },
       preview: {
         affected: 1,
         targets: [
@@ -1894,7 +1931,7 @@ describe('business actions', () => {
     const [executed] = await h.audit('PLAN_EXECUTED');
     expect(executed).toMatchObject({
       status: 'success',
-      capability: 'SANKHYA.BUSINESS_ACTION.EXECUTE',
+      capability: 'SANKHYA.ACTION.CANCELAR_NOTA',
     });
   });
 
@@ -2112,7 +2149,7 @@ describe('business actions', () => {
     await h.policy({
       name: 'actions need approval',
       effect: 'ALLOW',
-      actions: ['SANKHYA.BUSINESS_ACTION.EXECUTE'],
+      actions: ACTION_PERMISSIONS,
       limits: { requireApproval: true },
     });
     const { cookie } = await h.userWith(ACTOR);
@@ -2145,6 +2182,280 @@ describe('business actions', () => {
     expect(res.json()).toMatchObject({ verification: 'VERIFIED' });
     expect(actionCalls(h.mock)).toHaveLength(1);
     expect(await statusOf(h.mock, 7)).toBe('C');
+  });
+
+  it("the generic permission without the action's own: FORBIDDEN, no gateway call", async () => {
+    const h = await setup(WRITES);
+    await allowActions(h);
+    const { cookie } = await h.userWith(['QUERY.SELECT', 'SANKHYA.BUSINESS_ACTION.EXECUTE']);
+    const res = await prepareAction(h, cookie);
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error).toMatchObject({
+      code: 'FORBIDDEN',
+      details: { permission: 'SANKHYA.ACTION.CANCELAR_NOTA' },
+    });
+    expect(h.mock.calls).toEqual([]);
+  });
+
+  it('prepare carries the contract and the mock-only warning', async () => {
+    const h = await setup(WRITES);
+    await allowActions(h);
+    const { cookie } = await h.userWith(ACTOR);
+    const planned = await prepareAction(h, cookie);
+    expect(planned.json()).toMatchObject({
+      contract: expect.stringMatching(/^https:\/\/developer\.sankhya\.com\.br\/reference\//),
+      warning: 'validado só no mock; testar em HOMOLOGAÇÃO antes de produção',
+    });
+  });
+
+  it('a stub whose contract is not confirmed (SelecaoDocumentoSP.faturar) never plans or runs', async () => {
+    const h = await setup(WRITES);
+    await allowActions(h);
+    const { cookie } = await h.userWith(ACTOR);
+    const url = '/api/actions/SelecaoDocumentoSP.faturar';
+    const res = await prepareAction(h, cookie, { nunota: 7 }, url);
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe('OPERATION_NOT_SUPPORTED');
+    const exec = await executeAction(h, cookie, { planId: randomUUID(), token: 'x.y' }, url);
+    expect(exec.json().error.code).toBe('OPERATION_NOT_SUPPORTED');
+    expect(h.mock.calls).toEqual([]);
+    expect(await h.audit('PLAN_CREATED')).toEqual([]);
+  });
+
+  it('"Não autorizado" on an action: SANKHYA_WRITE_NOT_AUTHORIZED, failed, called once', async () => {
+    const h = await setup(WRITES);
+    await allowActions(h);
+    const { cookie } = await h.userWith(ACTOR);
+    const before = await statusOf(h.mock, 7);
+    const planned = await prepareAction(h, cookie);
+    h.mock.inject({ type: 'notAuthorizedEnvelope' }, { service: 'CACSP.cancelarNota' });
+    const res = await executeAction(h, cookie, planned.json());
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json()).toMatchObject({
+      status: 'failed',
+      steps: [{ outcome: 'error', errorCode: 'SANKHYA_WRITE_NOT_AUTHORIZED' }],
+    });
+    expect(res.json().verification).not.toBe('VERIFIED');
+    expect(actionCalls(h.mock)).toHaveLength(1);
+    expect(await statusOf(h.mock, 7)).toBe(before);
+  });
+
+  describe('note services (validated only on the mock)', () => {
+    const INCLUIR = '/api/actions/CACSP.incluirNota';
+    const ITEM = '/api/actions/CACSP.incluirAlterarItemNota';
+    const EXCLUIR = '/api/actions/CACSP.excluirItemNota';
+    const NOTA = {
+      codparc: 3,
+      dtneg: '15/03/2026',
+      codtipoper: 1000,
+      codtipvenda: 0,
+      codvend: 0,
+      codemp: 1,
+      tipmov: 'P',
+      informarPreco: true,
+      itens: [
+        { codprod: 5, qtdneg: 2, codlocalorig: 0, codvol: 'UN', vlrunit: 12.5, percdesc: 0 },
+        { codprod: 8, qtdneg: 1, codlocalorig: 0, codvol: 'UN', vlrunit: 3, percdesc: 0 },
+      ],
+    };
+    const items = async (mock: MockSankhya, nunota: number) =>
+      (
+        await mock.db.query<{ sequencia: number; codprod: number; qtdneg: string }>(
+          'SELECT sequencia, codprod, qtdneg FROM tgfite WHERE nunota = $1 ORDER BY sequencia',
+          [nunota],
+        )
+      ).rows;
+    const calls = (mock: MockSankhya, service: string) =>
+      mock.calls.filter((c) => c.serviceName === service);
+
+    it('incluirNota: previews the new note and items, creates them once, verifies by the answered key', async () => {
+      const h = await setup(WRITES);
+      await allowActions(h);
+      const { cookie } = await h.userWith(ACTOR);
+      const planned = await prepareAction(h, cookie, NOTA, INCLUIR);
+      expect(planned.statusCode, planned.body).toBe(200);
+      expect(planned.json()).toMatchObject({
+        action: 'CACSP.incluirNota',
+        capability: { route: 'SANKHYA_ACTION', action: 'SANKHYA.ACTION.INCLUIR_NOTA' },
+        preview: {
+          affected: 3,
+          targets: [
+            { key: { NUNOTA: null }, before: null, after: { CODPARC: 3, TIPMOV: 'P' } },
+            {
+              key: { NUNOTA: null, SEQUENCIA: null },
+              before: null,
+              after: { CODPROD: 5, QTDNEG: 2, VLRUNIT: 12.5 },
+            },
+            {
+              key: { NUNOTA: null, SEQUENCIA: null },
+              before: null,
+              after: { CODPROD: 8, QTDNEG: 1, VLRUNIT: 3 },
+            },
+          ],
+        },
+        impact: { entities: ['TGFCAB', 'TGFITE'] },
+      });
+      expect(calls(h.mock, 'CACSP.incluirNota')).toEqual([]);
+
+      const res = await executeAction(h, cookie, planned.json(), INCLUIR);
+      expect(res.statusCode, res.body).toBe(200);
+      const report = res.json() as { steps: Array<{ key: Record<string, number> }> };
+      expect(report).toMatchObject({ status: 'success', verification: 'VERIFIED' });
+      const nunota = report.steps[0]!.key.NUNOTA!;
+      expect(report.steps.map((s) => s.key)).toEqual([
+        { NUNOTA: nunota },
+        { NUNOTA: nunota, SEQUENCIA: 1 },
+        { NUNOTA: nunota, SEQUENCIA: 2 },
+      ]);
+      expect(calls(h.mock, 'CACSP.incluirNota')).toHaveLength(1);
+      expect((await items(h.mock, nunota)).map((r) => r.codprod)).toEqual([5, 8]);
+      const [executed] = await h.audit('PLAN_EXECUTED');
+      expect(executed).toMatchObject({
+        status: 'success',
+        capability: 'SANKHYA.ACTION.INCLUIR_NOTA',
+      });
+    });
+
+    it('incluirNota whose write the gateway drops: FAILED, never VERIFIED', async () => {
+      const h = await setup(WRITES);
+      await allowActions(h);
+      const { cookie } = await h.userWith(ACTOR);
+      const planned = await prepareAction(h, cookie, NOTA, INCLUIR);
+      h.mock.inject({ type: 'ignoreWrite' }, { service: 'CACSP.incluirNota' });
+      const res = await executeAction(h, cookie, planned.json(), INCLUIR);
+      expect(res.statusCode, res.body).toBe(200);
+      expect(res.json().verification).toBe('FAILED');
+      expect(calls(h.mock, 'CACSP.incluirNota')).toHaveLength(1);
+    });
+
+    it('incluirNota needs the policy to allow TGFITE too', async () => {
+      const h = await setup(WRITES);
+      await h.policy({
+        name: 'notes only',
+        effect: 'ALLOW',
+        actions: ['SANKHYA.ACTION.INCLUIR_NOTA'],
+        entities: ['TGFCAB'],
+      });
+      const { cookie } = await h.userWith(ACTOR);
+      const res = await prepareAction(h, cookie, NOTA, INCLUIR);
+      expect(res.statusCode).toBe(403);
+      expect(res.json().error.code).toBe('FORBIDDEN');
+      expect(h.mock.calls.filter((c) => c.serviceName.startsWith('CACSP.'))).toEqual([]);
+    });
+
+    it('incluirNota with informarPreco and an item without price is invalid', async () => {
+      const h = await setup(WRITES);
+      await allowActions(h);
+      const { cookie } = await h.userWith(ACTOR);
+      const { vlrunit: _omit, ...unpriced } = NOTA.itens[0]!;
+      const res = await prepareAction(h, cookie, { ...NOTA, itens: [unpriced] }, INCLUIR);
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('incluirAlterarItemNota: adds an item (key from the answer), then changes it', async () => {
+      const h = await setup(WRITES);
+      await allowActions(h);
+      const { cookie } = await h.userWith(ACTOR);
+      const add = { nunota: 9, codprod: 7, qtdneg: 4, vlrunit: 3, codvol: 'UN' };
+      const planned = await prepareAction(h, cookie, add, ITEM);
+      expect(planned.statusCode, planned.body).toBe(200);
+      expect(planned.json().preview.targets).toEqual([
+        {
+          key: { NUNOTA: 9, SEQUENCIA: null },
+          before: null,
+          after: { NUNOTA: 9, SEQUENCIA: null, CODPROD: 7, QTDNEG: 4, VLRUNIT: 3 },
+        },
+      ]);
+      const res = await executeAction(h, cookie, planned.json(), ITEM);
+      expect(res.statusCode, res.body).toBe(200);
+      expect(res.json()).toMatchObject({ status: 'success', verification: 'VERIFIED' });
+      const sequencia = res.json().steps[0].key.SEQUENCIA as number;
+      expect(res.json().steps[0].key).toEqual({ NUNOTA: 9, SEQUENCIA: sequencia });
+
+      const change = { ...add, sequencia, qtdneg: 6 };
+      const again = await prepareAction(h, cookie, change, ITEM);
+      expect(again.json().preview.targets[0]).toMatchObject({
+        key: { NUNOTA: 9, SEQUENCIA: sequencia },
+        before: { CODPROD: 7 },
+        after: { QTDNEG: 6 },
+      });
+      expect(Number(again.json().preview.targets[0].before.QTDNEG)).toBe(4);
+      const changed = await executeAction(h, cookie, again.json(), ITEM);
+      expect(changed.json()).toMatchObject({ verification: 'VERIFIED' });
+      const row = (await items(h.mock, 9)).find((r) => r.sequencia === sequencia);
+      expect(Number(row!.qtdneg)).toBe(6);
+      expect(calls(h.mock, 'CACSP.incluirAlterarItemNota')).toHaveLength(2);
+    });
+
+    it('excluirItemNota: previews the item, removes it once, verified by its absence', async () => {
+      const h = await setup(WRITES);
+      await allowActions(h);
+      const { cookie } = await h.userWith(ACTOR);
+      const [first] = await items(h.mock, 9);
+      const input = { nunota: 9, sequencia: first!.sequencia };
+      const planned = await prepareAction(h, cookie, input, EXCLUIR);
+      expect(planned.statusCode, planned.body).toBe(200);
+      expect(planned.json().preview).toMatchObject({
+        affected: 1,
+        targets: [
+          {
+            key: { NUNOTA: 9, SEQUENCIA: first!.sequencia },
+            before: { CODPROD: first!.codprod },
+            after: {},
+          },
+        ],
+      });
+      const res = await executeAction(h, cookie, planned.json(), EXCLUIR);
+      expect(res.statusCode, res.body).toBe(200);
+      expect(res.json()).toMatchObject({
+        status: 'success',
+        verification: 'VERIFIED',
+        steps: [{ outcome: 'ok', verified: true }],
+      });
+      expect((await items(h.mock, 9)).some((r) => r.sequencia === first!.sequencia)).toBe(false);
+      expect(calls(h.mock, 'CACSP.excluirItemNota')).toHaveLength(1);
+    });
+
+    it('excluirItemNota whose write the gateway drops: the item is still there, FAILED', async () => {
+      const h = await setup(WRITES);
+      await allowActions(h);
+      const { cookie } = await h.userWith(ACTOR);
+      const [first] = await items(h.mock, 9);
+      const input = { nunota: 9, sequencia: first!.sequencia };
+      const planned = await prepareAction(h, cookie, input, EXCLUIR);
+      h.mock.inject({ type: 'ignoreWrite' }, { service: 'CACSP.excluirItemNota' });
+      const res = await executeAction(h, cookie, planned.json(), EXCLUIR);
+      expect(res.json()).toMatchObject({
+        verification: 'FAILED',
+        steps: [{ outcome: 'ok', verified: false }],
+      });
+    });
+
+    it('excluirItemNota of a missing item is refused at preview, nothing is called', async () => {
+      const h = await setup(WRITES);
+      await allowActions(h);
+      const { cookie } = await h.userWith(ACTOR);
+      const res = await prepareAction(h, cookie, { nunota: 9, sequencia: 999 }, EXCLUIR);
+      expect(res.statusCode, res.body).toBe(400);
+      expect(res.json().error.code).toBe('RESOURCE_NOT_FOUND');
+      expect(calls(h.mock, 'CACSP.excluirItemNota')).toEqual([]);
+    });
+
+    it('each note service on a live connection stays off without BUSINESS_ACTIONS_ENABLED', async () => {
+      const h = await setup({ ...WRITES, SANKHYA_MODE: 'live' });
+      await allowActions(h);
+      const { cookie } = await h.userWith(ACTOR);
+      for (const [url, input] of [
+        [INCLUIR, NOTA],
+        [ITEM, { nunota: 9, codprod: 7, qtdneg: 4, vlrunit: 3, codvol: 'UN' }],
+        [EXCLUIR, { nunota: 9, sequencia: 1 }],
+      ] as const) {
+        const res = await prepareAction(h, cookie, input, url);
+        expect(res.json().error.code, url).toBe('OPERATION_NOT_SUPPORTED');
+      }
+      expect(h.mock.calls).toEqual([]);
+    });
   });
 });
 

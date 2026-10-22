@@ -273,6 +273,34 @@ describe('MutationDialog', () => {
     expect(screen.getByTestId('verification-status').textContent).toBe('UNVERIFIED');
   });
 
+  it('turns a gateway "Não autorizado" on the save into an actionable message, not a raw code', async () => {
+    vi.mocked(executePlan).mockResolvedValue(
+      report({
+        status: 'failed',
+        verification: 'FAILED',
+        steps: [
+          { key: { CODPARC: 1 }, outcome: 'error', errorCode: 'SANKHYA_WRITE_NOT_AUTHORIZED' },
+        ],
+      }),
+    );
+    render(
+      <MutationDialog
+        preview={preview({ requires: { strongConfirmation: null, approval: false } })}
+        sql="x"
+        onClose={() => {}}
+      />,
+    );
+    fireEvent.click(execButton());
+    await screen.findByTestId('execution-report');
+    expect(screen.getByTestId('write-not-authorized').textContent).toContain(
+      'Gravação via API não liberada para este usuário no Gateway (DatasetSP.save)',
+    );
+    const [step] = screen.getAllByTestId('execution-step').map((r) => r.textContent);
+    expect(step).toContain('gravação não liberada no Gateway');
+    expect(step).not.toContain('SANKHYA_WRITE_NOT_AUTHORIZED');
+    expect(screen.queryByTestId('outcome-unknown')).toBeNull();
+  });
+
   it('reports a definite refusal as a known outcome', async () => {
     vi.mocked(executePlan).mockRejectedValue(
       new ApiError(403, { code: 'READ_ONLY_MODE', message: 'x' }),

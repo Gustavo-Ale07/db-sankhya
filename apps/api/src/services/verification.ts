@@ -54,6 +54,12 @@ function cell(v: unknown): unknown {
   return v;
 }
 
+/** A key cell as the plan keys it: the gateway answers integers as text. */
+function keyCell(v: unknown): unknown {
+  const c = cell(v);
+  return typeof c === 'string' && /^-?\d+$/.test(c) ? Number(c) : c;
+}
+
 /**
  * Whether the value read back equals the value that was written. Gateways return every value as
  * text, so a number is compared numerically (relative tolerance for decimals) and anything else
@@ -156,6 +162,65 @@ export async function verifyByKey(
     }
   }
   return out;
+}
+
+/**
+ * Read-back of rows created together under one parent key (the items of a new note): every row
+ * with that parent key is read, and each expected row is matched, in order, to the first unused
+ * row holding all of its values. A match is verified with that row's own key; an expected row
+ * with no match is not (false). Nothing is verified when the read fails or does not end.
+ */
+export async function verifyChildren(
+  client: Pick<SankhyaClient, 'loadRecords'>,
+  input: {
+    entityName: string;
+    pk: string[];
+    parentKey: Record<string, unknown>;
+    expected: Record<string, unknown>[];
+  },
+): Promise<Array<VerifyResult & { key?: Record<string, unknown> }>> {
+  const { entityName, pk, parentKey, expected } = input;
+  const parent = Object.keys(parentKey);
+  if (parent.length === 0 || parent.some((k) => cell(parentKey[k]) === null)) {
+    return expected.map(() => ({}));
+  }
+  const fields = [...new Set([...pk, ...expected.flatMap((e) => Object.keys(e))])];
+  const rows: Record<string, unknown>[] = [];
+  try {
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const res = await client.loadRecords({
+        rootEntity: entityName,
+        fields,
+        criteria: {
+          expression: parent.map((k) => `this.${k} = ?`).join(' AND '),
+          parameters: parent.map((k) => {
+            const v = parentKey[k];
+            return { value: typeof v === 'number' ? v : String(v), type: paramType(v) };
+          }),
+        },
+        offsetPage: page,
+      });
+      rows.push(...res.records);
+      if (!res.hasMore) break;
+      if (page === MAX_PAGES - 1) throw new Error('verification read did not end');
+    }
+  } catch {
+    return expected.map(() => ({}));
+  }
+  const used = new Set<number>();
+  return expected.map((e) => {
+    const i = rows.findIndex(
+      (r, n) => !used.has(n) && Object.entries(e).every(([f, v]) => valuesMatch(v, r[f])),
+    );
+    if (i === -1) return { verified: false };
+    used.add(i);
+    const row = rows[i]!;
+    return {
+      verified: true,
+      key: Object.fromEntries(pk.map((k) => [k, keyCell(row[k])])),
+      observed: Object.fromEntries(Object.keys(e).map((f) => [f, cell(row[f])])),
+    };
+  });
 }
 
 /**

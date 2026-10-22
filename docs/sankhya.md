@@ -211,22 +211,45 @@ The environment connection (`env-default`, from `SANKHYA_*`) uses `SANKHYA_ENVIR
 
 ## Business actions
 
-The registry holds `CACSP.cancelarNota` (module `mgecom`): it cancels the note `nunota` of
-`TGFCAB` with a `justificativa` of 15 to 255 characters, and expects `STATUSNOTA = 'C'` on the row
-afterwards. On a `live` connection it runs only when its id is listed in
-`BUSINESS_ACTIONS_ENABLED`.
+Business actions are the native note services of the gateway (module `mgecom`). Each request body
+follows the official documentation page named in the registry (`contract`), and nothing else.
+Every prepare answer carries that link and the warning **"validado só no mock; testar em
+HOMOLOGAÇÃO antes de produção"**. On a `live` connection an action runs only when its exact id is
+listed in `BUSINESS_ACTIONS_ENABLED` (empty by default), and the write switches (`SAFE_MODE`,
+`GLOBAL_WRITE_ENABLED`, `WRITE_TO_SANKHYA`) gate it like any other write.
 
-- **The request body and the expected effect were validated only against the bundled mock.**
-  Compare them with the official gateway documentation of your ERP version before enabling the
-  action.
-- **Test one cancellation in `HOMOLOGATION`** and check the note in the ERP before listing the id
-  for a `PRODUCTION` connection. `BUSINESS_ACTIONS_ENABLED` applies to every live connection at
-  once, so enable it first on an installation that has only homologation connections, or keep
-  `SAFE_MODE` on while testing.
-- If the real effect differs (for example the note is moved instead of updated), the read-back
-  reports `FAILED` or `UNVERIFIED`, never `VERIFIED`, but the call has already happened.
-- One permission, `SANKHYA.BUSINESS_ACTION.EXECUTE`, covers every registered action. Limit who can
-  run them with policy rules on the action's entity.
+| Action                         | Permission                                 | Writes             | Expected effect, read back                                                                                                                 | Contract page              |
+| ------------------------------ | ------------------------------------------ | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------- |
+| `CACSP.cancelarNota`           | `SANKHYA.ACTION.CANCELAR_NOTA`             | `TGFCAB`           | `STATUSNOTA = 'C'` on the note (`justificativa` of 15 to 255 characters)                                                                   | `post_cancelamovimento`    |
+| `CACSP.incluirNota`            | `SANKHYA.ACTION.INCLUIR_NOTA`              | `TGFCAB`, `TGFITE` | the note (`CODPARC`, `TIPMOV`) under the `NUNOTA` the gateway answers, and each item (`CODPROD`, `QTDNEG`; `VLRUNIT` with `informarPreco`) | `post_incluimovimentos`    |
+| `CACSP.incluirAlterarItemNota` | `SANKHYA.ACTION.INCLUIR_ALTERAR_ITEM_NOTA` | `TGFITE`           | the item (`CODPROD`, `QTDNEG`, `VLRUNIT`); without `sequencia` it adds one, with it it changes that item                                   | `post_incaltitemmovimento` |
+| `CACSP.excluirItemNota`        | `SANKHYA.ACTION.EXCLUIR_ITEM_NOTA`         | `TGFITE`           | the item `NUNOTA` + `SEQUENCIA` is gone                                                                                                    | `post_excluiitemmovimento` |
+| `SelecaoDocumentoSP.faturar`   | none (stub)                                | none               | **not enabled**: the page does not say which fields are required; prepare answers `OPERATION_NOT_SUPPORTED`                                | `post_faturamovimento`     |
+
+- **Both permissions are needed**: `SANKHYA.BUSINESS_ACTION.EXECUTE` and the action's own. The
+  policy decides on the action's own permission with every table it writes, so `incluirNota` needs
+  an `ALLOW` that covers `TGFCAB` and `TGFITE`. An approver needs both as well.
+- **Validated only against the bundled mock.** The mock implements each service from the same
+  documentation page; it is not the ERP. Test each action in `HOMOLOGATION` and check the note in
+  the ERP before listing its id for a `PRODUCTION` connection. `BUSINESS_ACTIONS_ENABLED` applies
+  to every live connection at once, so enable it first on an installation that has only
+  homologation connections, or keep `SAFE_MODE` on while testing.
+- **Read-back.** A create is verified under the key the gateway answers (`pk`); when the answer
+  has no key the result is `UNVERIFIED`, never `VERIFIED`. The items of `incluirNota` are matched
+  among the rows of the new note. A delete is verified by the row's absence. If the real effect
+  differs, the result is `FAILED` or `UNVERIFIED`, but the call has already happened (it is never
+  retried).
+- **What the documentation leaves open (não verificado):** the `incluirNota` page is titled
+  "IncluirNota" while its example calls `incluirNota` (the example's casing is used);
+  `incluirAlterarItemNota` lists `CODLOCALORIG` as required but leaves it out of its example (sent
+  only when given); `VLRTOT` is sent as `QTDNEG × VLRUNIT` but not checked, since the ERP may
+  recompute it; the answer of `incluirAlterarItemNota` is not shown beyond `pk`; whether these
+  services need the `mgeSession` of the login is not verified. How to verify: one call of each in
+  `HOMOLOGATION`, with the read-back.
+- **"Não autorizado".** When the gateway answers `"status":"0"` with `"statusMessage":"Não
+autorizado"` (as `DatasetSP.save` did in the base de testes), the step fails with
+  `SANKHYA_WRITE_NOT_AUTHORIZED` and the editor shows "Gravação via API não liberada para este
+  usuário no Gateway (DatasetSP.save)" instead of the raw error. The call is not repeated.
 
 ## Mock gateway
 

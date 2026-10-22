@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react';
 import { ApiError } from '../api/client';
-import { describeError, translateMessage } from '../api/errors';
+import { describeError, translateCode, translateMessage } from '../api/errors';
 import { executePlan, requestApproval } from '../api/mutations';
 import type {
   ExecutionReport,
@@ -33,6 +33,9 @@ const VERIFICATION_TEXT: Record<VerificationLabel, string> = {
   UNVERIFIED: 'Nenhuma alteração pôde ser conferida por leitura.',
   FAILED: 'A leitura de volta encontrou valores diferentes do esperado.',
 };
+
+/** A step the gateway refused with "não autorizado": its integration user may not write. */
+const WRITE_NOT_AUTHORIZED = 'SANKHYA_WRITE_NOT_AUTHORIZED';
 
 const VERIFICATION_TONE: Record<VerificationLabel, string> = {
   VERIFIED: 'border-ok/60 text-ok',
@@ -602,6 +605,7 @@ function StepValues({
 function Report({ report, operation }: { report: ExecutionReport; operation: Operation | null }) {
   const [page, setPage] = useState(0);
   const unknown = report.steps.some((s) => s.outcome === 'unknown');
+  const writeNotAuthorized = report.steps.some((s) => s.errorCode === WRITE_NOT_AUTHORIZED);
   const title = reportTitle(report);
   const pages = Math.ceil(report.steps.length / PAGE_SIZE);
   const start = page * PAGE_SIZE;
@@ -622,6 +626,20 @@ function Report({ report, operation }: { report: ExecutionReport; operation: Ope
         <span className="text-muted">{VERIFICATION_TEXT[report.verification]}</span>
       </div>
       {unknown && <UnknownWarning />}
+      {writeNotAuthorized && (
+        <div
+          role="alert"
+          className="rounded border border-danger bg-danger/10 px-3 py-2 text-danger"
+          data-testid="write-not-authorized"
+        >
+          <div className="font-semibold">{translateCode(WRITE_NOT_AUTHORIZED)}</div>
+          <div>
+            O Gateway respondeu &quot;Não autorizado&quot; e nada foi gravado por esta chamada. Peça
+            ao administrador do Sankhya a liberação de gravação para o usuário de integração; não
+            adianta repetir a operação antes disso.
+          </div>
+        </div>
+      )}
       {noValues && (
         <p className="text-muted" data-testid="values-unavailable">
           {report.valuesTruncated
@@ -657,8 +675,12 @@ function Report({ report, operation }: { report: ExecutionReport; operation: Ope
                 </span>
                 <span>
                   {OUTCOME_TEXT[s.outcome] ?? s.outcome}
-                  {s.errorCode && (
-                    <span className="ml-1 font-mono text-danger">[{s.errorCode}]</span>
+                  {s.errorCode === WRITE_NOT_AUTHORIZED ? (
+                    <span className="ml-1 text-danger">— gravação não liberada no Gateway</span>
+                  ) : (
+                    s.errorCode && (
+                      <span className="ml-1 font-mono text-danger">[{s.errorCode}]</span>
+                    )
                   )}
                 </span>
                 <span className={`ml-auto ${s.verified === false ? 'text-danger' : 'text-muted'}`}>

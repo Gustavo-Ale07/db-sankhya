@@ -23,27 +23,31 @@ node scripts/permissions-doc.mjs --check   # fails when the table and the code d
 
 <!-- permissions:start (written by scripts/permissions-doc.mjs) -->
 
-| Permission                        | Policy class    | VIEWER | OPERATOR | ADMIN |
-| --------------------------------- | --------------- | ------ | -------- | ----- |
-| `QUERY.SELECT`                    | permission-only | yes    | yes      | yes   |
-| `TEMP.CREATE`                     | permission-only | yes    | yes      | yes   |
-| `TEMP.WRITE`                      | permission-only | yes    | yes      | yes   |
-| `TEMP.DROP`                       | permission-only | yes    | yes      | yes   |
-| `TEMP.MATERIALIZE`                | permission-only | yes    | yes      | yes   |
-| `DATA.PREVIEW`                    | permission-only |        | yes      | yes   |
-| `DATA.INSERT`                     | write           |        | yes      |       |
-| `DATA.UPDATE`                     | write           |        | yes      |       |
-| `DATA.DELETE`                     | write           |        |          |       |
-| `DDL.CUSTOM.GENERATE`             | write           |        |          |       |
-| `SANKHYA.BUSINESS_ACTION.EXECUTE` | write           |        |          |       |
-| `APPROVAL.DECIDE`                 | permission-only |        |          | yes   |
-| `AUDIT.READ`                      | permission-only |        |          | yes   |
-| `ADMIN.USERS`                     | permission-only |        |          | yes   |
-| `ADMIN.GROUPS`                    | permission-only |        |          | yes   |
-| `ADMIN.ROLES`                     | permission-only |        |          | yes   |
-| `ADMIN.POLICIES`                  | permission-only |        |          | yes   |
-| `ADMIN.CONNECTIONS`               | permission-only |        |          | yes   |
-| `ADMIN.SECURITY`                  | permission-only |        |          | yes   |
+| Permission                                 | Policy class    | VIEWER | OPERATOR | ADMIN |
+| ------------------------------------------ | --------------- | ------ | -------- | ----- |
+| `QUERY.SELECT`                             | permission-only | yes    | yes      | yes   |
+| `TEMP.CREATE`                              | permission-only | yes    | yes      | yes   |
+| `TEMP.WRITE`                               | permission-only | yes    | yes      | yes   |
+| `TEMP.DROP`                                | permission-only | yes    | yes      | yes   |
+| `TEMP.MATERIALIZE`                         | permission-only | yes    | yes      | yes   |
+| `DATA.PREVIEW`                             | permission-only |        | yes      | yes   |
+| `DATA.INSERT`                              | write           |        | yes      |       |
+| `DATA.UPDATE`                              | write           |        | yes      |       |
+| `DATA.DELETE`                              | write           |        |          |       |
+| `DDL.CUSTOM.GENERATE`                      | write           |        |          |       |
+| `SANKHYA.BUSINESS_ACTION.EXECUTE`          | write           |        |          |       |
+| `SANKHYA.ACTION.CANCELAR_NOTA`             | write           |        |          |       |
+| `SANKHYA.ACTION.INCLUIR_NOTA`              | write           |        |          |       |
+| `SANKHYA.ACTION.INCLUIR_ALTERAR_ITEM_NOTA` | write           |        |          |       |
+| `SANKHYA.ACTION.EXCLUIR_ITEM_NOTA`         | write           |        |          |       |
+| `APPROVAL.DECIDE`                          | permission-only |        |          | yes   |
+| `AUDIT.READ`                               | permission-only |        |          | yes   |
+| `ADMIN.USERS`                              | permission-only |        |          | yes   |
+| `ADMIN.GROUPS`                             | permission-only |        |          | yes   |
+| `ADMIN.ROLES`                              | permission-only |        |          | yes   |
+| `ADMIN.POLICIES`                           | permission-only |        |          | yes   |
+| `ADMIN.CONNECTIONS`                        | permission-only |        |          | yes   |
+| `ADMIN.SECURITY`                           | permission-only |        |          | yes   |
 
 <!-- permissions:end -->
 
@@ -53,7 +57,8 @@ Notes:
   `DATA.DELETE`) and no `DDL.*` or `SANKHYA.*` permission, and there is no administrator bypass
   anywhere. Its only `DATA.*` permission is `DATA.PREVIEW`. An administrator who must also write ERP data needs a second
   role.
-- No seeded role holds `DATA.DELETE`, `DDL.CUSTOM.GENERATE` or `SANKHYA.BUSINESS_ACTION.EXECUTE`.
+- No seeded role holds `DATA.DELETE`, `DDL.CUSTOM.GENERATE`, `SANKHYA.BUSINESS_ACTION.EXECUTE` or
+  any `SANKHYA.ACTION.*` permission.
   Grant them through a custom role. `DATA.DELETE` has no effect on Sankhya tables today: a `DELETE`
   on a Sankhya table is `UNSUPPORTED` (see [capabilities.md](capabilities.md)). It applies to
   nothing else either, since scratch deletes use `TEMP.WRITE`.
@@ -73,27 +78,28 @@ Notes:
 
 ## Where each permission is checked
 
-| Permission                        | Routes and behaviour                                                                                                                                                   |
-| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `QUERY.SELECT`                    | `POST /api/query` (Sankhya reads), `GET /api/schema`, `GET /api/connections`, `GET /api/scratch/tables`, scratch `SELECT` in `POST /api/scratch/exec`, materialization |
-| `TEMP.CREATE`                     | scratch `CREATE TABLE` / `ALTER TABLE` of a `tmp_` table (`POST /api/scratch/exec`)                                                                                    |
-| `TEMP.WRITE`                      | scratch `INSERT` / `UPDATE` / `DELETE` (`POST /api/scratch/exec`, and plans for `tmp_` tables through `POST /api/query/preview`)                                       |
-| `TEMP.DROP`                       | scratch `DROP TABLE` (`POST /api/scratch/exec`)                                                                                                                        |
-| `TEMP.MATERIALIZE`                | `POST /api/scratch/materialize` (with `QUERY.SELECT`), evaluated on both the scratch side and the Sankhya source side                                                  |
-| `DATA.PREVIEW`                    | `POST /api/query/preview` for Sankhya `INSERT` / `UPDATE` / `DELETE` without the statement permission; never `execute`; policy evaluated on the statement action       |
-| `DATA.INSERT`                     | `INSERT` plans on Sankhya tables (`POST /api/query/preview`, `POST /api/query/execute`)                                                                                |
-| `DATA.UPDATE`                     | `UPDATE` plans on Sankhya tables, including assisted rollback plans                                                                                                    |
-| `DATA.DELETE`                     | checked for `DELETE` statements; a Sankhya `DELETE` is still refused as unsupported                                                                                    |
-| `DDL.CUSTOM.GENERATE`             | `POST /api/ddl/artifact`: generates Add-on Studio files for custom-prefix tables, never executes DDL                                                                   |
-| `SANKHYA.BUSINESS_ACTION.EXECUTE` | `POST /api/actions/:id/prepare` and `/execute` (one permission covers every registered action)                                                                         |
-| `APPROVAL.DECIDE`                 | `GET /api/approvals/pending`, `POST /api/approvals/:id/decision`, the **Aprovações** page                                                                              |
-| `AUDIT.READ`                      | `GET /api/audit`, `POST /api/audit/:id/rollback-plan`, the **Auditoria** page                                                                                          |
-| `ADMIN.USERS`                     | `/api/admin/users` (assigning roles also needs `ADMIN.ROLES`)                                                                                                          |
-| `ADMIN.GROUPS`                    | `/api/admin/groups` (granting roles to a group also needs `ADMIN.ROLES`)                                                                                               |
-| `ADMIN.ROLES`                     | `/api/admin/roles`                                                                                                                                                     |
-| `ADMIN.POLICIES`                  | `/api/admin/policies` (changing a rule is refused to an account that also holds a write `DATA.*`, `DDL.*` or `SANKHYA.*` permission)                                   |
-| `ADMIN.CONNECTIONS`               | `/api/admin/connections` (create, edit, replace secrets, test, delete)                                                                                                 |
-| `ADMIN.SECURITY`                  | `GET` / `PUT /api/admin/security` (the runtime write kill switch), cancelling another user's running query                                                             |
+| Permission                        | Routes and behaviour                                                                                                                                                      |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `QUERY.SELECT`                    | `POST /api/query` (Sankhya reads), `GET /api/schema`, `GET /api/connections`, `GET /api/scratch/tables`, scratch `SELECT` in `POST /api/scratch/exec`, materialization    |
+| `TEMP.CREATE`                     | scratch `CREATE TABLE` / `ALTER TABLE` of a `tmp_` table (`POST /api/scratch/exec`)                                                                                       |
+| `TEMP.WRITE`                      | scratch `INSERT` / `UPDATE` / `DELETE` (`POST /api/scratch/exec`, and plans for `tmp_` tables through `POST /api/query/preview`)                                          |
+| `TEMP.DROP`                       | scratch `DROP TABLE` (`POST /api/scratch/exec`)                                                                                                                           |
+| `TEMP.MATERIALIZE`                | `POST /api/scratch/materialize` (with `QUERY.SELECT`), evaluated on both the scratch side and the Sankhya source side                                                     |
+| `DATA.PREVIEW`                    | `POST /api/query/preview` for Sankhya `INSERT` / `UPDATE` / `DELETE` without the statement permission; never `execute`; policy evaluated on the statement action          |
+| `DATA.INSERT`                     | `INSERT` plans on Sankhya tables (`POST /api/query/preview`, `POST /api/query/execute`)                                                                                   |
+| `DATA.UPDATE`                     | `UPDATE` plans on Sankhya tables, including assisted rollback plans                                                                                                       |
+| `DATA.DELETE`                     | checked for `DELETE` statements; a Sankhya `DELETE` is still refused as unsupported                                                                                       |
+| `DDL.CUSTOM.GENERATE`             | `POST /api/ddl/artifact`: generates Add-on Studio files for custom-prefix tables, never executes DDL                                                                      |
+| `SANKHYA.BUSINESS_ACTION.EXECUTE` | `POST /api/actions/:id/prepare` and `/execute`: needed for every business action, together with the action's own permission                                               |
+| `SANKHYA.ACTION.*`                | the one action it names (`CANCELAR_NOTA`, `INCLUIR_NOTA`, `INCLUIR_ALTERAR_ITEM_NOTA`, `EXCLUIR_ITEM_NOTA`); the policy decides on it, with every table the action writes |
+| `APPROVAL.DECIDE`                 | `GET /api/approvals/pending`, `POST /api/approvals/:id/decision`, the **Aprovações** page                                                                                 |
+| `AUDIT.READ`                      | `GET /api/audit`, `POST /api/audit/:id/rollback-plan`, the **Auditoria** page                                                                                             |
+| `ADMIN.USERS`                     | `/api/admin/users` (assigning roles also needs `ADMIN.ROLES`)                                                                                                             |
+| `ADMIN.GROUPS`                    | `/api/admin/groups` (granting roles to a group also needs `ADMIN.ROLES`)                                                                                                  |
+| `ADMIN.ROLES`                     | `/api/admin/roles`                                                                                                                                                        |
+| `ADMIN.POLICIES`                  | `/api/admin/policies` (changing a rule is refused to an account that also holds a write `DATA.*`, `DDL.*` or `SANKHYA.*` permission)                                      |
+| `ADMIN.CONNECTIONS`               | `/api/admin/connections` (create, edit, replace secrets, test, delete)                                                                                                    |
+| `ADMIN.SECURITY`                  | `GET` / `PUT /api/admin/security` (the runtime write kill switch), cancelling another user's running query                                                                |
 
 Authenticated routes that need no specific permission: `GET /api/status`, `GET /api/auth/me`,
 logout, password change, history, saved queries, `POST /api/query/cancel` for one's own

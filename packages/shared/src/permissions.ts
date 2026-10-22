@@ -3,6 +3,9 @@
  * write switches and approvals can still refuse it. No permission grants DDL on native ERP
  * tables: that is refused for everyone, administrators included.
  *
+ * A business action needs SANKHYA.BUSINESS_ACTION.EXECUTE and its own SANKHYA.ACTION.*
+ * permission; the policy is evaluated on the latter.
+ *
  * DATA.PREVIEW lets a user plan and see the preview of an INSERT / UPDATE / DELETE without
  * holding its DATA.* permission. It never executes anything: execution still needs the
  * statement's own permission, and the preview still needs a policy ALLOW for that write action.
@@ -19,6 +22,10 @@ export const PERMISSIONS = [
   'DATA.DELETE',
   'DDL.CUSTOM.GENERATE',
   'SANKHYA.BUSINESS_ACTION.EXECUTE',
+  'SANKHYA.ACTION.CANCELAR_NOTA',
+  'SANKHYA.ACTION.INCLUIR_NOTA',
+  'SANKHYA.ACTION.INCLUIR_ALTERAR_ITEM_NOTA',
+  'SANKHYA.ACTION.EXCLUIR_ITEM_NOTA',
   'APPROVAL.DECIDE',
   'AUDIT.READ',
   'ADMIN.USERS',
@@ -74,6 +81,10 @@ export const POLICY_ADMIN_CONFLICTS: readonly Permission[] = [
   'DATA.DELETE',
   'DDL.CUSTOM.GENERATE',
   'SANKHYA.BUSINESS_ACTION.EXECUTE',
+  'SANKHYA.ACTION.CANCELAR_NOTA',
+  'SANKHYA.ACTION.INCLUIR_NOTA',
+  'SANKHYA.ACTION.INCLUIR_ALTERAR_ITEM_NOTA',
+  'SANKHYA.ACTION.EXCLUIR_ITEM_NOTA',
 ];
 
 /** Permissions of the seeded system roles. The RBAC migration mirrors them; a test keeps both equal. */

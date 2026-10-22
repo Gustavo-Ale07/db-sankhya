@@ -324,6 +324,10 @@ describe('policies: separation of duties', () => {
     'DATA.DELETE',
     'DDL.CUSTOM.GENERATE',
     'SANKHYA.BUSINESS_ACTION.EXECUTE',
+    'SANKHYA.ACTION.CANCELAR_NOTA',
+    'SANKHYA.ACTION.INCLUIR_NOTA',
+    'SANKHYA.ACTION.INCLUIR_ALTERAR_ITEM_NOTA',
+    'SANKHYA.ACTION.EXCLUIR_ITEM_NOTA',
   ] as const)('refuses a policy change by an ADMIN that also holds %s', async (permission) => {
     const h = await setup();
     const actor = await h.userWithRoles(['ADMIN'], [permission]);

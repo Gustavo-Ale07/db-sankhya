@@ -127,6 +127,9 @@ const SERVICES: Record<string, 'mge' | 'mgecom'> = {
   'CRUDServiceProvider.loadRecords': 'mge',
   'DatasetSP.save': 'mge',
   'CACSP.cancelarNota': 'mgecom',
+  'CACSP.incluirNota': 'mgecom',
+  'CACSP.incluirAlterarItemNota': 'mgecom',
+  'CACSP.excluirItemNota': 'mgecom',
 };
 
 const SERVICE_PATH = /^\/gateway\/v1\/(mge|mgecom)\/service\.sbr$/;
@@ -316,6 +319,17 @@ export async function createMockSankhya(opts: MockSankhyaOptions = {}): Promise<
               ? await discarded((tx) => cancelarNota(body, tx))
               : await cancelarNota(body),
           );
+        case 'CACSP.incluirNota':
+        case 'CACSP.incluirAlterarItemNota':
+        case 'CACSP.excluirItemNota': {
+          const run = NOTE_SERVICES[serviceName]!;
+          return envelope(
+            serviceName,
+            fault?.type === 'ignoreWrite'
+              ? await discarded((tx) => run(body, tx))
+              : await run(body),
+          );
+        }
       }
       return serviceError(serviceName, 'Serviço não encontrado');
     } catch (err) {
@@ -516,6 +530,128 @@ export async function createMockSankhya(opts: MockSankhyaOptions = {}): Promise<
     return { notasCanceladas: { nunota: [{ $: String(nunota) }] } };
   }
 
+  /**
+   * Mock-only: creates a note and its items, taking the body documented for CACSP.incluirNota
+   * (post_incluimovimentos). Without INFORMARPRECO the item takes the product's price.
+   * Answers the generated key, `{ pk: { NUNOTA } }`.
+   */
+  async function incluirNota(body: unknown, q: Tx | PGlite = db) {
+    const nota = isRecord(body) && isRecord(body.nota) ? body.nota : undefined;
+    const cab = nota && isRecord(nota.cabecalho) ? nota.cabecalho : undefined;
+    const itens = nota && isRecord(nota.itens) ? nota.itens : undefined;
+    if (!cab || !itens) throw new MockServiceError('Estrutura da nota inválida');
+    const codparc = wireInt(cab, 'CODPARC');
+    const dtneg = wireDate(cab, 'DTNEG');
+    const tipmov = wireText(cab, 'TIPMOV');
+    if (!tipmov || tipmov.length !== 1) throw new MockServiceError('Campo TIPMOV inválido');
+    for (const name of ['CODTIPOPER', 'CODTIPVENDA', 'CODVEND', 'CODEMP']) wireInt(cab, name);
+    const priced = itens.INFORMARPRECO === 'True';
+    const list = Array.isArray(itens.item) ? itens.item : isRecord(itens.item) ? [itens.item] : [];
+    if (list.length === 0) throw new MockServiceError('Nota sem itens');
+    await partnerExists(q, codparc);
+    const lines: Array<[number, number, number]> = [];
+    for (const item of list) {
+      if (!isRecord(item)) throw new MockServiceError('Item inválido');
+      const codprod = wireInt(item, 'CODPROD');
+      const qtdneg = wireNumber(item, 'QTDNEG');
+      wireInt(item, 'CODLOCALORIG');
+      if (!wireText(item, 'CODVOL')) throw new MockServiceError('Campo CODVOL ausente');
+      const price = await productPrice(q, codprod);
+      lines.push([codprod, qtdneg, priced ? wireNumber(item, 'VLRUNIT') : price]);
+    }
+    const next = await q.query<{ nunota: number; numnota: number }>(
+      `SELECT COALESCE(MAX(NUNOTA), 0) + 1 AS nunota, COALESCE(MAX(NUMNOTA), 0) + 1 AS numnota
+         FROM TGFCAB`,
+    );
+    const { nunota, numnota } = next.rows[0]!;
+    await q.query(
+      `INSERT INTO TGFCAB (NUNOTA, NUMNOTA, CODPARC, DTNEG, TIPMOV, VLRNOTA, STATUSNOTA)
+       VALUES ($1, $2, $3, $4, $5, 0, 'A')`,
+      [nunota, numnota, codparc, dtneg, tipmov],
+    );
+    for (const [n, [codprod, qtdneg, vlrunit]] of lines.entries()) {
+      await q.query(
+        `INSERT INTO TGFITE (NUNOTA, SEQUENCIA, CODPROD, QTDNEG, VLRUNIT, VLRTOT)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [nunota, n + 1, codprod, qtdneg, vlrunit, cents(qtdneg * vlrunit)],
+      );
+    }
+    await noteTotal(q, nunota);
+    return { pk: { NUNOTA: { $: String(nunota) } } };
+  }
+
+  /**
+   * Mock-only: adds an item to an open note (SEQUENCIA "") or changes one, taking the body
+   * documented for CACSP.incluirAlterarItemNota (post_incaltitemmovimento). Answers the item's
+   * key, `{ pk: { NUNOTA, SEQUENCIA } }`.
+   */
+  async function incluirAlterarItemNota(body: unknown, q: Tx | PGlite = db) {
+    const nota = isRecord(body) && isRecord(body.nota) ? body.nota : undefined;
+    const itens = nota && isRecord(nota.itens) ? nota.itens : undefined;
+    const item = itens && isRecord(itens.item) ? itens.item : undefined;
+    if (!nota || !item) throw new MockServiceError('Estrutura da nota inválida');
+    const nunota = wireInt(nota, 'NUNOTA');
+    if (wireInt(item, 'NUNOTA') !== nunota) throw new MockServiceError('NUNOTA divergente');
+    const seq = wireText(item, 'SEQUENCIA');
+    if (seq === undefined) throw new MockServiceError('Campo SEQUENCIA ausente');
+    const codprod = wireInt(item, 'CODPROD');
+    const qtdneg = wireNumber(item, 'QTDNEG');
+    const vlrunit = wireNumber(item, 'VLRUNIT');
+    if (!wireText(item, 'CODVOL')) throw new MockServiceError('Campo CODVOL ausente');
+    await openNote(q, nunota);
+    await productPrice(q, codprod);
+    let sequencia: number;
+    if (seq === '') {
+      const next = await q.query<{ seq: number }>(
+        'SELECT COALESCE(MAX(SEQUENCIA), 0) + 1 AS seq FROM TGFITE WHERE NUNOTA = $1',
+        [nunota],
+      );
+      sequencia = next.rows[0]!.seq;
+      await q.query(
+        `INSERT INTO TGFITE (NUNOTA, SEQUENCIA, CODPROD, QTDNEG, VLRUNIT, VLRTOT)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [nunota, sequencia, codprod, qtdneg, vlrunit, cents(qtdneg * vlrunit)],
+      );
+    } else {
+      sequencia = wireInt(item, 'SEQUENCIA');
+      const res = await q.query(
+        `UPDATE TGFITE SET CODPROD = $3, QTDNEG = $4, VLRUNIT = $5, VLRTOT = $6
+          WHERE NUNOTA = $1 AND SEQUENCIA = $2`,
+        [nunota, sequencia, codprod, qtdneg, vlrunit, cents(qtdneg * vlrunit)],
+      );
+      if (res.affectedRows !== 1) throw new MockServiceError('Item não encontrado');
+    }
+    await noteTotal(q, nunota);
+    return { pk: { NUNOTA: { $: String(nunota) }, SEQUENCIA: { $: String(sequencia) } } };
+  }
+
+  /**
+   * Mock-only: removes one item of an open note, taking the body documented for
+   * CACSP.excluirItemNota (post_excluiitemmovimento).
+   */
+  async function excluirItemNota(body: unknown, q: Tx | PGlite = db) {
+    const nota = isRecord(body) && isRecord(body.nota) ? body.nota : undefined;
+    const itens = nota && isRecord(nota.itens) ? nota.itens : undefined;
+    const item = itens && isRecord(itens.item) ? itens.item : undefined;
+    if (!item) throw new MockServiceError('Estrutura da nota inválida');
+    const nunota = wireInt(item, 'NUNOTA');
+    const sequencia = wireInt(item, 'SEQUENCIA');
+    await openNote(q, nunota);
+    const res = await q.query('DELETE FROM TGFITE WHERE NUNOTA = $1 AND SEQUENCIA = $2', [
+      nunota,
+      sequencia,
+    ]);
+    if (res.affectedRows !== 1) throw new MockServiceError('Item não encontrado');
+    await noteTotal(q, nunota);
+    return {};
+  }
+
+  const NOTE_SERVICES: Record<string, (body: unknown, q?: Tx | PGlite) => Promise<unknown>> = {
+    'CACSP.incluirNota': incluirNota,
+    'CACSP.incluirAlterarItemNota': incluirAlterarItemNota,
+    'CACSP.excluirItemNota': excluirItemNota,
+  };
+
   /** Runs a write and rolls it back, returning what it answered (the ignoreWrite fault). */
   async function discarded<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
     let out: { value: T } | undefined;
@@ -640,6 +776,68 @@ export async function startMockSankhyaServer(
 }
 
 class MockServiceError extends Error {}
+
+/** The text of a `{ "$": "..." }` field (or a bare value); undefined when absent. */
+function wireText(o: Record<string, unknown>, name: string): string | undefined {
+  const v = o[name];
+  const raw = isRecord(v) ? v.$ : v;
+  return typeof raw === 'string' ? raw : typeof raw === 'number' ? String(raw) : undefined;
+}
+
+function wireNumber(o: Record<string, unknown>, name: string): number {
+  const text = wireText(o, name)?.trim();
+  const n = text ? Number(text) : NaN;
+  if (!Number.isFinite(n)) throw new MockServiceError(`Campo ${name} inválido ou ausente`);
+  return n;
+}
+
+function wireInt(o: Record<string, unknown>, name: string): number {
+  const n = wireNumber(o, name);
+  if (!Number.isInteger(n)) throw new MockServiceError(`Campo ${name} inválido`);
+  return n;
+}
+
+/** dd/mm/yyyy, as the documented examples send dates, to an ISO date. */
+function wireDate(o: Record<string, unknown>, name: string): string {
+  const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(wireText(o, name) ?? '');
+  if (!m) throw new MockServiceError(`Campo ${name} inválido`);
+  return `${m[3]}-${m[2]}-${m[1]}`;
+}
+
+const cents = (n: number) => Math.round(n * 100) / 100;
+
+async function partnerExists(q: Tx | PGlite, codparc: number) {
+  const res = await q.query('SELECT 1 FROM TGFPAR WHERE CODPARC = $1', [codparc]);
+  if (res.rows.length !== 1) throw new MockServiceError('Parceiro não encontrado');
+}
+
+/** The product's sale price; refuses an unknown product. */
+async function productPrice(q: Tx | PGlite, codprod: number): Promise<number> {
+  const res = await q.query<{ vlrvenda: number | string | null }>(
+    'SELECT VLRVENDA AS vlrvenda FROM TGFPRO WHERE CODPROD = $1',
+    [codprod],
+  );
+  if (res.rows.length !== 1) throw new MockServiceError('Produto não encontrado');
+  return Number(res.rows[0]!.vlrvenda ?? 0);
+}
+
+/** Refuses a note that does not exist or is cancelled. */
+async function openNote(q: Tx | PGlite, nunota: number) {
+  const res = await q.query<{ statusnota: string | null }>(
+    'SELECT STATUSNOTA AS statusnota FROM TGFCAB WHERE NUNOTA = $1',
+    [nunota],
+  );
+  if (res.rows.length !== 1) throw new MockServiceError('Nota não encontrada');
+  if (res.rows[0]!.statusnota === 'C') throw new MockServiceError('Nota cancelada');
+}
+
+async function noteTotal(q: Tx | PGlite, nunota: number) {
+  await q.query(
+    `UPDATE TGFCAB SET VLRNOTA = (SELECT COALESCE(SUM(VLRTOT), 0) FROM TGFITE WHERE NUNOTA = $1)
+      WHERE NUNOTA = $1`,
+    [nunota],
+  );
+}
 
 function tableFor(entity: string): MockTable {
   const t = findTableByEntity(entity);

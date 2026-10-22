@@ -127,9 +127,18 @@ was never used for any of this, read or write.
 | `DELETE` on Sankhya                         | n/a                    | refused (`UNSUPPORTED`)                                              | refused (`UNSUPPORTED`)                   |
 | Production                                  | never                  | never                                                                | never                                     |
 
+Business actions (`/api/actions/:id`, route `SANKHYA_ACTION`) are not statements: see
+[sankhya.md](sankhya.md#business-actions). `CACSP.cancelarNota`, `CACSP.incluirNota`,
+`CACSP.incluirAlterarItemNota` and `CACSP.excluirItemNota` were proven on the mock only
+(integration tests), never against the base de testes or production; `SelecaoDocumentoSP.faturar`
+is a disabled stub. Each needs `SANKHYA.BUSINESS_ACTION.EXECUTE` plus its own `SANKHYA.ACTION.*`
+permission.
+
 The base de testes refusal is the single Fase 0.6 attempt: `DatasetSP.save` answered
 `"status":"0"`, `"statusMessage":"Não autorizado"`, and the read-back showed the value unchanged
-(see [sankhya.md](sankhya.md#what-the-gateway-does-observed)). Every gateway call of the E2E
+(see [sankhya.md](sankhya.md#what-the-gateway-does-observed)). The API reports it as
+`SANKHYA_WRITE_NOT_AUTHORIZED`, and the editor shows "Gravação via API não liberada para este
+usuário no Gateway (DatasetSP.save)". Every gateway call of the E2E
 `e2e/tests/editor-tmp.spec.ts` is logged by service name (`SANKHYA_MOCK_CALL_LOG`), and the test
 asserts the log holds read services only.
 

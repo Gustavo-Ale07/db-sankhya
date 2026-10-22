@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { AppError } from '@dbx/shared';
 import { ENV_CONNECTION_ID } from '../services/connections';
 import { ApprovalsService } from '../services/approvals';
-import { findAction } from '../services/business-actions';
+import { ACTION_WARNING, findAction, findStub } from '../services/business-actions';
 import type { BusinessAction } from '../services/business-actions';
 import { MutationService } from '../services/mutations';
 import { PlansService } from '../services/plans';
@@ -74,8 +74,16 @@ export async function actionRoutes(app: FastifyInstance): Promise<void> {
   function actionOf(params: unknown): BusinessAction {
     const { id } = parseBody(actionParams, params);
     const action = findAction(id);
-    if (!action) throw new AppError('NOT_FOUND', 'Unknown business action.');
-    return action;
+    if (action) return action;
+    // A known service whose contract is not confirmed: documented, never executable.
+    const stub = findStub(id);
+    if (stub) {
+      throw new AppError('OPERATION_NOT_SUPPORTED', `${stub.id} is not available: ${stub.reason}`, {
+        action: stub.id,
+        contract: stub.contract,
+      });
+    }
+    throw new AppError('NOT_FOUND', 'Unknown business action.');
   }
 
   function defaultConnection(): string {
@@ -88,7 +96,8 @@ export async function actionRoutes(app: FastifyInstance): Promise<void> {
 
   // ------------------------------------------------------------ POST /api/actions/:id/prepare
   // Plans one business action and returns its preview (the row as it is and as the action is
-  // expected to leave it). Never calls the action: it runs only through /execute.
+  // expected to leave it), with the contract it follows and the warning that it was validated
+  // on the mock only. Never calls the action: it runs only through /execute.
   app.post('/api/actions/:id/prepare', async (request, reply) => {
     noStore(reply);
     const auth = requireAuth(request);
@@ -113,6 +122,8 @@ export async function actionRoutes(app: FastifyInstance): Promise<void> {
       ...(redact({
         type: 'preview',
         ...shown,
+        contract: action.contract,
+        warning: ACTION_WARNING,
         execution: {
           available,
           // Whether the caller holds the permission execute checks (false for DATA.PREVIEW only).

@@ -1270,6 +1270,10 @@ describe('action classification', () => {
       'DATA.DELETE',
       'DDL.CUSTOM.GENERATE',
       'SANKHYA.BUSINESS_ACTION.EXECUTE',
+      'SANKHYA.ACTION.CANCELAR_NOTA',
+      'SANKHYA.ACTION.INCLUIR_NOTA',
+      'SANKHYA.ACTION.INCLUIR_ALTERAR_ITEM_NOTA',
+      'SANKHYA.ACTION.EXCLUIR_ITEM_NOTA',
     ]);
     expect(Object.keys(POLICY_ACTION_CLASS).sort()).toEqual([...PERMISSIONS].sort());
     // Previewing writes nothing: policy is evaluated on the statement's own write action.

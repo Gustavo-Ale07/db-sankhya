@@ -475,8 +475,8 @@ describe('ApprovalsService: business action plans', () => {
     class: 'SUPPORTED',
     route: 'SANKHYA_ACTION',
     reason: 'typed business action',
-    action: 'SANKHYA.BUSINESS_ACTION.EXECUTE',
-    actions: ['SANKHYA.BUSINESS_ACTION.EXECUTE'],
+    action: 'SANKHYA.ACTION.CANCELAR_NOTA',
+    actions: ['SANKHYA.ACTION.CANCELAR_NOTA'],
   };
   const actionPlan = (sql: string, capability: Capability = ACTION_CAPABILITY) =>
     plansService.create(
@@ -492,21 +492,28 @@ describe('ApprovalsService: business action plans', () => {
     'ACTION CACSP.cancelarNota {"justificativa":"Nota emitida em duplicidade","nunota":7}';
 
   it('scopes the plan to the action permission and entity', async () => {
-    await addRole('ACTION_APPROVER', ['APPROVAL.DECIDE', 'SANKHYA.BUSINESS_ACTION.EXECUTE']);
+    await addRole('ACTION_APPROVER', [
+      'APPROVAL.DECIDE',
+      'SANKHYA.BUSINESS_ACTION.EXECUTE',
+      'SANKHYA.ACTION.CANCELAR_NOTA',
+    ]);
     const approver = await addUser('iris@example.com', 'ACTION_APPROVER');
     // Only an owner holding the action permission may ask for approval of an action plan.
     const plan = await actionPlan(STATEMENT);
     await expectCode(service.request(plan.id, requester), 'FORBIDDEN');
-    await addRole('ACTION_REQUESTER', ['SANKHYA.BUSINESS_ACTION.EXECUTE']);
+    await addRole('ACTION_REQUESTER', [
+      'SANKHYA.BUSINESS_ACTION.EXECUTE',
+      'SANKHYA.ACTION.CANCELAR_NOTA',
+    ]);
     const [extra] = await database.db.select().from(roles).where(eq(roles.key, 'ACTION_REQUESTER'));
     await database.db.insert(userRoles).values({ userId: requester, roleId: extra!.id });
     const approval = await service.request(plan.id, requester);
-    // OPERATOR holds no SANKHYA.BUSINESS_ACTION.EXECUTE: a DATA.UPDATE decider cannot approve.
+    // OPERATOR holds no action permission: a DATA.UPDATE decider cannot approve.
     await expectCode(service.decide(approval.id, decider, 'APPROVE', null), 'FORBIDDEN');
     // The permission alone is not enough: the policy must ALLOW the action on TGFCAB.
-    await rule('ALLOW', approver, ['SANKHYA.BUSINESS_ACTION.EXECUTE'], ['TGFPAR']);
+    await rule('ALLOW', approver, ['SANKHYA.ACTION.CANCELAR_NOTA'], ['TGFPAR']);
     await expectCode(service.decide(approval.id, approver, 'APPROVE', null), 'FORBIDDEN');
-    await rule('ALLOW', approver, ['SANKHYA.BUSINESS_ACTION.EXECUTE'], ['TGFCAB']);
+    await rule('ALLOW', approver, ['SANKHYA.ACTION.CANCELAR_NOTA'], ['TGFCAB']);
     await service.decide(approval.id, approver, 'APPROVE', null);
     expect(await planStatus(plan.id)).toBe('APPROVED');
   });
@@ -518,7 +525,7 @@ describe('ApprovalsService: business action plans', () => {
     await expectCode(service.request(badInput.id, requester), 'VALIDATION_ERROR');
     const widened = await actionPlan(STATEMENT, {
       ...ACTION_CAPABILITY,
-      actions: ['SANKHYA.BUSINESS_ACTION.EXECUTE', 'DATA.UPDATE'],
+      actions: ['SANKHYA.ACTION.CANCELAR_NOTA', 'DATA.UPDATE'],
     });
     await expectCode(service.request(widened.id, requester), 'VALIDATION_ERROR');
     const sqlUnderAction = await actionPlan("UPDATE TGFCAB SET STATUSNOTA = 'C' WHERE NUNOTA = 7");
