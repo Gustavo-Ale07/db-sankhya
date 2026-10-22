@@ -3,7 +3,13 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, ApiError, newExecutionId } from '../api/client';
 import { previewMutation } from '../api/mutations';
 import type { PreparedPlan } from '../api/mutations';
-import type { QueryResult, SavedQuery, SchemaResponse, SchemaTableResponse } from '../api/types';
+import type {
+  QueryResult,
+  SavedQuery,
+  ScratchSchema,
+  SchemaResponse,
+  SchemaTableResponse,
+} from '../api/types';
 import type { Theme } from '../app/theme';
 import { useSession } from '../app/session';
 import { setCompletionSchema } from '../editor/monaco';
@@ -16,7 +22,7 @@ import type { PendingPlan } from './pendingPlans';
 import { ResultsPanel } from './ResultsPanel';
 import type { ResultTab } from './ResultsPanel';
 import { SavedQueryPicker } from './SavedQueryPicker';
-import { SchemaTree } from './SchemaTree';
+import { SchemaTree, scratchAsCatalog } from './SchemaTree';
 import { SqlEditor } from './SqlEditor';
 import type { EditorApi } from './SqlEditor';
 import { isPreviewPointer } from './runState';
@@ -148,6 +154,18 @@ export function ExplorerPage({
         : undefined,
     [columnsCut, connectionId],
   );
+  // The caller's tmp_ tables, with columns and rows (policy-filtered by the server): the
+  // "Temporárias" group of the tree and the autocomplete. Read again after every command.
+  const scratch = useQuery({
+    queryKey: ['scratch-tables', 'columns'],
+    queryFn: () => api.get<ScratchSchema>('/api/scratch/tables', { query: { columns: '1' } }),
+    staleTime: 30_000,
+  });
+  const scratchSchema = Array.isArray(scratch.data?.tables) ? scratch.data : undefined;
+  const refreshScratch = useCallback(
+    () => void qc.invalidateQueries({ queryKey: ['scratch-tables'] }),
+    [qc],
+  );
   const refresh = useMutation({
     mutationFn: (id: string) =>
       api.post<SchemaResponse>('/api/schema/refresh', {}, { query: { connectionId: id } }),
@@ -172,8 +190,17 @@ export function ExplorerPage({
   }, [connectionId]);
   useEffect(() => {
     // Cleared while another connection's dictionary loads: no suggestions from the wrong one.
-    setCompletionSchema(schema.data?.catalog.tables ?? [], loadTable);
-  }, [schema.data, loadTable]);
+    const own = (scratchSchema?.tables ?? []).map(scratchAsCatalog);
+    const byName = new Map(own.map((t) => [t.name, t]));
+    // A tmp_ table is complete as listed: never read from the Sankhya dictionary.
+    const load =
+      loadTable &&
+      ((name: string) => {
+        const t = byName.get(name);
+        return t ? Promise.resolve(t) : loadTable(name);
+      });
+    setCompletionSchema([...own, ...(schema.data?.catalog.tables ?? [])], load);
+  }, [schema.data, loadTable, scratchSchema]);
 
   const tab = tabs.find((t) => t.id === activeId) ?? tabs[0]!;
   const run: RunState = runs[tab.id] ?? { status: 'idle' };
@@ -278,9 +305,10 @@ export function ExplorerPage({
       } finally {
         if (aborts.current[tabId] === controller) delete aborts.current[tabId];
         void qc.invalidateQueries({ queryKey: ['history'] });
+        refreshScratch();
       }
     },
-    [qc, connectionId, openPlan],
+    [qc, connectionId, openPlan, refreshScratch],
   );
 
   const runCurrent = useCallback(() => {
@@ -589,6 +617,7 @@ export function ExplorerPage({
                     degraded={schema.data?.catalog.degraded}
                     onRefresh={connectionId ? () => refresh.mutate(connectionId) : undefined}
                     refreshing={refresh.isPending}
+                    {...(scratchSchema ? { scratch: scratchSchema } : {})}
                   />
                 </div>
                 {schema.isError && <ErrorBox error={schema.error} className="m-2" />}
@@ -717,6 +746,7 @@ export function ExplorerPage({
           onClose={() => setMutation(null)}
           onOutcome={(outcome) => {
             updatePlan(mutation.planId, { outcome });
+            refreshScratch();
             setRun(mutation.tabId, {
               status: 'mutation',
               sql: mutation.sql,

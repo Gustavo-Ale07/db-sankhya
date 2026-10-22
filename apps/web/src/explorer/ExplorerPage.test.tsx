@@ -6,6 +6,7 @@ import { executePlan, previewMutation, requestApproval } from '../api/mutations'
 import type { ExecutionReport, MutationPreview, PreparedPlan } from '../api/mutations';
 import type { User } from '../api/types';
 import { SessionContext } from '../app/session';
+import { setCompletionSchema } from '../editor/monaco';
 import { ExplorerPage } from './ExplorerPage';
 import type { OpenPlanRequest } from './ExplorerPage';
 import { clearPendingPlans } from './pendingPlans';
@@ -342,5 +343,47 @@ describe('ExplorerPage server-prepared plan (assisted rollback)', () => {
   it('opens nothing while the selected connection is not the plan connection', () => {
     renderPage({ planRequest: request({ connectionId: 'prod' }), connectionId: 'env' });
     expect(screen.queryByTestId('mutation-dialog')).toBeNull();
+  });
+});
+
+describe('ExplorerPage tmp_ tables (A5)', () => {
+  const SCRATCH = {
+    ttlMinutes: 60,
+    tables: [{ name: 'tmp_p', rows: 5, columns: [{ name: 'codparc', type: 'integer' }] }],
+  };
+  const getScratch = () =>
+    vi.mocked(api.get).mock.calls.filter((c) => c[0] === '/api/scratch/tables');
+
+  beforeEach(() => {
+    vi.mocked(api.get).mockImplementation((path) =>
+      Promise.resolve(
+        path === '/api/scratch/tables'
+          ? SCRATCH
+          : {
+              connectionId: 'env',
+              catalog: { tables: [{ name: 'TGFPAR', columns: [], foreignKeys: [] }] },
+            },
+      ),
+    );
+  });
+
+  it('shows the Temporárias group and feeds tmp_ tables to the autocomplete', async () => {
+    renderPage();
+    expect(await screen.findByTestId('schema-table-tmp_p')).toBeTruthy();
+    expect(getScratch()[0]![1]).toEqual({ query: { columns: '1' } });
+    await waitFor(() => {
+      const last = vi.mocked(setCompletionSchema).mock.calls.at(-1)!;
+      expect(last[0].map((t) => t.name)).toEqual(['tmp_p', 'TGFPAR']);
+    });
+  });
+
+  it('reads the tmp_ tables again once a plan reports its outcome', async () => {
+    vi.mocked(executePlan).mockResolvedValue(report);
+    await openPreviewedPlan();
+    await screen.findByTestId('schema-table-tmp_p');
+    const before = getScratch().length;
+    fireEvent.click(execButton());
+    await screen.findByTestId('execution-report');
+    await waitFor(() => expect(getScratch().length).toBeGreaterThan(before));
   });
 });

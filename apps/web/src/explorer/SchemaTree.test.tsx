@@ -208,3 +208,77 @@ describe('SchemaTree', () => {
     });
   });
 });
+
+describe('SchemaTree "Temporárias (tmp_*)" group', () => {
+  const SCRATCH = {
+    ttlMinutes: 60,
+    tables: [
+      {
+        name: 'tmp_p',
+        rows: 5,
+        columns: [
+          { name: 'codparc', type: 'integer' },
+          { name: 'nomeparc', type: 'text' },
+        ],
+      },
+    ],
+  };
+
+  it('comes first, says it is yours and when it goes, and lists rows and columns', () => {
+    const loadTable = vi.fn();
+    const onSelectQuery = vi.fn();
+    render(
+      <SchemaTree
+        tables={TABLES}
+        loading={false}
+        onSelectQuery={onSelectQuery}
+        onInsertText={() => {}}
+        loadTable={loadTable}
+        scratch={SCRATCH}
+      />,
+    );
+    const groups = screen.getAllByRole('group');
+    expect(groups[0]!.getAttribute('aria-label')).toBe('Temporárias (tmp_*)');
+    expect(screen.getByTestId('schema-scratch-note').textContent).toBe(
+      'Só sua; apagada após 60 min de inatividade.',
+    );
+    expect(screen.getByTestId('schema-scratch-rows-tmp_p').textContent).toBe('5 linhas');
+    fireEvent.click(screen.getByTestId('schema-table-tmp_p'));
+    const cols = screen.getByTestId('schema-columns-tmp_p').textContent;
+    expect(cols).toContain('codparc');
+    expect(cols).toContain('integer');
+    // A tmp_ table is never read from the Sankhya dictionary.
+    expect(loadTable).not.toHaveBeenCalled();
+    fireEvent.doubleClick(screen.getByTestId('schema-table-tmp_p'));
+    expect(onSelectQuery).toHaveBeenCalledWith('SELECT *\nFROM tmp_p', 'tmp_p');
+  });
+
+  it('shows the group empty, with a hint, when there is no tmp_ table', () => {
+    render(
+      <SchemaTree
+        tables={TABLES}
+        loading={false}
+        onSelectQuery={() => {}}
+        onInsertText={() => {}}
+        scratch={{ ttlMinutes: 30, tables: [] }}
+      />,
+    );
+    expect(screen.getByTestId('schema-scratch-empty').textContent).toContain('CREATE TABLE tmp_');
+  });
+
+  it('filters tmp_ tables like the others', () => {
+    render(
+      <SchemaTree
+        tables={TABLES}
+        loading={false}
+        onSelectQuery={() => {}}
+        onInsertText={() => {}}
+        scratch={SCRATCH}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText('Filtrar tabelas'), { target: { value: 'TGFPRO' } });
+    expect(screen.queryByTestId('schema-table-tmp_p')).toBeNull();
+    fireEvent.change(screen.getByLabelText('Filtrar tabelas'), { target: { value: 'nomeparc' } });
+    expect(screen.getByTestId('schema-table-tmp_p')).toBeTruthy();
+  });
+});

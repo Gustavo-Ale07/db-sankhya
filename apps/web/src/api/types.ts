@@ -283,3 +283,17 @@ export interface GlobalWriteState {
   runtime: boolean;
   effective: boolean;
 }
+
+/** One of the caller's tmp_ tables (GET /api/scratch/tables?columns=1), policy-filtered. */
+export interface ScratchTableInfo {
+  name: string;
+  rows: number;
+  columns: { name: string; type: string }[];
+}
+
+/** Answer of GET /api/scratch/tables?columns=1. */
+export interface ScratchSchema {
+  /** Minutes of inactivity after which the server drops the whole scratch area. */
+  ttlMinutes: number;
+  tables: ScratchTableInfo[];
+}

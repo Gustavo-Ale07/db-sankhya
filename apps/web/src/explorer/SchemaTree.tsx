@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import type { CatalogTable } from '../api/types';
+import type { CatalogTable, ScratchSchema } from '../api/types';
 import { Icon } from '../components/Icon';
 import { groupByPrefix } from './schemaGroups';
 
@@ -19,6 +19,20 @@ interface Props {
   /** Reads the catalog again (POST /api/schema/refresh). */
   onRefresh?: () => void;
   refreshing?: boolean;
+  /** The caller's tmp_ tables, shown first as "Temporárias (tmp_*)"; absent: no such group. */
+  scratch?: ScratchSchema;
+}
+
+/** The tree group of the tmp_ tables (also its accessible name). */
+export const SCRATCH_GROUP = 'Temporárias (tmp_*)';
+
+/** A tmp_ table as a catalog table, for the tree and the autocomplete. */
+export function scratchAsCatalog(t: ScratchSchema['tables'][number]): CatalogTable {
+  return {
+    name: t.name,
+    columns: t.columns.map((c) => ({ ...c, pk: false })),
+    foreignKeys: [],
+  };
 }
 
 type Detail = { status: 'loading' } | { status: 'ok'; table: CatalogTable } | { status: 'error' };
@@ -38,6 +52,7 @@ export function SchemaTree({
   degraded,
   onRefresh,
   refreshing = false,
+  scratch,
 }: Props) {
   const [filter, setFilter] = useState('');
   const [open, setOpen] = useState<Record<string, boolean>>({});
@@ -48,9 +63,16 @@ export function SchemaTree({
   }>({ byName: {} });
   const byName = details.load === loadTable ? details.byName : NO_DETAILS;
 
+  // tmp_ tables come complete in `scratch`: never read from the Sankhya dictionary.
+  const scratchNames = useMemo(
+    () => new Set((scratch?.tables ?? []).map((t) => t.name)),
+    [scratch],
+  );
   useEffect(() => {
     if (!loadTable) return;
-    const wanted = Object.keys(open).filter((name) => open[name] && !byName[name]);
+    const wanted = Object.keys(open).filter(
+      (name) => open[name] && !byName[name] && !scratchNames.has(name),
+    );
     if (wanted.length === 0) return;
     // Only an answer of the current loader is kept: a late one from another connection is dropped.
     const settle = (name: string, detail: Detail) =>
@@ -70,9 +92,21 @@ export function SchemaTree({
         () => settle(name, { status: 'error' }),
       );
     }
-  }, [loadTable, open, byName]);
+  }, [loadTable, open, byName, scratchNames]);
 
   const filtering = filter.trim() !== '';
+  const matches = (t: CatalogTable, columns: CatalogTable['columns']) => {
+    const f = filter.trim().toLowerCase();
+    return (
+      !f ||
+      t.name.toLowerCase().includes(f) ||
+      (t.description ?? '').toLowerCase().includes(f) ||
+      columns.some((c) => c.name.toLowerCase().includes(f))
+    );
+  };
+  const scratchTables = (scratch?.tables ?? [])
+    .map((t) => ({ table: scratchAsCatalog(t), rows: t.rows }))
+    .filter(({ table }) => matches(table, table.columns));
   const groups = useMemo(() => {
     const f = filter.trim().toLowerCase();
     // With a cut column list, only the columns of a table read on its own are matched: matching
@@ -93,10 +127,12 @@ export function SchemaTree({
     );
   }, [tables, filter, loadTable, byName]);
 
-  function renderTable(t: CatalogTable) {
+  /** `rows`: a tmp_ table, complete as listed (never read from the Sankhya dictionary). */
+  function renderTable(t: CatalogTable, rows?: number) {
     const isOpen = open[t.name] ?? false;
-    const detail = loadTable ? byName[t.name] : undefined;
-    const shown = loadTable ? (detail?.status === 'ok' ? detail.table : undefined) : t;
+    const fromDictionary = loadTable !== undefined && rows === undefined;
+    const detail = fromDictionary ? byName[t.name] : undefined;
+    const shown = fromDictionary ? (detail?.status === 'ok' ? detail.table : undefined) : t;
     const refs = new Map((shown?.foreignKeys ?? []).map((fk) => [fk.column, fk]));
     return (
       <div key={t.name} role="treeitem" aria-expanded={isOpen} aria-selected={false}>
@@ -116,6 +152,14 @@ export function SchemaTree({
             />
             <Icon name="table" size={13} className="text-accent" />
             <span className="truncate font-mono">{t.name}</span>
+            {rows !== undefined && (
+              <span
+                className="ml-auto pl-1 text-[10px] text-muted"
+                data-testid={`schema-scratch-rows-${t.name}`}
+              >
+                {rows === 1 ? '1 linha' : `${rows} linhas`}
+              </span>
+            )}
           </button>
           <button
             type="button"
@@ -180,6 +224,7 @@ Clique para inserir no editor`}
   }
 
   const visible = groups.reduce((n, g) => n + g.tables.length, 0);
+  const scratchOpen = filtering || (openGroups[SCRATCH_GROUP] ?? true);
 
   return (
     <div className="flex h-full flex-col">
@@ -242,6 +287,44 @@ Clique para inserir no editor`}
         />
       </div>
       <div className="min-h-0 flex-1 overflow-auto py-0.5 text-xs" role="tree" aria-label="Tabelas">
+        {scratch && (!filtering || scratchTables.length > 0) && (
+          <div role="group" aria-label={SCRATCH_GROUP}>
+            <button
+              type="button"
+              className="flex w-full items-center gap-1 px-1 py-px text-left font-semibold hover:bg-hover"
+              aria-expanded={scratchOpen}
+              onClick={() => setOpenGroups((o) => ({ ...o, [SCRATCH_GROUP]: !scratchOpen }))}
+              data-testid="schema-group-scratch"
+            >
+              <Icon
+                name={scratchOpen ? 'chevron-down' : 'chevron-right'}
+                size={12}
+                className="text-muted"
+              />
+              <Icon name="folder" size={13} className="text-accent" />
+              <span>{SCRATCH_GROUP}</span>
+              <span className="ml-auto text-[10px] font-normal text-muted">
+                {scratchTables.length}
+              </span>
+            </button>
+            {scratchOpen && (
+              <div className="ml-[0.6rem] border-l border-line">
+                <p className="px-1 py-px text-[10px] text-muted" data-testid="schema-scratch-note">
+                  {`Só sua; apagada após ${scratch.ttlMinutes} min de inatividade.`}
+                </p>
+                {scratchTables.map(({ table, rows }) => renderTable(table, rows))}
+                {scratch.tables.length === 0 && (
+                  <p
+                    className="px-1 py-px text-[10px] text-muted"
+                    data-testid="schema-scratch-empty"
+                  >
+                    Nenhuma ainda: crie com CREATE TABLE tmp_… no editor.
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+        )}
         {loading && <div className="p-2 text-muted">Carregando schema…</div>}
         {groups.map((g) => {
           // A filter opens every group so matches are never hidden behind a collapsed prefix.
@@ -267,7 +350,9 @@ Clique para inserir no editor`}
                 </span>
               </button>
               {groupOpen && (
-                <div className="ml-[0.6rem] border-l border-line">{g.tables.map(renderTable)}</div>
+                <div className="ml-[0.6rem] border-l border-line">
+                  {g.tables.map((t) => renderTable(t))}
+                </div>
               )}
             </div>
           );
