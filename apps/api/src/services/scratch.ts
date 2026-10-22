@@ -14,7 +14,9 @@ import { Worker } from 'node:worker_threads';
 import { AppError } from '@dbx/shared';
 import { analyzeScratchSql, assertScratchTableName } from './scratch-guard';
 import type { ScratchStatement } from './scratch-guard';
-import type { Limits, WorkerRequest, WorkerResponse } from './scratch-worker';
+import type { Limits, TableStructure, WorkerRequest, WorkerResponse } from './scratch-worker';
+
+export type { TableStructure } from './scratch-worker';
 
 export type ScratchColumnType = 'text' | 'numeric' | 'timestamp' | 'boolean';
 
@@ -65,6 +67,14 @@ export interface ScratchSnapshot {
   rows: unknown[][];
   truncated: boolean;
 }
+
+export interface DdlDryRunResult {
+  table: string;
+  before: TableStructure | null;
+  after: TableStructure | null;
+}
+
+const DDL_COMMANDS = new Set(['CREATE TABLE', 'ALTER TABLE', 'DROP TABLE']);
 
 export interface DryRunResult {
   table: string;
@@ -428,6 +438,31 @@ export class ScratchWorkspace {
         sql: stmt.sql,
         target,
         previewRows: this.previewRows,
+        limits: this.limits,
+      }),
+    );
+    return { table: target, ...res };
+  }
+
+  /** Every table with its columns (PostgreSQL types, in order) and row count. */
+  describe(): Promise<TableStructure[]> {
+    return this.use(() => this.host.run({ op: 'describe' }));
+  }
+
+  /**
+   * BEGIN, run a CREATE / ALTER / DROP already analyzed with `analyzeScratchSql` (and authorized
+   * by the caller), describe its target before and after, ROLLBACK. `null` is "no such table".
+   */
+  async ddlDryRun(stmt: ScratchStatement): Promise<DdlDryRunResult> {
+    if (!DDL_COMMANDS.has(stmt.command) || stmt.target === null) {
+      throw new AppError('VALIDATION_ERROR', 'A structure dry run needs a CREATE, ALTER or DROP.');
+    }
+    const target = stmt.target.toLowerCase();
+    const res = await this.use(() =>
+      this.host.run<Omit<DdlDryRunResult, 'table'>>({
+        op: 'ddlDryRun',
+        sql: stmt.sql,
+        target,
         limits: this.limits,
       }),
     );

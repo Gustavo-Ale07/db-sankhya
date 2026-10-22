@@ -30,7 +30,16 @@ export type WorkerRequest =
       target: string;
       previewRows: number;
       limits: Limits;
-    };
+    }
+  | { id: number; op: 'describe' }
+  | { id: number; op: 'ddlDryRun'; sql: string; target: string; limits: Limits };
+
+/** A table's columns (in order, with their PostgreSQL types) and its row count. */
+export interface TableStructure {
+  name: string;
+  rows: number;
+  columns: Array<{ name: string; type: string }>;
+}
 
 export interface Limits {
   maxRows: number;
@@ -111,6 +120,10 @@ async function dispatch(msg: WorkerRequest): Promise<unknown> {
       return importRows(msg.table, msg.columns, msg.rows, msg.limits);
     case 'dryRun':
       return dryRun(msg.sql, msg.target, msg.previewRows, msg.limits.maxResultBytes);
+    case 'describe':
+      return describe();
+    case 'ddlDryRun':
+      return ddlDryRun(msg.sql, msg.target, msg.limits);
   }
 }
 
@@ -189,6 +202,53 @@ async function dryRun(sql: string, target: string, previewRows: number, maxBytes
   } finally {
     await rollback();
   }
+}
+
+/**
+ * BEGIN, run a CREATE / ALTER / DROP, describe the target table before and after, ROLLBACK.
+ * PostgreSQL DDL is transactional, so nothing of it survives. The quotas are checked inside the
+ * transaction, so a CREATE … AS SELECT that would pass them is refused at the preview already.
+ */
+async function ddlDryRun(sql: string, target: string, limits: Limits) {
+  await db.query('BEGIN');
+  try {
+    const before = await structureOf(target);
+    await db.query(sql);
+    await enforceQuota(limits);
+    const after = await structureOf(target);
+    return { before, after };
+  } finally {
+    await rollback();
+  }
+}
+
+/** Every table of the workspace with its columns and row count. */
+async function describe(): Promise<TableStructure[]> {
+  const out: TableStructure[] = [];
+  for (const t of await listTables(true)) {
+    out.push({ name: t.name, rows: t.rows, columns: await columnsOf(t.name) });
+  }
+  return out;
+}
+
+async function structureOf(table: string): Promise<TableStructure | null> {
+  const columns = await columnsOf(table);
+  if (columns.length === 0) return null;
+  const c = await db.query<{ n: number }>(`SELECT count(*)::int AS n FROM ${quote(table)}`);
+  return { name: table, rows: c.rows[0]?.n ?? 0, columns };
+}
+
+async function columnsOf(table: string): Promise<Array<{ name: string; type: string }>> {
+  const res = await db.query<{ name: string; type: string }>(
+    `SELECT a.attname AS name, format_type(a.atttypid, a.atttypmod) AS type
+       FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE c.relname = $1 AND c.relkind IN ('r', 'p') AND n.nspname = current_schema()
+        AND a.attnum > 0 AND NOT a.attisdropped
+      ORDER BY a.attnum`,
+    [table],
+  );
+  return res.rows;
 }
 
 async function snapshot(table: string, limit: number, maxBytes: number): Promise<Rows> {

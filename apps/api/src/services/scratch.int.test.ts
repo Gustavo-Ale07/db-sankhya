@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { AppError, isAppError } from '@dbx/shared';
 import { ScratchManager, type ScratchManagerOptions } from './scratch';
+import { analyzeScratchSql } from './scratch-guard';
 
 const managers: ScratchManager[] = [];
 
@@ -408,4 +409,63 @@ describe('ScratchManager', () => {
     ).toBe('QUERY_CANCELLED');
     expect((await ws.exec('SELECT 2 AS two')).rows).toEqual([[2]]);
   }, 60_000);
+  it('dry-runs CREATE, ALTER and DROP: structure before and after, nothing kept', async () => {
+    const ws = await manager().workspace('u1');
+    await ws.exec('CREATE TABLE tmp_a (id int, name text)');
+    await ws.exec("INSERT INTO tmp_a VALUES (1, 'um'), (2, 'dois')");
+    const stmt = (sql: string) => analyzeScratchSql(sql);
+
+    const ctas = await ws.ddlDryRun(
+      stmt('CREATE TABLE tmp_b AS SELECT id FROM tmp_a WHERE id > 1'),
+    );
+    expect(ctas).toEqual({
+      table: 'tmp_b',
+      before: null,
+      after: { name: 'tmp_b', rows: 1, columns: [{ name: 'id', type: 'integer' }] },
+    });
+    const alter = await ws.ddlDryRun(stmt('ALTER TABLE tmp_a ADD COLUMN score numeric(10,2)'));
+    expect(alter.before?.columns.map((c) => c.name)).toEqual(['id', 'name']);
+    expect(alter.after).toEqual({
+      name: 'tmp_a',
+      rows: 2,
+      columns: [
+        { name: 'id', type: 'integer' },
+        { name: 'name', type: 'text' },
+        { name: 'score', type: 'numeric(10,2)' },
+      ],
+    });
+    const drop = await ws.ddlDryRun(stmt('DROP TABLE tmp_a'));
+    expect(drop.before?.rows).toBe(2);
+    expect(drop.after).toBeNull();
+
+    // Rolled back: the workspace is exactly as before.
+    expect(await ws.describe()).toEqual([
+      {
+        name: 'tmp_a',
+        rows: 2,
+        columns: [
+          { name: 'id', type: 'integer' },
+          { name: 'name', type: 'text' },
+        ],
+      },
+    ]);
+  });
+
+  it('refuses at the dry run a CREATE … AS SELECT that would pass the quotas', async () => {
+    const ws = await manager({ maxRows: 3 }).workspace('u1');
+    await ws.exec('CREATE TABLE tmp_a (id int)');
+    await ws.exec('INSERT INTO tmp_a VALUES (1), (2)');
+    expect(
+      await codeOf(ws.ddlDryRun(analyzeScratchSql('CREATE TABLE tmp_b AS SELECT * FROM tmp_a'))),
+    ).toBe('QUERY_LIMIT_EXCEEDED');
+    expect((await ws.describe()).map((t) => t.name)).toEqual(['tmp_a']);
+  });
+
+  it('a structure dry run needs a DDL statement', async () => {
+    const ws = await manager().workspace('u1');
+    await ws.exec('CREATE TABLE tmp_a (id int)');
+    expect(await codeOf(ws.ddlDryRun(analyzeScratchSql('DELETE FROM tmp_a WHERE id = 1')))).toBe(
+      'VALIDATION_ERROR',
+    );
+  });
 });
