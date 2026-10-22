@@ -1330,3 +1330,111 @@ describe('MutationDialog review fixes', () => {
     expect(screen.getByTestId('step-now').textContent).toContain('não foi possível reler');
   });
 });
+
+describe('MutationDialog scratch DDL (tmp_*)', () => {
+  const ddl = (over: Partial<MutationPreview>, preview: Partial<MutationPreview['preview']>) =>
+    preview_({
+      capability: { class: 'SCRATCH_ONLY', route: 'SCRATCH', reason: 'scratch' },
+      previewKind: 'TRANSACTIONAL_DRY_RUN',
+      previewLabels: ['TRANSACTIONAL_DRY_RUN'],
+      impact: { entities: ['TMP_P'], rows: 1, environment: 'SCRATCH' },
+      requires: { strongConfirmation: null, approval: false },
+      ...over,
+      preview: { affected: 1, targets: [], ...preview },
+    });
+  const preview_ = preview;
+
+  it('shows the structure AFTER of a CREATE, the Sankhya parts cut, and "Confirmar criação"', () => {
+    render(
+      <MutationDialog
+        preview={ddl(
+          { operation: 'CREATE_TABLE' },
+          {
+            structure: {
+              table: 'tmp_p',
+              before: null,
+              after: {
+                name: 'tmp_p',
+                rows: 2,
+                columns: [
+                  { name: 'codparc', type: 'integer' },
+                  { name: 'nomeparc', type: 'text' },
+                ],
+              },
+            },
+            sankhyaParts: [{ tables: ['TGFPAR'], rows: 2, truncated: true }],
+          },
+        )}
+        sql="CREATE TABLE tmp_p AS SELECT CODPARC, NOMEPARC FROM TGFPAR"
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.getByTestId('impact-rows').textContent).toBe(
+      'A tabela tmp_p será criada com 2 linhas',
+    );
+    expect(screen.queryByTestId('structure-before')).toBeNull();
+    const after = screen.getByTestId('structure-after').textContent;
+    expect(after).toContain('codparc');
+    expect(after).toContain('integer');
+    expect(after).toContain('2 linhas');
+    expect(screen.getByTestId('structure-sankhya-parts').textContent).toContain(
+      'A parte do Sankhya (TGFPAR) foi cortada em 2 linhas',
+    );
+    expect(screen.queryByTestId('mutation-diff')).toBeNull();
+    expect(execButton().textContent).toBe('Confirmar criação');
+  });
+
+  it('shows BEFORE and AFTER of an ALTER', () => {
+    const s = (columns: { name: string; type: string }[]) => ({ name: 'tmp_a', rows: 3, columns });
+    render(
+      <MutationDialog
+        preview={ddl(
+          { operation: 'ALTER_TABLE' },
+          {
+            structure: {
+              table: 'tmp_a',
+              before: s([{ name: 'id', type: 'integer' }]),
+              after: s([
+                { name: 'id', type: 'integer' },
+                { name: 'note', type: 'text' },
+              ]),
+            },
+          },
+        )}
+        sql="ALTER TABLE tmp_a ADD COLUMN note text"
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.getByTestId('impact-rows').textContent).toBe(
+      'A estrutura da tabela tmp_a será alterada',
+    );
+    expect(screen.getByTestId('structure-before').textContent).not.toContain('note');
+    expect(screen.getByTestId('structure-after').textContent).toContain('note');
+    expect(execButton().textContent).toBe('Confirmar alteração');
+  });
+
+  it('warns that a DROP loses its rows and asks "Confirmar exclusão" in danger', () => {
+    render(
+      <MutationDialog
+        preview={ddl(
+          { operation: 'DROP_TABLE' },
+          {
+            structure: {
+              table: 'tmp_a',
+              before: { name: 'tmp_a', rows: 3, columns: [{ name: 'id', type: 'integer' }] },
+              after: null,
+            },
+            lostRows: 3,
+          },
+        )}
+        sql="DROP TABLE tmp_a"
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.getByTestId('impact-rows').textContent).toBe('A tabela tmp_a será apagada');
+    expect(screen.getByTestId('structure-lost-rows').textContent).toBe('3 linhas serão perdidas');
+    expect(screen.getByTestId('structure-after').textContent).toContain('tabela removida');
+    expect(execButton().textContent).toBe('Confirmar exclusão');
+    expect(execButton().className).toContain('btn-danger');
+  });
+});

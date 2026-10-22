@@ -1,13 +1,17 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react';
 import { ApiError } from '../api/client';
-import { describeError } from '../api/errors';
+import { describeError, translateMessage } from '../api/errors';
 import { executePlan, requestApproval } from '../api/mutations';
 import type {
   ExecutionReport,
   ExecutionStep,
+  PlanOperation,
   PreparedPlan,
   PreviewTarget,
+  SankhyaPart,
+  StructurePreview,
+  TableStructure,
   StepOutcome,
   VerificationLabel,
 } from '../api/mutations';
@@ -88,7 +92,7 @@ const PAGE_SIZE = 20;
 /** Above this many targets only the first card starts expanded. */
 const EXPAND_ALL_UP_TO = 5;
 
-type Operation = 'INSERT' | 'UPDATE' | 'DELETE';
+type Operation = PlanOperation;
 
 function show(v: unknown): string {
   if (v === null || v === undefined) return 'NULL';
@@ -140,6 +144,100 @@ function countSentence(op: Operation | null, n: number): string {
     default:
       return one ? '1 registro afetado' : `${n} registros afetados`;
   }
+}
+
+const plural = (n: number, one: string, many: string) => (n === 1 ? `1 ${one}` : `${n} ${many}`);
+
+/** The sentence of a scratch DDL plan, from the server's dry run. */
+function structureSentence(op: Operation | null, s: StructurePreview): string {
+  switch (op) {
+    case 'CREATE_TABLE':
+      return `A tabela ${s.table} será criada com ${plural(s.after?.rows ?? 0, 'linha', 'linhas')}`;
+    case 'DROP_TABLE':
+      return `A tabela ${s.table} será apagada`;
+    default:
+      return `A estrutura da tabela ${s.table} será alterada`;
+  }
+}
+
+/** The label of the confirm button: the operation in words, never a generic "executar". */
+function confirmLabel(op: Operation | null): string {
+  if (op === 'CREATE_TABLE') return 'Confirmar criação';
+  if (op === 'DROP_TABLE') return 'Confirmar exclusão';
+  return 'Confirmar alteração';
+}
+
+function StructureSide({
+  label,
+  table,
+  testId,
+}: {
+  label: string;
+  table: TableStructure | null;
+  testId: string;
+}) {
+  return (
+    <div className="min-w-0 flex-1 rounded border border-line" data-testid={testId}>
+      <SideHeading>{label}</SideHeading>
+      {table === null ? (
+        <p className="px-2 py-1 text-danger">tabela removida</p>
+      ) : (
+        <>
+          <table className="w-full font-mono">
+            <tbody>
+              {table.columns.map((c) => (
+                <tr key={c.name} className="border-t border-line">
+                  <td className="px-2 py-0.5">{c.name}</td>
+                  <td className="px-2 py-0.5 text-muted">{c.type}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="border-t border-line px-2 py-0.5 text-muted">
+            {plural(table.rows, 'linha', 'linhas')}
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Scratch DDL: the columns and row count BEFORE/AFTER, the rows a DROP loses, the Sankhya reads. */
+function Structure({
+  structure,
+  lostRows,
+  parts,
+}: {
+  structure: StructurePreview;
+  lostRows: number | undefined;
+  parts: SankhyaPart[] | undefined;
+}) {
+  return (
+    <div className="space-y-2" data-testid="mutation-structure">
+      {lostRows !== undefined && (
+        <p className="font-semibold text-danger" role="alert" data-testid="structure-lost-rows">
+          {lostRows === 1 ? '1 linha será perdida' : `${lostRows} linhas serão perdidas`}
+        </p>
+      )}
+      <div className="flex flex-wrap gap-2">
+        {structure.before !== null && (
+          <StructureSide label="ANTES" table={structure.before} testId="structure-before" />
+        )}
+        <StructureSide label="DEPOIS" table={structure.after} testId="structure-after" />
+      </div>
+      {parts && parts.length > 0 && (
+        <ul className="space-y-0.5" data-testid="structure-sankhya-parts">
+          {parts.map((p, i) => (
+            <li key={i} className={p.truncated ? 'text-warn' : 'text-muted'}>
+              {p.truncated
+                ? translateMessage(`Sankhya part (${p.tables.join(', ')}) cut at ${p.rows} rows.`)
+                : `Lido do Sankhya (${p.tables.join(', ')}): ${plural(p.rows, 'linha', 'linhas')}.`}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
 }
 
 function Pager({
@@ -882,6 +980,8 @@ export function MutationDialog({
   const labels = previewLabelsOf(preview);
   const blocked = blockingSwitches(preview);
   const operation = operationOf(preview);
+  const structure = preview.preview.structure;
+  const danger = operation === 'DELETE' || operation === 'DROP_TABLE';
   const environment = preview.impact.environment;
   const production = environment === 'PRODUCTION';
   const entities = preview.impact.entities.join(', ') || '—';
@@ -917,7 +1017,7 @@ export function MutationDialog({
           </div>
           <div className="flex flex-wrap items-center gap-2 text-xs" data-testid="mutation-impact">
             <span
-              className={`font-mono font-semibold ${operation === 'DELETE' ? 'text-danger' : ''}`}
+              className={`font-mono font-semibold ${danger ? 'text-danger' : ''}`}
               data-testid="mutation-operation"
             >
               {`${operation ?? preview.capability.class} • ${entities}`}
@@ -987,16 +1087,26 @@ export function MutationDialog({
           {report === null && (
             <>
               <p
-                className={`text-sm font-semibold ${operation === 'DELETE' ? 'text-danger' : ''}`}
+                className={`text-sm font-semibold ${danger ? 'text-danger' : ''}`}
                 data-testid="impact-rows"
               >
-                {countSentence(operation, rows)}
+                {structure
+                  ? structureSentence(operation, structure)
+                  : countSentence(operation, rows)}
               </p>
-              <Diff
-                targets={preview.preview.targets}
-                affected={preview.preview.affected}
-                operation={preview.operation ?? null}
-              />
+              {structure ? (
+                <Structure
+                  structure={structure}
+                  lostRows={preview.preview.lostRows}
+                  parts={preview.preview.sankhyaParts}
+                />
+              ) : (
+                <Diff
+                  targets={preview.preview.targets}
+                  affected={preview.preview.affected}
+                  operation={preview.operation ?? null}
+                />
+              )}
             </>
           )}
 
@@ -1085,7 +1195,7 @@ export function MutationDialog({
             <button
               ref={executeRef}
               type="button"
-              className={`btn ${production || operation === 'DELETE' ? 'btn-danger' : 'btn-primary'}`}
+              className={`btn ${production || danger ? 'btn-danger' : 'btn-primary'}`}
               onClick={() => void execute()}
               disabled={!canExecute}
               aria-busy={busy}
@@ -1095,7 +1205,7 @@ export function MutationDialog({
                 ? 'Executando…'
                 : outcomeUnknown
                   ? 'Consultar resultado'
-                  : 'Confirmar alteração'}
+                  : confirmLabel(operation)}
             </button>
           )}
         </div>

@@ -15,6 +15,30 @@ export interface PreviewTarget {
   after: RecordValues;
 }
 
+/** A scratch table as the server read it: its columns in order and its row count. */
+export interface TableStructure {
+  name: string;
+  rows: number;
+  columns: { name: string; type: string }[];
+}
+
+/** Scratch DDL dry run: the table before (null: it does not exist yet) and after (null: dropped). */
+export interface StructurePreview {
+  table: string;
+  before: TableStructure | null;
+  after: TableStructure | null;
+}
+
+/** One Sankhya part a CREATE TABLE tmp_… AS read for its preview (a read only). */
+export interface SankhyaPart {
+  tables: string[];
+  rows: number;
+  truncated: boolean;
+}
+
+export type PlanOperation =
+  'INSERT' | 'UPDATE' | 'DELETE' | 'CREATE_TABLE' | 'ALTER_TABLE' | 'DROP_TABLE';
+
 /** Whether execute would pass the write switches when the preview was made. */
 export interface ExecutionSwitches {
   available: boolean;
@@ -35,11 +59,20 @@ export interface PreparedPlan {
   token: string;
   expiresAt: string;
   /** Statement kind, computed by the server (SQL plans only; absent on business actions). */
-  operation?: 'INSERT' | 'UPDATE' | 'DELETE';
+  operation?: PlanOperation;
   capability: { class: string; route: string; reason: string };
   previewKind: PreviewKind;
   previewLabels: PreviewKind[];
-  preview: { targets: PreviewTarget[]; affected: number };
+  preview: {
+    targets: PreviewTarget[];
+    affected: number;
+    /** Scratch DDL (tmp_*): the structure BEFORE/AFTER, from a dry run in the caller's scratch. */
+    structure?: StructurePreview;
+    /** Scratch DROP TABLE: the rows the table holds now, lost with it. */
+    lostRows?: number;
+    /** CREATE TABLE tmp_… AS reading Sankhya: each part copied for the preview. */
+    sankhyaParts?: SankhyaPart[];
+  };
   impact: { entities: string[]; rows: number; environment: string };
   requires: { strongConfirmation: string | null; approval: boolean };
   execution?: ExecutionSwitches;
