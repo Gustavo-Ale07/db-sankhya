@@ -121,7 +121,10 @@ Deactivating an account is allowed, because it grants nothing.
 
 **Assigning is not holding.** Since `ADMIN` holds no `DATA.*` (separation of duties), nobody could
 otherwise make a writer through the interface. A role administrator (`ADMIN.ROLES`) may therefore
-give _another_ user a role with permissions the administrator lacks, such as `OPERATOR`, provided the
+give _another_ user a role with permissions the administrator lacks, such as `OPERATOR`, provided
+every such permission is one of the writes kept from policy administrators (`POLICY_ADMIN_CONFLICTS`:
+`DATA.INSERT`/`UPDATE`/`DELETE`, `DDL.CUSTOM.GENERATE`, `SANKHYA.*`; an `ADMIN.*`, `APPROVAL.*` or
+read permission the administrator lacks is never handed on, `reason: beyond_own`) and the
 user has already signed in and chosen their own password (`mustChangePassword` false; otherwise
 `FORBIDDEN` with `reason: password_not_own`). The administrator's own permissions do not change,
 they still cannot change their own roles, and once the user holds `DATA.*` the administrator can
@@ -341,7 +344,7 @@ tokens, passwords, cookies or authorization headers.
 ## Known limitations
 
 - **A role administrator can make a writer.** "Assigning is not holding" (above) lets a holder of
-  `ADMIN.USERS` + `ADMIN.ROLES` give `OPERATOR` to an account whose owner chose its password. One who
+  `ADMIN.USERS` + `ADMIN.ROLES` give the separated writes (for example `OPERATOR`) to an account whose owner chose its password. One who
   creates an account, signs in once with the first password and changes it meets that condition
   for an account they control, and as a policy administrator can also write the `ALLOW` it needs.
   This is accepted: those permissions belong to full administrators. Review `user.create`,

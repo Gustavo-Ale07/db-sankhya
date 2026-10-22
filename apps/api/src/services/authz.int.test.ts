@@ -363,6 +363,26 @@ describe('AuthzService', () => {
       await authz.setUserRoles(bia, ['ADMIN', 'VIEWER'], admin);
     });
 
+    it('hands on only the separated writes, never an administrative permission the actor lacks', async () => {
+      const bia = await newUser('bia@example.com', ['VIEWER']);
+      await seedRole('ROLES_ONLY', ['ADMIN.ROLES']);
+      const clerk = await newUser('clerk@example.com', ['ROLES_ONLY']);
+      await seedRole('SECURITY', ['ADMIN.SECURITY']);
+      await seedRole('MIXED', ['DATA.UPDATE', 'ADMIN.POLICIES']);
+      for (const role of ['SECURITY', 'MIXED', 'ADMIN'])
+        await expect(authz.setUserRoles(bia, ['VIEWER', role], clerk)).rejects.toMatchObject({
+          code: 'FORBIDDEN',
+          details: { reason: 'beyond_own' },
+        });
+      expect(await authz.directRoles(bia)).toEqual(['VIEWER']);
+      // OPERATOR also carries reads this actor lacks: refused. The writes alone pass.
+      await expect(authz.setUserRoles(bia, ['VIEWER', 'OPERATOR'], clerk)).rejects.toMatchObject({
+        details: { reason: 'beyond_own' },
+      });
+      await seedRole('WRITES', ['DATA.INSERT', 'DATA.UPDATE']);
+      await authz.setUserRoles(bia, ['VIEWER', 'WRITES'], clerk);
+    });
+
     it('refuses creating a user with roles the actor lacks', async () => {
       const admin = await newUser('admin@example.com', ['ADMIN']);
       const input = { name: 'Op', password: PASSWORD, roles: ['OPERATOR'], createdBy: admin };

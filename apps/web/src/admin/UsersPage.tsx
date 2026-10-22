@@ -17,9 +17,26 @@ interface NewUser {
 }
 
 /**
+ * The writes kept from policy administrators (POLICY_ADMIN_CONFLICTS in @dbx/shared, which the web
+ * app does not import). These are the only permissions a role administrator may hand on without
+ * holding them; an ADMIN.* or APPROVAL.* they lack stays out of reach.
+ */
+const SEPARATED_WRITES: readonly Permission[] = [
+  'DATA.INSERT',
+  'DATA.UPDATE',
+  'DATA.DELETE',
+  'DDL.CUSTOM.GENERATE',
+  'SANKHYA.BUSINESS_ACTION.EXECUTE',
+  'SANKHYA.ACTION.CANCELAR_NOTA',
+  'SANKHYA.ACTION.INCLUIR_NOTA',
+  'SANKHYA.ACTION.INCLUIR_ALTERAR_ITEM_NOTA',
+  'SANKHYA.ACTION.EXCLUIR_ITEM_NOTA',
+];
+
+/**
  * Checkbox list of role keys with each role's permissions as a hint. A role with a permission the
- * viewer lacks cannot be added unless `beyondOwn` (the server decides the same way); it can still
- * be removed.
+ * viewer lacks cannot be added, except, with `beyondOwn`, when every such permission is a
+ * separated write (the server decides the same way); it can still be removed.
  */
 function RolePicker({
   options,
@@ -45,9 +62,10 @@ function RolePicker({
             type="checkbox"
             checked={value.includes(r.key)}
             disabled={
-              !beyondOwn &&
               !value.includes(r.key) &&
-              !!r.permissions?.some((p) => !held.includes(p))
+              !!r.permissions?.some(
+                (p) => !held.includes(p) && !(beyondOwn && SEPARATED_WRITES.includes(p)),
+              )
             }
             onChange={(e) =>
               onChange(e.target.checked ? [...value, r.key] : value.filter((k) => k !== r.key))

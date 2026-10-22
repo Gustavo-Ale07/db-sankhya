@@ -190,7 +190,7 @@ describe('SecurityPage', () => {
 describe('UsersPage', () => {
   const ROLE_ADMIN: User = {
     ...ME,
-    permissions: ['ADMIN.USERS', 'ADMIN.ROLES', 'ADMIN.POLICIES'] as Permission[],
+    permissions: ['QUERY.SELECT', 'ADMIN.USERS', 'ADMIN.ROLES', 'ADMIN.POLICIES'] as Permission[],
   };
   const person = (over: Partial<AdminUser>): AdminUser => ({
     ...ME,
@@ -220,6 +220,7 @@ describe('UsersPage', () => {
                 items: [
                   role('VIEWER', ['QUERY.SELECT']),
                   role('OPERATOR', ['QUERY.SELECT', 'DATA.INSERT', 'DATA.UPDATE']),
+                  role('APPROVER', ['QUERY.SELECT', 'APPROVAL.DECIDE']),
                 ],
               }
             : { items: users },
@@ -242,6 +243,11 @@ describe('UsersPage', () => {
     await screen.findByTestId('roles-homolog@example.com');
     const box = await operatorBox('homolog@example.com');
     await waitFor(() => expect(box.disabled).toBe(false));
+    // Only the separated writes are handed on: an administrative permission stays out of reach.
+    const auditor = within(openDialog()).getByRole('checkbox', {
+      name: /APPROVER/,
+    }) as HTMLInputElement;
+    expect(auditor.disabled).toBe(true);
     fireEvent.click(box);
     fireEvent.click(within(openDialog()).getByRole('button', { name: 'Salvar papéis' }));
     await waitFor(() =>

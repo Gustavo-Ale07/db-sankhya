@@ -10,7 +10,7 @@ import {
   users,
 } from '@dbx/database';
 import type { Database, GroupRow, RoleRow } from '@dbx/database';
-import { AppError, isPermission } from '@dbx/shared';
+import { AppError, POLICY_ADMIN_CONFLICTS, isPermission } from '@dbx/shared';
 import type { Permission } from '@dbx/shared';
 
 /** Permission that keeps the tool administrable; some active user must always hold it. */
@@ -236,6 +236,9 @@ export class AuthzService {
    * Assigning is not holding: giving another user a role leaves the actor's own permissions as
    * they were. That is what lets an ADMIN (no DATA.*, by separation of duties) make a writer.
    * It is allowed beyond the actor's own permissions only when
+   * - every permission beyond them is a write kept from policy administrators
+   *   (POLICY_ADMIN_CONFLICTS: DATA.*, DDL.CUSTOM.GENERATE, SANKHYA.*), the ones ADMIN lacks by
+   *   design; an ADMIN.* or APPROVAL.* the actor lacks is never handed on;
    * - the actor holds ADMIN.ROLES (the role administrators, who are full administrators anyway);
    * - the target is someone else (`setUserRoles` refuses self changes before this);
    * - the target has set their own password (`mustChangePassword` false): a password the actor
@@ -256,8 +259,10 @@ export class AuthzService {
     db: Db,
   ): Promise<void> {
     const mine = (await this.grants(actorId, db)).permissions;
-    if ([...granted].every((p) => mine.has(p))) return;
-    if (!mine.has('ADMIN.ROLES')) return this.assertCanGrant(actorId, granted, db);
+    const beyond = [...granted].filter((p) => !mine.has(p));
+    if (beyond.length === 0) return;
+    if (!mine.has('ADMIN.ROLES') || beyond.some((p) => !POLICY_ADMIN_CONFLICTS.includes(p)))
+      return this.assertCanGrant(actorId, granted, db);
     const [target] = await db
       .select({ mustChangePassword: users.mustChangePassword })
       .from(users)
@@ -268,7 +273,7 @@ export class AuthzService {
         'This user must first sign in and choose their own password before receiving permissions you do not hold',
         {
           reason: 'password_not_own',
-          missing: [...granted].filter((p) => !mine.has(p)).sort(),
+          missing: beyond.sort(),
         },
       );
     }
