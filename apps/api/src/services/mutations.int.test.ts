@@ -3406,6 +3406,32 @@ describe('MutationService server-side route (Executa Banco)', () => {
       expect(writeCalls(h.mock)).toEqual([]);
     });
 
+    it('refuses a server statement that READS FROM the reserved control record (AD_MANIPULADADOS)', async () => {
+      const h = await setup({}, { serverSql: SERVER_ON });
+      await allowServer(h);
+      const { auth } = await h.userWith(SERVER_PERMS);
+      // Reading the control record back is refused the same way targeting it is: it is the tool's own
+      // execution channel and must never be a source a caller can observe through.
+      await expect(
+        prepare(h, auth, 'DELETE FROM TGFPAR WHERE CODPARC IN (SELECT ID FROM AD_MANIPULADADOS)'),
+      ).rejects.toMatchObject({ code: 'FORBIDDEN', details: { entity: 'AD_MANIPULADADOS' } });
+      expect(await h.audit('PLAN_CREATED')).toEqual([]);
+      expect(writeCalls(h.mock)).toEqual([]);
+    });
+
+    it('fails closed on an Oracle q-quote literal the tokenizer cannot parse: SERVER_SQL_TARGET_UNKNOWN', async () => {
+      const h = await setup({}, { serverSql: SERVER_ON });
+      await allowServer(h);
+      const { auth } = await h.userWith(SERVER_PERMS);
+      // A q-quote desyncs the analysis tokenizer, so target/WHERE/sources cannot be trusted: refuse
+      // rather than authorize on a misparsed statement.
+      await expect(
+        prepare(h, auth, "DELETE FROM TGFPAR WHERE OBS = q'[x]' AND CODPARC = 1"),
+      ).rejects.toMatchObject({ code: 'SERVER_SQL_TARGET_UNKNOWN' });
+      expect(await h.audit('PLAN_CREATED')).toEqual([]);
+      expect(writeCalls(h.mock)).toEqual([]);
+    });
+
     it('refuses a GATEWAY write that targets the reserved control record, even with the server route off', async () => {
       const h = await setup();
       const { auth } = await h.userWith(WRITER);

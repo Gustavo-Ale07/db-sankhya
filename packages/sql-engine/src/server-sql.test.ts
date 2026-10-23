@@ -296,6 +296,13 @@ describe('serverSqlTarget', () => {
     expect(serverSqlTarget('')).toBeNull();
     expect(serverSqlTarget('SELECT 1 FROM dual')).toBeNull();
   });
+
+  it('fails closed on an Oracle q-quote literal (ansi tokenizer cannot parse it)', () => {
+    expect(serverSqlTarget("UPDATE tgfpar SET obs = q'[it's]' WHERE id = 1")).toBeNull();
+    expect(serverSqlTarget("DELETE FROM tgfpar WHERE name = nq'{x}'")).toBeNull();
+    // A q' only inside an ordinary escaped string is not a q-quote; the target still resolves.
+    expect(serverSqlTarget("UPDATE tgfpar SET obs = 'a q'' b' WHERE id = 1")).toBe('TGFPAR');
+  });
 });
 
 describe('serverSqlWhere', () => {
@@ -337,6 +344,18 @@ describe('serverSqlWhere', () => {
     expect(serverSqlWhere('INSERT INTO A SELECT * FROM B')).toEqual({
       required: false,
       present: true,
+    });
+  });
+
+  it('fails closed to WHERE-absent when a q-quote defeats the tokenizer', () => {
+    // A q-quote could hide (or fake) a top-level WHERE; a required verb is treated as WHERE-absent.
+    expect(serverSqlWhere("DELETE FROM A WHERE NAME = q'[WHERE]'")).toEqual({
+      required: true,
+      present: false,
+    });
+    expect(serverSqlWhere("UPDATE A SET N = q'[x]' WHERE ID = 1")).toEqual({
+      required: true,
+      present: false,
     });
   });
 });
@@ -418,5 +437,38 @@ describe('serverSqlSources', () => {
   it('returns an empty set for a statement that reads nothing', () => {
     expect(serverSqlSources('DELETE FROM OK WHERE ID = 1')).toEqual(new Set(['OK']));
     expect(serverSqlSources('DROP TABLE AD_X')).toEqual(new Set());
+  });
+
+  it('fails closed on an Oracle table-reference modifier that could hide a later sibling', () => {
+    // SAMPLE/AS OF/VERSIONS introduce clauses we do not parse; consuming them as an alias would run
+    // the walk past the modifier and miss `, SECRET`. Each must fail closed rather than silently stop.
+    expect(serverSqlSources('INSERT INTO OK SELECT * FROM A SAMPLE (10), SECRET')).toBeNull();
+    expect(serverSqlSources('INSERT INTO OK SELECT * FROM A AS OF SCN 123, SECRET')).toBeNull();
+    expect(
+      serverSqlSources(
+        'INSERT INTO OK SELECT * FROM A VERSIONS BETWEEN TIMESTAMP MINVALUE AND MAXVALUE, SECRET',
+      ),
+    ).toBeNull();
+    // A bare modifier with no following sibling still fails closed (never read as a table alias).
+    expect(serverSqlSources('INSERT INTO OK SELECT * FROM A SAMPLE (10)')).toBeNull();
+  });
+
+  it('still accepts plain and AS aliases followed by a clean clause end', () => {
+    expect(serverSqlSources('INSERT INTO OK SELECT * FROM A a, B b WHERE a.id = b.id')).toEqual(
+      new Set(['A', 'B']),
+    );
+    expect(serverSqlSources('INSERT INTO OK SELECT * FROM A AS x, B AS y')).toEqual(
+      new Set(['A', 'B']),
+    );
+  });
+
+  it('fails closed on an Oracle q-quote literal (ansi tokenizer cannot parse it)', () => {
+    expect(
+      serverSqlSources("DELETE FROM OK WHERE NAME = q'[x]' AND ID IN (SELECT ID FROM SECRET)"),
+    ).toBeNull();
+    // A q' sequence that only appears inside an ordinary string is NOT a q-quote and is fine.
+    expect(serverSqlSources("DELETE FROM OK WHERE NAME = 'a q'' b' AND ID = 1")).toEqual(
+      new Set(['OK']),
+    );
   });
 });

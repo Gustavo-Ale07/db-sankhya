@@ -19,6 +19,55 @@
 import { AppError } from '@dbx/shared';
 import { tokenize, type Token } from './tokenizer';
 
+const IDENT_CHAR = /[A-Za-z0-9_$#]/u;
+
+/**
+ * True if the SQL contains an Oracle q-quote / nq-quote string introducer (`q'…'`, `Q'…'`, `nq'…'`,
+ * `NQ'…'`). The ANSI tokenizer this module uses does NOT understand q-quotes: it reads the body as
+ * ordinary `'…'` strings and desyncs for the rest of the statement, so a q-quote could hide a `;`, a
+ * top-level WHERE or a source table from the analyzers below. Rather than trust a desynced token
+ * stream, every analyzer fails closed when this returns true (single-statement, target, WHERE and
+ * sources). Scans the RAW text, skipping ordinary single-quoted strings (with `''` escape) and
+ * `--` / block comments, so a `q'` sequence that merely appears inside an ordinary string or comment
+ * does not count. PL/SQL (which legitimately uses q-quotes) never reaches these analyzers.
+ */
+function containsQuoteLiteral(sql: string): boolean {
+  for (let i = 0; i < sql.length; i++) {
+    const c = sql[i];
+    if (c === "'") {
+      // ordinary string literal: skip to the closing quote, treating '' as an escaped quote
+      i += 1;
+      while (i < sql.length) {
+        if (sql[i] === "'") {
+          if (sql[i + 1] === "'") i += 1;
+          else break;
+        }
+        i += 1;
+      }
+      continue;
+    }
+    if (c === '-' && sql[i + 1] === '-') {
+      i += 2;
+      while (i < sql.length && sql[i] !== '\n') i += 1;
+      continue;
+    }
+    if (c === '/' && sql[i + 1] === '*') {
+      i += 2;
+      while (i < sql.length && !(sql[i] === '*' && sql[i + 1] === '/')) i += 1;
+      i += 1; // sits on the '*'; the loop's ++ moves past the '/'
+      continue;
+    }
+    // q-quote introducer: q'/Q' (optionally with an n/N national prefix) at an identifier boundary,
+    // i.e. not the tail of a larger identifier.
+    if ((c === 'q' || c === 'Q') && sql[i + 1] === "'") {
+      const prev = i > 0 ? (sql[i - 1] as string) : '';
+      const before = prev === 'n' || prev === 'N' ? (i > 1 ? (sql[i - 2] as string) : '') : prev;
+      if (!IDENT_CHAR.test(before)) return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Rejects a payload that smuggles more than one statement, so the category — and the
  * SERVER.* permission and policy decision keyed on it — can never be confused by a
@@ -29,6 +78,11 @@ import { tokenize, type Token } from './tokenizer';
  * block, so there is no category to confuse.
  */
 function assertSingleStatement(sql: string): void {
+  // Note: a q-quote the ansi lexer misreads is NOT a smuggling risk here — `wrapServerSql` runs
+  // these categories through `dynamicWrap` (EXECUTE IMMEDIATE), which makes Oracle execute exactly
+  // one statement regardless of any lexer differential. The q-quote fail-closed lives in the
+  // AUTHORIZATION analyzers (serverSqlTarget / serverSqlWhere / serverSqlSources), which gate the
+  // policy decision and are not protected by the wrap.
   const tokens = tokenize(sql, { ansi: true });
   let lastContentIndex = -1;
   for (let i = 0; i < tokens.length; i++) {
@@ -205,6 +259,8 @@ function readObjectName(sig: Token[], i: number): string | null {
  * the wrong entity. PL/SQL has no single target by design and resolves to null here.
  */
 export function serverSqlTarget(sql: string): string | null {
+  // A q-quote desyncs the ansi tokenizer, so the parsed target cannot be trusted → fail closed.
+  if (containsQuoteLiteral(sql)) return null;
   const sig = tokenize(sql, { ansi: true }).filter(
     (t: Token) => t.type !== 'space' && t.type !== 'comment',
   );
@@ -300,6 +356,9 @@ export function serverSqlWhere(sql: string): { required: boolean; present: boole
   const verb = leadingWord(sql);
   const required = verb === 'UPDATE' || verb === 'DELETE';
   if (!required) return { required: false, present: true };
+  // A q-quote desyncs the ansi tokenizer, so a top-level WHERE cannot be trusted → treat as absent
+  // (fail closed to WHERE_REQUIRED). These statements are already refused earlier via a null target.
+  if (containsQuoteLiteral(sql)) return { required, present: false };
   const sig = tokenize(sql, { ansi: true }).filter(
     (t: Token) => t.type !== 'space' && t.type !== 'comment',
   );
@@ -356,6 +415,14 @@ const FROM_LIST_TERMINATORS = new Set([
   'USING',
 ]);
 
+/**
+ * Oracle table-reference modifiers that introduce a clause we do not parse (`SAMPLE (…)`,
+ * `AS OF …`, `VERSIONS BETWEEN …`). They must never be consumed as a table alias: doing so would
+ * let the walk run past them and miss a following comma-separated source. Encountering one makes
+ * `serverSqlSources` fail closed.
+ */
+const TABLE_REF_MODIFIERS = new Set(['SAMPLE', 'VERSIONS', 'OF']);
+
 /** Index just after the `)` matching the `(` at `open`, or -1 when the parens are unbalanced. */
 function skipParens(sig: Token[], open: number): number {
   let depth = 0;
@@ -383,6 +450,8 @@ function skipParens(sig: Token[], open: number): number {
  * inner `FROM` this same walk reaches. `DUAL` and the write target are excluded (here and by the caller).
  */
 export function serverSqlSources(sql: string): Set<string> | null {
+  // A q-quote desyncs the ansi tokenizer, so sources cannot be enumerated reliably → fail closed.
+  if (containsQuoteLiteral(sql)) return null;
   const sig = tokenize(sql, { ansi: true }).filter(
     (t: Token) => t.type !== 'space' && t.type !== 'comment',
   );
@@ -423,22 +492,39 @@ export function serverSqlSources(sql: string): Set<string> | null {
           if (k < 0) return null;
         }
       }
-      // Optional alias: `AS <ident>` or a bare identifier that is not a clause/join keyword.
+      // Optional alias: `AS <ident>` or a bare identifier that is neither a clause/join keyword nor
+      // a table-reference modifier (SAMPLE / VERSIONS / OF — those introduce clauses we do not parse,
+      // so they must fall through to the strict end-check below and fail closed, not be eaten as an
+      // alias that would hide a following `, SECRET` sibling).
       if (isWord(k, 'AS')) {
         if (!isNameStart(sig[k + 1])) return null;
         k += 2;
       } else if (
         sig[k]?.type === 'word' &&
-        !FROM_LIST_TERMINATORS.has((sig[k] as Token).text.toUpperCase())
+        !FROM_LIST_TERMINATORS.has((sig[k] as Token).text.toUpperCase()) &&
+        !TABLE_REF_MODIFIERS.has((sig[k] as Token).text.toUpperCase())
       ) {
         k += 1;
       }
-      // A comma continues the table list; anything else ends this FROM/JOIN/USING clause.
+      // A comma continues the table list. Otherwise the item must end cleanly — end of input, a
+      // closing paren, a terminator (`;`) or a clause keyword. ANYTHING else (SAMPLE, AS OF, VERSIONS,
+      // an unrecognised modifier) means we can no longer be sure we have seen every source, so fail
+      // closed rather than silently stop the walk and let a later sibling escape read-policy.
       if (isSym(k, ',')) {
         k += 1;
         continue;
       }
-      break;
+      const end = sig[k];
+      if (
+        end === undefined ||
+        isSym(k, ')') ||
+        isSym(k, ';') ||
+        end.type === 'semicolon' ||
+        (end.type === 'word' && FROM_LIST_TERMINATORS.has(end.text.toUpperCase()))
+      ) {
+        break;
+      }
+      return null;
     }
   }
   return sources;

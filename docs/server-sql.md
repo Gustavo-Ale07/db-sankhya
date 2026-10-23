@@ -111,16 +111,31 @@ Ordem de verificação, tudo fail-closed:
    percorrendo **toda** a lista `FROM` separada por vírgula (não só a primeira tabela),
    pulando subconsultas derivadas sem perder as irmãs seguintes e sufixos Oracle
    `PARTITION (...)`/`SUBPARTITION (...)`. Fail-closed → `SERVER_SQL_TARGET_UNKNOWN` quando uma
-   fonte não pode ser determinada com segurança (função de tabela `TABLE(f())`, dblink
-   `tabela@link`). **Resíduo documentado:** a checagem é por **tabela** (nível de objeto);
-   regras de leitura por **coluna** nas fontes ainda não são aplicadas aqui. PL/SQL é exceção
-   (bloco arbitrário, sem lista de fontes analisável).
-8. **Confirmação forte** quando a política/ambiente exigem — decidida no servidor, nunca
+   fonte não pode ser determinada com segurança: função de tabela `TABLE(f())`, dblink
+   `tabela@link`, ou **qualquer modificador de referência que não parseamos** (`SAMPLE`,
+   `AS OF`, `VERSIONS`) — estes nunca são consumidos como alias, para não pular uma irmã
+   `, SECRET` à frente. Além disso, **ler da entidade de controle** (`AD_MANIPULADADOS`) é
+   recusado como alvo (`FORBIDDEN { entity }`). **Resíduos documentados:** (a) a checagem é por
+   **tabela** (nível de objeto); regras de leitura por **coluna** nas fontes não são aplicadas
+   aqui; (b) uma tabela lida **indiretamente por uma função** (`WHERE c = ALGUMA_FN()`) não é
+   fonte de `FROM`/`JOIN` e não é descoberta aqui — a função roda sob os privilégios do próprio
+   Oracle, então o schema de integração deve ser de menor privilégio no banco; o comando ainda
+   exige a permissão `SERVER.<categoria>` e um ALLOW de política. PL/SQL é exceção (bloco
+   arbitrário, sem lista de fontes analisável).
+8. **Literais q-quote Oracle (`q'…'`/`nq'…'`):** o tokenizer das análises é ANSI e **não**
+   entende q-quote; um `q'[…]'` dessincroniza a leitura e poderia esconder um `WHERE`, uma
+   fonte ou o alvo. Por isso `serverSqlTarget`/`serverSqlWhere`/`serverSqlSources` **falham
+   fechado** diante de um q-quote (alvo/fonte → `SERVER_SQL_TARGET_UNKNOWN`; `WHERE` →
+   tratado como ausente). Isso é na camada de **autorização** — o disparo em si (`dynamicWrap`,
+   `EXECUTE IMMEDIATE q'X…X'`) já garante execução de exatamente um statement mesmo com
+   diferença de lexer, então q-quote não é vetor de statement-smuggling. PL/SQL (que usa
+   q-quote legitimamente) não passa por essas análises.
+9. **Confirmação forte** quando a política/ambiente exigem — decidida no servidor, nunca
    inventada só no front.
-9. `UPDATE`/`DELETE` sem `WHERE` → `WHERE_REQUIRED` (salvo override explícito de política). A
-   necessidade de `WHERE` e a presença dele são decididas pelo tokenizer real da rota direta
-   (`serverSqlWhere`), por verbo — não pelo parser PG, que marcaria como `UNKNOWN` formas
-   Oracle como `DELETE FROM T PARTITION (P1)`. Fail-closed: na dúvida, `present = false`.
+10. `UPDATE`/`DELETE` sem `WHERE` → `WHERE_REQUIRED` (salvo override explícito de política). A
+    necessidade de `WHERE` e a presença dele são decididas pelo tokenizer real da rota direta
+    (`serverSqlWhere`), por verbo — não pelo parser PG, que marcaria como `UNKNOWN` formas
+    Oracle como `DELETE FROM T PARTITION (P1)`. Fail-closed: na dúvida, `present = false`.
 
 Papéis: `LEITOR` = só `SELECT`; `OPERADOR` = `SELECT` + `INSERT` + `UPDATE`; `ADMIN` = tudo
 

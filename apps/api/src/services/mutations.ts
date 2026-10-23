@@ -863,8 +863,12 @@ export class MutationService {
     // FROM secret`, `MERGE INTO ok USING secret`, an UPDATE/DELETE whose WHERE subquery reads `secret`.
     // QUERY.SELECT must ALLOW each referenced source, or the write is refused. PL/SQL is an opaque
     // block with no statically-determinable sources and is authorized as SERVER.PLSQL alone; every
-    // other category must have its sources pinned down, else fail closed. This is TABLE-level only —
-    // column-level read rules on the sources are not enforced here (documented residual).
+    // other category must have its sources pinned down, else fail closed. Two documented residuals:
+    // (a) this is TABLE-level only — column-level read rules on the sources are not enforced here;
+    // (b) a table read indirectly through a user-defined function call (e.g. `WHERE c = SOME_FN()`)
+    //     is not a FROM/JOIN source and is not discovered here — such a function runs under Oracle's
+    //     own privileges, so the integration schema must be least-privileged at the database. The
+    //     statement still requires the category's SERVER.* write permission and a policy ALLOW.
     if (category !== 'PLSQL') {
       const sources = serverSqlSources(sql);
       if (sources === null) {
@@ -877,7 +881,21 @@ export class MutationService {
         );
       }
       for (const source of sources) {
-        if (source === entity || source === control) continue;
+        // Reading FROM the control record is refused the same way targeting it is: it is the tool's
+        // own execution channel and a caller must never read the staged block back through it.
+        if (source === control) {
+          throw refuse(
+            'AUTHORIZE',
+            new AppError(
+              'FORBIDDEN',
+              'This object is reserved by the tool and cannot be read by a change',
+              { entity: control },
+            ),
+          );
+        }
+        // The statement's own target is naturally readable by its writer (e.g. a DELETE whose WHERE
+        // subquery reads the table being deleted); only OTHER sources need a separate read check.
+        if (source === entity) continue;
         const read = await evaluateFor({
           policies,
           auth,
