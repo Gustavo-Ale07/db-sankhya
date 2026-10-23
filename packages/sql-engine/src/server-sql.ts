@@ -110,9 +110,9 @@ export function assertServerSqlAllowed(gate: ServerSqlGate, environment: ServerE
   }
 }
 
-/** Categories wrapped verbatim as DML inside the block (statement + one `;`). */
+/** Raw DML/DELETE: run through EXECUTE IMMEDIATE so Oracle executes exactly one statement. */
 const DIRECT_DML = new Set<ServerSqlCategory>(['DELETE', 'DML_RAW']);
-/** Categories run through EXECUTE IMMEDIATE (DDL/DCL are not valid inside a plain block). */
+/** DDL/DCL: not valid as a direct block statement, so also run through EXECUTE IMMEDIATE. */
 const DYNAMIC = new Set<ServerSqlCategory>(['DDL', 'DCL']);
 
 const LEADING: Record<string, ServerSqlCategory> = {
@@ -288,6 +288,162 @@ export function serverSqlTarget(sql: string): string | null {
   }
 }
 
+/**
+ * Whether a server-side statement is a verb that REQUIRES a `WHERE` (UPDATE / DELETE) and whether it
+ * actually carries one at the top level — both decided by the real tokenizer, NOT the PG classifier
+ * (which returns UNKNOWN for Oracle DML the gateway cannot parse and would then skip the guard
+ * entirely, letting an unqualified `DELETE FROM t` through). A `WHERE` inside a subquery (parenthesised)
+ * does not satisfy the statement's own `WHERE`. Fail closed: a verb we cannot read, or an UPDATE/DELETE
+ * whose top-level `WHERE` is absent, reports `present: false`.
+ */
+export function serverSqlWhere(sql: string): { required: boolean; present: boolean } {
+  const verb = leadingWord(sql);
+  const required = verb === 'UPDATE' || verb === 'DELETE';
+  if (!required) return { required: false, present: true };
+  const sig = tokenize(sql, { ansi: true }).filter(
+    (t: Token) => t.type !== 'space' && t.type !== 'comment',
+  );
+  let depth = 0;
+  for (const t of sig) {
+    if (t.type === 'symbol' && t.text === '(') depth += 1;
+    else if (t.type === 'symbol' && t.text === ')') depth = Math.max(0, depth - 1);
+    else if (t.type === 'word' && depth === 0 && t.text.toUpperCase() === 'WHERE')
+      return { required, present: true };
+  }
+  return { required, present: false };
+}
+
+/** Oracle's canonical single-row dummy table: reading it discloses nothing, never policy-governed. */
+const READ_IGNORED_SOURCES = new Set(['DUAL']);
+
+/**
+ * Keywords that END a table reference inside a FROM list: a clause boundary, a set operator, or a
+ * join keyword (the joined table is reached by the main walk through its own JOIN keyword). A word
+ * here is never swallowed as a table alias, so a comma-separated sibling after it is still read.
+ */
+const FROM_LIST_TERMINATORS = new Set([
+  'WHERE',
+  'GROUP',
+  'HAVING',
+  'ORDER',
+  'CONNECT',
+  'START',
+  'MODEL',
+  'RETURNING',
+  'SET',
+  'WHEN',
+  'PIVOT',
+  'UNPIVOT',
+  'FETCH',
+  'OFFSET',
+  'FOR',
+  'INTO',
+  'UNION',
+  'INTERSECT',
+  'MINUS',
+  'EXCEPT',
+  'JOIN',
+  'INNER',
+  'LEFT',
+  'RIGHT',
+  'FULL',
+  'CROSS',
+  'NATURAL',
+  'OUTER',
+  'LATERAL',
+  'APPLY',
+  'ON',
+  'USING',
+]);
+
+/** Index just after the `)` matching the `(` at `open`, or -1 when the parens are unbalanced. */
+function skipParens(sig: Token[], open: number): number {
+  let depth = 0;
+  for (let k = open; k < sig.length; k++) {
+    const tk = sig[k] as Token;
+    if (tk.type === 'symbol' && tk.text === '(') depth += 1;
+    else if (tk.type === 'symbol' && tk.text === ')') {
+      depth -= 1;
+      if (depth === 0) return k + 1;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Every table a server-side statement READS from — `FROM` / `JOIN` clauses at any nesting, plus a
+ * `MERGE ... USING` source — parsed with the real tokenizer. The caller evaluates the read policy
+ * (`QUERY.SELECT`) on each so a write cannot exfiltrate from, or act on, a table the user may not
+ * read (`INSERT INTO ok SELECT * FROM secret`, `MERGE INTO ok USING secret`, a `DELETE`/`UPDATE`
+ * whose `WHERE` subquery reads `secret`). Returns the set of object segments (uppercased), or
+ * **null when a read construct is present but its source cannot be determined** (a function source,
+ * an unreadable token) — the caller must then fail closed. A statement that reads nothing returns an
+ * empty set. `USING` counts as a source only in `MERGE` (elsewhere it is a join column list or a DDL
+ * storage clause, never a read); a `FROM`/`JOIN` immediately followed by `(` is a subquery whose own
+ * inner `FROM` this same walk reaches. `DUAL` and the write target are excluded (here and by the caller).
+ */
+export function serverSqlSources(sql: string): Set<string> | null {
+  const sig = tokenize(sql, { ansi: true }).filter(
+    (t: Token) => t.type !== 'space' && t.type !== 'comment',
+  );
+  const usingIsSource = leadingWord(sql) === 'MERGE';
+  const isSym = (i: number, ch: string): boolean =>
+    sig[i]?.type === 'symbol' && (sig[i] as Token).text === ch;
+  const isWord = (i: number, w: string): boolean =>
+    sig[i]?.type === 'word' && (sig[i] as Token).text.toUpperCase() === w;
+  const sources = new Set<string>();
+  for (let i = 0; i < sig.length; i++) {
+    const t = sig[i] as Token;
+    if (t.type !== 'word') continue;
+    const w = t.text.toUpperCase();
+    if (w !== 'FROM' && w !== 'JOIN' && !(w === 'USING' && usingIsSource)) continue;
+    // Walk the whole comma-separated table list that follows (old-style joins list several, e.g.
+    // `FROM A, SECRET`). Stopping at the first name would let every sibling escape read-policy
+    // evaluation. Fail closed (null) on anything in the list that is not a plain, nameable table.
+    let k = i + 1;
+    for (;;) {
+      if (isSym(k, '(')) {
+        // A derived table / subquery: its own FROM is reached by this same outer walk, so skip the
+        // parenthesised block here (without losing a sibling that may follow the closing paren).
+        k = skipParens(sig, k);
+        if (k < 0) return null;
+      } else {
+        const path = readPath(sig, k);
+        if (!path) return null; // a read construct with an undeterminable source → fail closed
+        k += path.length * 2 - 1;
+        if (isSym(k, '(')) return null; // `name(` is a table function, not a nameable table
+        if (isSym(k, '@')) return null; // `name@dblink` is a remote source → fail closed
+        const name = path[path.length - 1] as string;
+        if (!READ_IGNORED_SOURCES.has(name)) sources.add(name);
+        // Optional Oracle partition / subpartition suffix: `PARTITION (p)` / `SUBPARTITION (p)`.
+        while (isWord(k, 'PARTITION') || isWord(k, 'SUBPARTITION')) {
+          k += 1;
+          if (!isSym(k, '(')) return null;
+          k = skipParens(sig, k);
+          if (k < 0) return null;
+        }
+      }
+      // Optional alias: `AS <ident>` or a bare identifier that is not a clause/join keyword.
+      if (isWord(k, 'AS')) {
+        if (!isNameStart(sig[k + 1])) return null;
+        k += 2;
+      } else if (
+        sig[k]?.type === 'word' &&
+        !FROM_LIST_TERMINATORS.has((sig[k] as Token).text.toUpperCase())
+      ) {
+        k += 1;
+      }
+      // A comma continues the table list; anything else ends this FROM/JOIN/USING clause.
+      if (isSym(k, ',')) {
+        k += 1;
+        continue;
+      }
+      break;
+    }
+  }
+  return sources;
+}
+
 /** Removes trailing whitespace and semicolons, so exactly one terminator can be re-added. */
 function stripTrailingSemicolons(sql: string): string {
   return sql.replace(/[\s;]+$/u, '');
@@ -300,7 +456,14 @@ const Q_DELIMITERS: ReadonlyArray<readonly [string, string]> = [
   ['(', ')'],
 ];
 
-/** Wraps a DDL/DCL payload in `EXECUTE IMMEDIATE q'X…X'`, choosing a delimiter the text cannot close. */
+/**
+ * Wraps a payload in `EXECUTE IMMEDIATE q'X…X'`, choosing a delimiter the text cannot close. Used
+ * for DDL/DCL (invalid as a direct block statement) AND for raw DML/DELETE: running the statement
+ * as a single dynamic-SQL string makes Oracle execute EXACTLY ONE statement regardless of any
+ * parser differential between our tokenizer and the database — a `;`-smuggled second statement (or
+ * a character the server-side lexer reads differently) becomes an ORA error, never a second command
+ * under the first one's category/permission.
+ */
 function dynamicWrap(payload: string): string {
   const inner = stripTrailingSemicolons(payload);
   for (const [open, close] of Q_DELIMITERS) {
@@ -315,20 +478,24 @@ function dynamicWrap(payload: string): string {
 }
 
 /**
- * Builds the PL/SQL block for the server-side action. DML goes straight into the block;
- * DDL/DCL go through EXECUTE IMMEDIATE (invalid as a direct block statement); a PL/SQL block
- * passes through, and a bare procedure call is wrapped. UNSUPPORTED is refused.
+ * Builds the PL/SQL block for the server-side action. DDL, DCL and raw DML/DELETE all go through
+ * EXECUTE IMMEDIATE so Oracle parses the payload as a single dynamic-SQL string and runs exactly one
+ * statement (see `dynamicWrap`); a PL/SQL block passes through, and a bare procedure call is
+ * wrapped. UNSUPPORTED is refused.
  */
 export function wrapServerSql(sql: string, category: ServerSqlCategory): string {
   if (category === 'UNSUPPORTED') {
     throw new AppError('SERVER_SQL_UNSUPPORTED', 'This statement has no server-side route.');
   }
-  // Single-statement categories carry exactly one statement: a second one riding behind a
-  // `;` would run under the first one's category/permission. PL/SQL is intentionally exempt.
-  if (DYNAMIC.has(category) || DIRECT_DML.has(category)) assertSingleStatement(sql);
-  if (DYNAMIC.has(category)) return dynamicWrap(sql);
-  if (DIRECT_DML.has(category)) {
-    return `BEGIN\n${stripTrailingSemicolons(sql)};\nEND;`;
+  // Single-statement categories carry exactly one statement: a second one riding behind a `;`
+  // would run under the first one's category/permission. `assertSingleStatement` gives a clean
+  // early error for the obvious `a; b` case; `dynamicWrap` (EXECUTE IMMEDIATE) is the structural
+  // guarantee that the database executes only one statement even if our lexer and Oracle's differ.
+  // PL/SQL is intentionally exempt (a block legitimately holds many statements and SERVER.PLSQL
+  // already authorizes an arbitrary one).
+  if (DYNAMIC.has(category) || DIRECT_DML.has(category)) {
+    assertSingleStatement(sql);
+    return dynamicWrap(sql);
   }
   // PLSQL: an anonymous block is already a complete block; anything else is a call to wrap.
   const trimmed = sql.trim();

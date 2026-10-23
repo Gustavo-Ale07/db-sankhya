@@ -383,6 +383,20 @@ describe('AuthzService', () => {
       await authz.setUserRoles(bia, ['VIEWER', 'WRITES'], clerk);
     });
 
+    it('never hands on a SERVER.* permission beyond the actor own (holder-only, no fanout)', async () => {
+      const bia = await newUser('bia@example.com', ['VIEWER']);
+      await seedRole('ROLES_ONLY', ['ADMIN.ROLES']);
+      const clerk = await newUser('clerk@example.com', ['ROLES_ONLY']);
+      await seedRole('SRV', ['SERVER.DDL']);
+      // A role administrator cannot assign SERVER.*: it is not in ASSIGNABLE_BEYOND_OWN, so it falls
+      // to assertCanGrant (holder-only) regardless of ADMIN.ROLES or the target's password state.
+      await expect(authz.setUserRoles(bia, ['VIEWER', 'SRV'], clerk)).rejects.toMatchObject({
+        code: 'FORBIDDEN',
+        details: { reason: 'beyond_own', missing: ['SERVER.DDL'] },
+      });
+      expect(await authz.directRoles(bia)).toEqual(['VIEWER']);
+    });
+
     it('refuses creating a user with roles the actor lacks', async () => {
       const admin = await newUser('admin@example.com', ['ADMIN']);
       const input = { name: 'Op', password: PASSWORD, roles: ['OPERATOR'], createdBy: admin };

@@ -4,6 +4,8 @@ import {
   assertServerSqlAllowed,
   classifyServerSql,
   serverSqlTarget,
+  serverSqlWhere,
+  serverSqlSources,
   wrapServerSql,
   SERVER_SQL_CATEGORIES,
   type ServerSqlGate,
@@ -127,14 +129,29 @@ describe('classifyServerSql', () => {
 });
 
 describe('wrapServerSql', () => {
-  it('wraps DML directly inside a BEGIN/END block, with one trailing semicolon', () => {
+  it('runs raw DML through EXECUTE IMMEDIATE so Oracle executes exactly one statement', () => {
     const block = wrapServerSql('DELETE FROM TGFCAB WHERE NUNOTA = 1', 'DELETE');
-    expect(block).toBe('BEGIN\nDELETE FROM TGFCAB WHERE NUNOTA = 1;\nEND;');
+    expect(block).toBe("BEGIN\nEXECUTE IMMEDIATE q'[DELETE FROM TGFCAB WHERE NUNOTA = 1]';\nEND;");
   });
 
-  it('strips a trailing semicolon from the DML before re-adding exactly one', () => {
+  it('strips a trailing semicolon from the DML before wrapping it in EXECUTE IMMEDIATE', () => {
     const block = wrapServerSql('UPDATE A SET N = 1 WHERE ID = 2;', 'DML_RAW');
-    expect(block).toBe('BEGIN\nUPDATE A SET N = 1 WHERE ID = 2;\nEND;');
+    expect(block).toBe("BEGIN\nEXECUTE IMMEDIATE q'[UPDATE A SET N = 1 WHERE ID = 2]';\nEND;");
+  });
+
+  it('wraps a raw-DML payload holding an Oracle q-quote literal without corrupting it', () => {
+    // The ansi lexer cannot reason about q'[…]'; EXECUTE IMMEDIATE + a non-colliding delimiter makes
+    // Oracle parse the whole payload as one dynamic statement, so a `;` inside the q-quote is inert.
+    const block = wrapServerSql("DELETE FROM T WHERE C = q'[a;b]'", 'DELETE');
+    expect(block).toContain('EXECUTE IMMEDIATE q');
+    expect(block.startsWith('BEGIN\nEXECUTE IMMEDIATE q')).toBe(true);
+    // The chosen outer delimiter's closing sequence must not appear inside the payload.
+    const m = /EXECUTE IMMEDIATE q'(.)/.exec(block);
+    const open = m?.[1] as string;
+    const close =
+      ({ '[': ']', '{': '}', '<': '>', '(': ')' } as Record<string, string>)[open] ?? open;
+    const payload = block.slice(block.indexOf(`q'${open}`) + 3, block.lastIndexOf(`${close}'`));
+    expect(payload.includes(`${close}'`)).toBe(false);
   });
 
   it('wraps DDL in EXECUTE IMMEDIATE with q-quoting and no trailing semicolon inside', () => {
@@ -278,5 +295,128 @@ describe('serverSqlTarget', () => {
     expect(serverSqlTarget('CREATE OR REPLACE PROCEDURE p AS BEGIN NULL; END;')).toBeNull();
     expect(serverSqlTarget('')).toBeNull();
     expect(serverSqlTarget('SELECT 1 FROM dual')).toBeNull();
+  });
+});
+
+describe('serverSqlWhere', () => {
+  it('reports a top-level WHERE on an UPDATE/DELETE via the real tokenizer', () => {
+    expect(serverSqlWhere('DELETE FROM TGFCAB WHERE NUNOTA = 1')).toEqual({
+      required: true,
+      present: true,
+    });
+    expect(serverSqlWhere('UPDATE A SET N = 1 WHERE ID = 2')).toEqual({
+      required: true,
+      present: true,
+    });
+  });
+
+  it('fails closed: an unqualified UPDATE/DELETE is required-but-absent', () => {
+    expect(serverSqlWhere('DELETE FROM TGFCAB')).toEqual({ required: true, present: false });
+    expect(serverSqlWhere('UPDATE A SET N = 1')).toEqual({ required: true, present: false });
+  });
+
+  it('does not count a WHERE that lives only inside a subquery', () => {
+    expect(serverSqlWhere('DELETE FROM A WHERE ID IN (SELECT ID FROM B WHERE X = 1)')).toEqual({
+      required: true,
+      present: true,
+    });
+    expect(serverSqlWhere('UPDATE A SET N = (SELECT N FROM B WHERE B.ID = A.ID)')).toEqual({
+      required: true,
+      present: false,
+    });
+  });
+
+  it('does not require a WHERE for non UPDATE/DELETE verbs', () => {
+    expect(
+      serverSqlWhere('MERGE INTO A USING B ON (A.ID = B.ID) WHEN MATCHED THEN UPDATE SET A.N = 1'),
+    ).toEqual({
+      required: false,
+      present: true,
+    });
+    expect(serverSqlWhere('DROP TABLE AD_X')).toEqual({ required: false, present: true });
+    expect(serverSqlWhere('INSERT INTO A SELECT * FROM B')).toEqual({
+      required: false,
+      present: true,
+    });
+  });
+});
+
+describe('serverSqlSources', () => {
+  it('collects FROM/JOIN read sources at any nesting (INSERT ... SELECT)', () => {
+    expect(serverSqlSources('INSERT INTO OK SELECT * FROM SECRET')).toEqual(new Set(['SECRET']));
+    expect(serverSqlSources('INSERT INTO OK SELECT * FROM A JOIN B ON A.ID = B.ID')).toEqual(
+      new Set(['A', 'B']),
+    );
+  });
+
+  it('collects EVERY table of a comma-separated FROM list (old-style join), not just the first', () => {
+    expect(serverSqlSources('INSERT INTO OK SELECT * FROM A, SECRET')).toEqual(
+      new Set(['A', 'SECRET']),
+    );
+    // With aliases (AS and bare) and a trailing clause.
+    expect(
+      serverSqlSources(
+        'DELETE FROM OK WHERE ID IN (SELECT X FROM A a1, SCHEMA.SECRET AS s2 WHERE a1.id = s2.id)',
+      ),
+    ).toEqual(new Set(['OK', 'A', 'SECRET']));
+    // A derived table between two real siblings must not hide the sibling after it.
+    expect(
+      serverSqlSources('INSERT INTO OK SELECT * FROM A, (SELECT ID FROM MID) d, SECRET'),
+    ).toEqual(new Set(['A', 'MID', 'SECRET']));
+  });
+
+  it('skips an Oracle partition suffix but still reads the table and its siblings', () => {
+    expect(serverSqlSources('DELETE FROM OK PARTITION (P1) WHERE ID = 1')).toEqual(new Set(['OK']));
+    expect(serverSqlSources('INSERT INTO OK SELECT * FROM A PARTITION (P1), SECRET')).toEqual(
+      new Set(['A', 'SECRET']),
+    );
+  });
+
+  it('fails closed on a remote @dblink source', () => {
+    expect(serverSqlSources('INSERT INTO OK SELECT * FROM SECRET@REMOTE')).toBeNull();
+  });
+
+  it('collects a MERGE ... USING source, schema-qualified to its last segment', () => {
+    expect(
+      serverSqlSources(
+        'MERGE INTO OK USING SANKHYA.SECRET ON (1=1) WHEN MATCHED THEN UPDATE SET N=1',
+      ),
+    ).toEqual(new Set(['SECRET']));
+  });
+
+  it('collects a source read inside a DELETE/UPDATE WHERE subquery', () => {
+    expect(serverSqlSources('DELETE FROM OK WHERE ID IN (SELECT ID FROM SECRET)')).toEqual(
+      new Set(['OK', 'SECRET']),
+    );
+  });
+
+  it('reaches into derived tables without adding the subquery paren', () => {
+    expect(serverSqlSources('INSERT INTO OK SELECT * FROM (SELECT ID FROM SECRET) S')).toEqual(
+      new Set(['SECRET']),
+    );
+  });
+
+  it('ignores DUAL and a JOIN ... USING column list', () => {
+    expect(serverSqlSources('INSERT INTO OK SELECT SEQ.NEXTVAL FROM DUAL')).toEqual(new Set());
+    expect(serverSqlSources('INSERT INTO OK SELECT * FROM A JOIN B USING (ID)')).toEqual(
+      new Set(['A', 'B']),
+    );
+  });
+
+  it('treats USING as a source only in MERGE, not a DDL storage clause', () => {
+    // ALTER ... USING INDEX must not be read as a source named INDEX.
+    expect(
+      serverSqlSources('ALTER TABLE A ADD CONSTRAINT PK PRIMARY KEY (ID) USING INDEX'),
+    ).toEqual(new Set());
+  });
+
+  it('fails closed (null) when a read source is a function call or otherwise undeterminable', () => {
+    expect(serverSqlSources('INSERT INTO OK SELECT * FROM TABLE(SOME_FUNC(1))')).toBeNull();
+    expect(serverSqlSources('INSERT INTO OK SELECT * FROM PKG.FUNC(1)')).toBeNull();
+  });
+
+  it('returns an empty set for a statement that reads nothing', () => {
+    expect(serverSqlSources('DELETE FROM OK WHERE ID = 1')).toEqual(new Set(['OK']));
+    expect(serverSqlSources('DROP TABLE AD_X')).toEqual(new Set());
   });
 });

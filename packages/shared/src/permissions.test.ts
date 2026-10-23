@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  ASSIGNABLE_BEYOND_OWN,
   PERMISSIONS,
   POLICY_ADMIN_CONFLICTS,
   SYSTEM_ROLE_PERMISSIONS,
@@ -89,6 +90,17 @@ describe('permission catalog', () => {
     expect(POLICY_ADMIN_CONFLICTS).not.toContain('DATA.PREVIEW');
     expect(POLICY_ADMIN_CONFLICTS).not.toContain('SECURITY.SEGREGATION_OVERRIDE');
     for (const p of POLICY_ADMIN_CONFLICTS) expect(SYSTEM_ROLE_PERMISSIONS.ADMIN).not.toContain(p);
+  });
+
+  it('assignable-beyond-own is the conflict writes WITHOUT SERVER.* (holder-only, no fanout)', () => {
+    // A role administrator may hand on DATA.*/DDL.*/SANKHYA.* beyond their own, but never SERVER.*:
+    // that follows assertCanGrant so only a holder (SUPER_ADMIN) can assign it.
+    for (const p of ASSIGNABLE_BEYOND_OWN) expect(p.startsWith('SERVER.')).toBe(false);
+    expect([...ASSIGNABLE_BEYOND_OWN].sort()).toEqual(
+      POLICY_ADMIN_CONFLICTS.filter((p) => !p.startsWith('SERVER.')).sort(),
+    );
+    for (const p of PERMISSIONS.filter((x) => x.startsWith('SERVER.')))
+      expect(ASSIGNABLE_BEYOND_OWN).not.toContain(p);
   });
 
   it('SUPER_ADMIN holds the whole catalog: every command and administration, with the override', () => {

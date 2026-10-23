@@ -17,9 +17,9 @@ interface NewUser {
 }
 
 /**
- * The writes kept from policy administrators (POLICY_ADMIN_CONFLICTS in @dbx/shared, which the web
- * app does not import). These are the only permissions a role administrator may hand on without
- * holding them; an ADMIN.* or APPROVAL.* they lack stays out of reach.
+ * The writes a role administrator may hand on without holding them (ASSIGNABLE_BEYOND_OWN in
+ * @dbx/shared, which the web app does not import). SERVER.* and any ADMIN or APPROVAL writes they
+ * lack stay out of reach — those follow assertCanGrant on the server (holder-only).
  */
 const SEPARATED_WRITES: readonly Permission[] = [
   'DATA.INSERT',
@@ -31,11 +31,8 @@ const SEPARATED_WRITES: readonly Permission[] = [
   'SANKHYA.ACTION.INCLUIR_NOTA',
   'SANKHYA.ACTION.INCLUIR_ALTERAR_ITEM_NOTA',
   'SANKHYA.ACTION.EXCLUIR_ITEM_NOTA',
-  'SERVER.DDL',
-  'SERVER.DELETE',
-  'SERVER.DML_RAW',
-  'SERVER.DCL',
-  'SERVER.PLSQL',
+  // SERVER.* (the "Executa Banco" route) is intentionally NOT here: it mirrors the server's
+  // ASSIGNABLE_BEYOND_OWN, so a role administrator can only hand on a SERVER.* role if they hold it.
 ];
 
 /**

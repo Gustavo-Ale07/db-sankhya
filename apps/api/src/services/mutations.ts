@@ -33,7 +33,9 @@ import {
   classifyStatement,
   isTrivialWhere,
   resolveCapability,
+  serverSqlSources,
   serverSqlTarget,
+  serverSqlWhere,
   wrapServerSql,
 } from '@dbx/sql-engine';
 import type {
@@ -517,6 +519,23 @@ export class MutationService {
     onEnvironment?: (environment: Environment) => void,
   ): Promise<SankhyaResolution> {
     const permission = PERMISSION[write.kind];
+    // The server-side execution channel (AD_MANIPULADADOS) is reserved for the tool: the executor
+    // stages its block there, reads it back and runs it. No GATEWAY write may target it — a
+    // DatasetSP.save against the control record could stage or overwrite the block the executor
+    // fires (a TOCTOU / block-injection path). Fail closed before permission/policy, in every mode.
+    const controlEntity = (
+      this.deps.serverSql?.action?.entityName ?? 'AD_MANIPULADADOS'
+    ).toUpperCase();
+    if (write.table.toUpperCase() === controlEntity) {
+      throw refuse(
+        'AUTHORIZE',
+        new AppError(
+          'FORBIDDEN',
+          'This object is reserved by the tool and cannot be targeted directly',
+          { entity: controlEntity },
+        ),
+      );
+    }
     // DELETE without WHERE never gets here (VALIDATE); INSERT has no WHERE at all.
     const noWhere = write.kind === 'UPDATE' && !write.hasWhere;
     const holds = auth.grants.permissions.has(permission);
@@ -814,10 +833,76 @@ export class MutationService {
       );
     }
     const control = (this.deps.serverSql?.action?.entityName ?? 'AD_MANIPULADADOS').toUpperCase();
+
+    // Control-entity denylist: the dedicated AD_MANIPULADADOS record is the tool's own execution
+    // channel (the executor stages the block there, reads it back and runs it). A user statement must
+    // never TARGET it directly — doing so would let a caller stage or overwrite the very record the
+    // executor fires (a TOCTOU / block-injection path). Fail closed, before any policy decision.
+    if (extracted !== null && extracted === control) {
+      throw refuse(
+        'AUTHORIZE',
+        new AppError(
+          'FORBIDDEN',
+          'This object is reserved by the tool and cannot be targeted directly',
+          { entity: control },
+        ),
+      );
+    }
     const entity = extracted ?? control;
     const entities = extracted ? [extracted, control] : [control];
-    const needsWhere = classified.kind === 'UPDATE' || classified.kind === 'DELETE';
-    const hasWhere = needsWhere ? classified.hasWhere : true;
+
+    // Verb-aware WHERE, decided by the server-side tokenizer — NOT the PG classifier, which returns
+    // UNKNOWN for the Oracle DML the gateway cannot parse and would then skip the guard, letting an
+    // unqualified `DELETE FROM t` / `UPDATE t SET ...` through. A verb that requires a WHERE but whose
+    // top-level WHERE cannot be read is treated as having none (fail closed).
+    const where = serverSqlWhere(sql);
+    const needsWhere = where.required;
+    const hasWhere = where.present;
+
+    // Read-policy on every source table. A write can READ tables the user may not: `INSERT ... SELECT
+    // FROM secret`, `MERGE INTO ok USING secret`, an UPDATE/DELETE whose WHERE subquery reads `secret`.
+    // QUERY.SELECT must ALLOW each referenced source, or the write is refused. PL/SQL is an opaque
+    // block with no statically-determinable sources and is authorized as SERVER.PLSQL alone; every
+    // other category must have its sources pinned down, else fail closed. This is TABLE-level only —
+    // column-level read rules on the sources are not enforced here (documented residual).
+    if (category !== 'PLSQL') {
+      const sources = serverSqlSources(sql);
+      if (sources === null) {
+        throw refuse(
+          'VALIDATE',
+          new AppError(
+            'SERVER_SQL_TARGET_UNKNOWN',
+            'A table this statement reads from could not be determined, so it cannot be authorized. Rewrite it so every source table is explicit.',
+          ),
+        );
+      }
+      for (const source of sources) {
+        if (source === entity || source === control) continue;
+        const read = await evaluateFor({
+          policies,
+          auth,
+          groupIds,
+          action: 'QUERY.SELECT',
+          environment,
+          connectionId,
+          entities: [source],
+          defaults,
+        });
+        if (read.effect !== 'ALLOW') {
+          throw refuse(
+            'AUTHORIZE',
+            new AppError('FORBIDDEN', 'The change reads from a table you are not allowed to read', {
+              entity: source,
+            }),
+            {
+              reasons: read.reasons,
+              matchedRuleIds: read.matchedRuleIds,
+              policyVersion: read.policyVersion,
+            },
+          );
+        }
+      }
+    }
 
     const decision = await evaluateFor({
       policies,
@@ -838,7 +923,9 @@ export class MutationService {
       });
     }
     if (needsWhere && !hasWhere && !overrideApplies(decision)) {
-      throw refuse('VALIDATE', whereRequired(classified.kind), { reasons: decision.reasons });
+      throw refuse('VALIDATE', whereRequired(category === 'DELETE' ? 'DELETE' : 'UPDATE'), {
+        reasons: decision.reasons,
+      });
     }
 
     const capability: Capability = {

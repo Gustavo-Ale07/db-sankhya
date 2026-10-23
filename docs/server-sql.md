@@ -89,7 +89,13 @@ Ordem de verificação, tudo fail-closed:
    (`SERVER_SQL_PRODUCTION_OPT_IN`) **e** `SAFE_MODE` desligado; caso contrário
    `SERVER_SQL_PRODUCTION_BLOCKED`.
 4. **RBAC:** a permissão `SERVER.<categoria>` precisa estar concedida, senão `FORBIDDEN`.
-5. **Política:** decisão com ALLOW obrigatório (deny-wins) sobre o **objeto real** do comando;
+5. **Entidade de controle reservada:** nenhum comando — nem pela rota SERVER_SQL nem pelo
+   gateway — pode ter a entidade de controle (`AD_MANIPULADADOS`, configurável) como alvo.
+   Uma tentativa é recusada com `FORBIDDEN` (detalhe `{ entity }`). Isso fecha o TOCTOU em
+   que um usuário visaria diretamente o registro que a ferramenta cria/apaga para disparar a
+   ação `98`. A checagem existe nos **dois** lados (`resolveSankhya` para o gateway e
+   `resolveServerSql` para a rota direta).
+6. **Política:** decisão com ALLOW obrigatório (deny-wins) sobre o **objeto real** do comando;
    sem ALLOW, `FORBIDDEN`. O objeto é extraído com o tokenizer real (strings, comentários e
    identificadores entre aspas ou qualificados por schema tratados). Se o objeto de um
    DDL/`DELETE`/DML cru/DCL **não puder ser determinado com segurança** (ex.: `ALTER SESSION`,
@@ -97,9 +103,24 @@ Ordem de verificação, tudo fail-closed:
    (`SERVER_SQL_TARGET_UNKNOWN`) em vez de cair no registro de controle — a política nunca é
    decidida sobre `AD_MANIPULADADOS` no lugar da tabela real. PL/SQL é a exceção: não tem alvo
    único e já é autorizado como bloco arbitrário por `SERVER.PLSQL`.
-6. **Confirmação forte** quando a política/ambiente exigem — decidida no servidor, nunca
+7. **Política de leitura das fontes:** um comando que **lê** de outras tabelas para decidir o
+   que gravar (`DELETE ... WHERE x IN (SELECT ... FROM OUTRA)`, `MERGE ... USING`,
+   `INSERT ... SELECT`, `UPDATE` com subconsulta) só passa se o chamador puder ler **cada**
+   tabela de origem: para cada fonte, avalia-se `QUERY.SELECT` (que honra regras DENY) e, sem
+   ALLOW, recusa-se com `FORBIDDEN` (detalhe `{ entity }` da fonte). As fontes são extraídas
+   percorrendo **toda** a lista `FROM` separada por vírgula (não só a primeira tabela),
+   pulando subconsultas derivadas sem perder as irmãs seguintes e sufixos Oracle
+   `PARTITION (...)`/`SUBPARTITION (...)`. Fail-closed → `SERVER_SQL_TARGET_UNKNOWN` quando uma
+   fonte não pode ser determinada com segurança (função de tabela `TABLE(f())`, dblink
+   `tabela@link`). **Resíduo documentado:** a checagem é por **tabela** (nível de objeto);
+   regras de leitura por **coluna** nas fontes ainda não são aplicadas aqui. PL/SQL é exceção
+   (bloco arbitrário, sem lista de fontes analisável).
+8. **Confirmação forte** quando a política/ambiente exigem — decidida no servidor, nunca
    inventada só no front.
-7. `UPDATE`/`DELETE` sem `WHERE` → `WHERE_REQUIRED` (salvo override explícito de política).
+9. `UPDATE`/`DELETE` sem `WHERE` → `WHERE_REQUIRED` (salvo override explícito de política). A
+   necessidade de `WHERE` e a presença dele são decididas pelo tokenizer real da rota direta
+   (`serverSqlWhere`), por verbo — não pelo parser PG, que marcaria como `UNKNOWN` formas
+   Oracle como `DELETE FROM T PARTITION (P1)`. Fail-closed: na dúvida, `present = false`.
 
 Papéis: `LEITOR` = só `SELECT`; `OPERADOR` = `SELECT` + `INSERT` + `UPDATE`; `ADMIN` = tudo
 

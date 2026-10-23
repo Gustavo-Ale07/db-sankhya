@@ -33,6 +33,8 @@ export {
   assertServerSqlAllowed,
   classifyServerSql,
   serverSqlTarget,
+  serverSqlWhere,
+  serverSqlSources,
   wrapServerSql,
   SERVER_SQL_CATEGORIES,
 } from './server-sql';

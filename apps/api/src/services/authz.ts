@@ -10,7 +10,7 @@ import {
   users,
 } from '@dbx/database';
 import type { Database, GroupRow, RoleRow } from '@dbx/database';
-import { AppError, POLICY_ADMIN_CONFLICTS, isPermission } from '@dbx/shared';
+import { AppError, ASSIGNABLE_BEYOND_OWN, isPermission } from '@dbx/shared';
 import type { Permission } from '@dbx/shared';
 
 /** Permission that keeps the tool administrable; some active user must always hold it. */
@@ -236,9 +236,11 @@ export class AuthzService {
    * Assigning is not holding: giving another user a role leaves the actor's own permissions as
    * they were. That is what lets an ADMIN (no DATA.*, by separation of duties) make a writer.
    * It is allowed beyond the actor's own permissions only when
-   * - every permission beyond them is a write kept from policy administrators
-   *   (POLICY_ADMIN_CONFLICTS: DATA.*, DDL.CUSTOM.GENERATE, SANKHYA.*), the ones ADMIN lacks by
-   *   design; an ADMIN.* or APPROVAL.* the actor lacks is never handed on;
+   * - every permission beyond them is in ASSIGNABLE_BEYOND_OWN (DATA.*, DDL.CUSTOM.GENERATE,
+   *   SANKHYA.*), the writes ADMIN lacks by design. SERVER.* (the "Executa Banco" route) is a
+   *   separation-of-duties conflict but is NOT assignable-beyond-own: it follows `assertCanGrant`,
+   *   so only an actor who actually holds it (SUPER_ADMIN) can hand it on. An ADMIN.* or APPROVAL.*
+   *   the actor lacks is likewise never handed on;
    * - the actor holds ADMIN.ROLES (the role administrators, who are full administrators anyway);
    * - the target is someone else (`setUserRoles` refuses self changes before this);
    * - the target has set their own password (`mustChangePassword` false): a password the actor
@@ -261,7 +263,7 @@ export class AuthzService {
     const mine = (await this.grants(actorId, db)).permissions;
     const beyond = [...granted].filter((p) => !mine.has(p));
     if (beyond.length === 0) return;
-    if (!mine.has('ADMIN.ROLES') || beyond.some((p) => !POLICY_ADMIN_CONFLICTS.includes(p)))
+    if (!mine.has('ADMIN.ROLES') || beyond.some((p) => !ASSIGNABLE_BEYOND_OWN.includes(p)))
       return this.assertCanGrant(actorId, granted, db);
     const [target] = await db
       .select({ mustChangePassword: users.mustChangePassword })

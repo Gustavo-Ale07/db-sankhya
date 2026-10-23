@@ -3331,6 +3331,92 @@ describe('MutationService server-side route (Executa Banco)', () => {
         code: 'WHERE_REQUIRED',
       });
     });
+
+    it('decides WHERE from the server tokenizer, not the PG parser: an Oracle no-WHERE DELETE the gateway cannot parse is still WHERE_REQUIRED', async () => {
+      const h = await setup({}, { serverSql: SERVER_ON });
+      await allowServer(h);
+      const { auth } = await h.userWith(SERVER_PERMS);
+      // The PG classifier returns UNKNOWN for Oracle partition-extended DML, so a kind-based guard
+      // would skip the check and let this through. The verb-aware server check must still fire.
+      await expect(prepare(h, auth, 'DELETE FROM TGFPAR PARTITION (P1)')).rejects.toMatchObject({
+        code: 'WHERE_REQUIRED',
+      });
+      expect(await h.audit('PLAN_CREATED')).toEqual([]);
+      expect(writeCalls(h.mock)).toEqual([]);
+    });
+
+    it('enforces the READ policy on a table the write only reads (subquery source): a DENY on the source refuses the write and names it', async () => {
+      const h = await setup({}, { serverSql: SERVER_ON });
+      await allowServer(h);
+      // A DENY rule hides TSECRET from this caller's reads (QUERY.SELECT is permission-only, so a
+      // DENY is what restricts it). The write deletes the allowed target TGFPAR but reads TSECRET
+      // through its WHERE subquery, so it must be refused (no acting on / exfiltrating from a table
+      // the caller may not read), and the refusal must name the source.
+      await h.policy({ name: 'hide tsecret', actions: ['QUERY.SELECT'], entities: ['TSECRET'] });
+      const { auth } = await h.userWith(SERVER_PERMS);
+      const sql = 'DELETE FROM TGFPAR WHERE CODPARC IN (SELECT CODPARC FROM TSECRET)';
+      await expect(prepare(h, auth, sql)).rejects.toMatchObject({
+        code: 'FORBIDDEN',
+        details: { entity: 'TSECRET' },
+      });
+      expect(await h.audit('PLAN_CREATED')).toEqual([]);
+      expect(writeCalls(h.mock)).toEqual([]);
+    });
+
+    it('allows the same read-bearing write when no DENY hides the source (read permission is enough)', async () => {
+      const h = await setup({}, { serverSql: SERVER_ON });
+      await allowServer(h);
+      const { auth } = await h.userWith(SERVER_PERMS);
+      // No DENY on TSECRET: the caller holds QUERY.SELECT, so reading the source is permitted and the
+      // statement plans as a server-side DELETE. The source evaluation must not over-block.
+      const p = await prepare(
+        h,
+        auth,
+        'DELETE FROM TGFPAR WHERE CODPARC IN (SELECT CODPARC FROM TSECRET)',
+      );
+      expect(p.capability).toMatchObject({ route: 'SERVER_SQL', action: 'SERVER.DELETE' });
+      expect(writeCalls(h.mock)).toEqual([]);
+    });
+
+    it('fails closed when a read source cannot be determined (function source): SERVER_SQL_TARGET_UNKNOWN', async () => {
+      const h = await setup({}, { serverSql: SERVER_ON });
+      await allowServer(h);
+      const { auth } = await h.userWith(SERVER_PERMS);
+      // The WHERE subquery reads from a table function, whose real source cannot be named: refuse.
+      await expect(
+        prepare(
+          h,
+          auth,
+          'DELETE FROM TGFPAR WHERE CODPARC IN (SELECT COLUMN_VALUE FROM TABLE(SOME_PKG.IDS()))',
+        ),
+      ).rejects.toMatchObject({ code: 'SERVER_SQL_TARGET_UNKNOWN' });
+      expect(await h.audit('PLAN_CREATED')).toEqual([]);
+    });
+
+    it('refuses a server statement that TARGETS the reserved control record (AD_MANIPULADADOS)', async () => {
+      const h = await setup({}, { serverSql: SERVER_ON });
+      await allowServer(h);
+      const { auth } = await h.userWith(SERVER_PERMS);
+      // The control record is the tool's own execution channel: a user statement must never act on
+      // it directly (it would let a caller stage or overwrite the block the executor fires).
+      await expect(
+        prepare(h, auth, 'DELETE FROM AD_MANIPULADADOS WHERE ID = 1'),
+      ).rejects.toMatchObject({ code: 'FORBIDDEN', details: { entity: 'AD_MANIPULADADOS' } });
+      expect(await h.audit('PLAN_CREATED')).toEqual([]);
+      expect(writeCalls(h.mock)).toEqual([]);
+    });
+
+    it('refuses a GATEWAY write that targets the reserved control record, even with the server route off', async () => {
+      const h = await setup();
+      const { auth } = await h.userWith(WRITER);
+      // No server route here (default bench, DATA.* allowed). A plain gateway INSERT into the control
+      // entity must still be blocked by the denylist.
+      await expect(
+        prepare(h, auth, "INSERT INTO AD_MANIPULADADOS (TEXTO) VALUES ('x')"),
+      ).rejects.toMatchObject({ code: 'FORBIDDEN', details: { entity: 'AD_MANIPULADADOS' } });
+      expect(await h.audit('PLAN_CREATED')).toEqual([]);
+      expect(writeCalls(h.mock)).toEqual([]);
+    });
   });
 
   describe('execute', () => {

@@ -124,6 +124,18 @@ export const POLICY_ADMIN_CONFLICTS: readonly Permission[] = [
   ...SERVER,
 ];
 
+/**
+ * The subset of {@link POLICY_ADMIN_CONFLICTS} a role administrator (ADMIN.ROLES) may hand on to
+ * ANOTHER user beyond their own permissions (assigning is not holding — see `authz.assertCanAssign`).
+ * `SERVER.*` is deliberately NOT here: the server-side ("Executa Banco") route is dangerous enough
+ * that it follows `assertCanGrant` instead, so only an actor who actually holds it (in practice
+ * SUPER_ADMIN) can ever assign it. This keeps it out of a plain ADMIN's reach even though it is,
+ * correctly, still a separation-of-duties conflict for a policy administrator.
+ */
+export const ASSIGNABLE_BEYOND_OWN: readonly Permission[] = POLICY_ADMIN_CONFLICTS.filter(
+  (p) => !p.startsWith('SERVER.'),
+);
+
 /** Permissions of the seeded system roles. The RBAC migration mirrors them; a test keeps both equal. */
 export const SYSTEM_ROLE_PERMISSIONS: Readonly<Record<SystemRole, readonly Permission[]>> = {
   VIEWER,
