@@ -496,6 +496,33 @@ const JOIN_KEYWORDS = new Set([
  */
 const JOIN_READ_UNSAFE = new Set(['APPLY', 'LATERAL', 'PIVOT', 'UNPIVOT', 'MODEL']);
 
+/**
+ * Oracle RESERVED words that genuinely end a query block's FROM list. Unlike FROM_LIST_CLAUSE_END
+ * (used only at the strict end-of-item check, where the preceding token is known to be a clause
+ * keyword and never a column reference), this set is consulted mid-expression while scanning a join
+ * area, where ANY word may be an identifier. A reserved word can never be a legal unquoted
+ * identifier, so encountering one here is unambiguously the clause boundary and the scan may stop.
+ * Non-reserved keywords are deliberately EXCLUDED (JOIN, OFFSET, FETCH, RETURNING, WHEN, EXCEPT):
+ * each can be a column/table name (`a.OFFSET`, a table named `FETCH`), so breaking on one could end
+ * the scan before a hidden depth-0 comma sibling and let an unread source escape read-policy. The
+ * scan keeps going past them instead — a real comma sibling is still caught, and a real reserved
+ * boundary (GROUP / ORDER / ...) stops the scan before its own, non-sibling, commas.
+ */
+const RESERVED_CLAUSE_END = new Set([
+  'WHERE',
+  'GROUP',
+  'HAVING',
+  'ORDER',
+  'CONNECT',
+  'START',
+  'SET',
+  'FOR',
+  'INTO',
+  'UNION',
+  'INTERSECT',
+  'MINUS',
+]);
+
 /** Index just after the `)` matching the `(` at `open`, or -1 when the parens are unbalanced. */
 function skipParens(sig: Token[], open: number): number {
   let depth = 0;
@@ -600,8 +627,10 @@ export function serverSqlSources(sql: string): Set<string> | null {
       // level (paren-balanced) and fail closed on anything that could hide a source:
       //  - a depth-0 comma → an old-style sibling exists → null;
       //  - CASE, or an APPLY/LATERAL/PIVOT/UNPIVOT/MODEL construct we cannot parse → null;
-      //  - a following `JOIN` or a real clause boundary → the area is accounted for; stop (the outer
-      //    walk re-enters at that `JOIN` and that join's own walk catches anything after it).
+      //  - a RESERVED clause boundary (GROUP / ORDER / ...) → the FROM list is over; stop. A
+      //    non-reserved keyword (JOIN, OFFSET, ...) or a `.`-qualified identifier part is NOT a
+      //    trusted boundary (it may be a column/table name), so the scan keeps going past it rather
+      //    than risk stopping before a hidden comma sibling.
       if (kw === 'ON' || kw === 'USING' || JOIN_KEYWORDS.has(kw)) {
         let d = 0;
         for (let j = k; j < sig.length; j++) {
@@ -614,9 +643,13 @@ export function serverSqlSources(sql: string): Set<string> | null {
             if (tj.type === 'symbol' && tj.text === ',') return null; // old-style sibling after a join
             if (tj.type === 'semicolon') break;
             if (tj.type === 'word') {
+              // A word right after `.` is a qualified-identifier part (`a.OFFSET`), never a clause
+              // keyword — skip it so it can neither trip a null nor end the scan.
+              const prev = sig[j - 1];
+              if (prev?.type === 'symbol' && (prev as Token).text === '.') continue;
               const w = tj.text.toUpperCase();
               if (w === 'CASE' || JOIN_READ_UNSAFE.has(w)) return null;
-              if (w === 'JOIN' || FROM_LIST_CLAUSE_END.has(w)) break;
+              if (RESERVED_CLAUSE_END.has(w)) break; // only a reserved word is a trusted boundary
             }
           }
         }

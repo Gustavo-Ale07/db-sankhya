@@ -120,7 +120,13 @@ Ordem de verificação, tudo fail-closed:
    fechado por padrão**. Uma irmã vírgula ao estilo antigo após um join ANSI
    (`FROM A JOIN B ON a=b, SECRET` / `USING (x), SECRET`) é recusada (essa irmã não é alcançada por
    nenhum `FROM`/`JOIN`); e um `CASE` numa condição de join, ou qualquer `PIVOT`/`UNPIVOT`/`APPLY`/
-   `LATERAL`/`MODEL`, também falham fechado por não serem gramática que analisamos. Além disso,
+   `LATERAL`/`MODEL`, também falham fechado por não serem gramática que analisamos. Ao varrer a
+   área de join em busca dessa irmã, só uma palavra **reservada** do Oracle (`WHERE`, `GROUP`,
+   `HAVING`, `ORDER`, `CONNECT`, `START`, `SET`, `FOR`, `INTO`, operadores de conjunto) encerra a
+   varredura; palavras não reservadas (`JOIN`, `OFFSET`, `FETCH`, `RETURNING`, `WHEN`, `EXCEPT`)
+   podem ser **identificadores** (ex.: coluna `a.OFFSET`) e por isso não interrompem a varredura, e
+   todo nome logo após um `.` é tratado como parte de identificador — assim uma irmã vírgula não
+   escapa escondida atrás de um nome com forma de palavra-chave. Além disso,
    **ler da entidade de controle** (`AD_MANIPULADADOS`) é
    recusado como alvo (`FORBIDDEN { entity }`). **Resíduos documentados:** (a) a checagem é por
    **tabela** (nível de objeto); regras de leitura por **coluna** nas fontes não são aplicadas

@@ -525,6 +525,30 @@ describe('serverSqlSources', () => {
     ).toBeNull();
   });
 
+  it('does not let a keyword-shaped identifier in a join condition hide a comma sibling', () => {
+    // OFFSET / FETCH / JOIN / WHEN are NOT reserved in Oracle and may be column names. A scan that
+    // treated them as clause boundaries would stop early and miss a trailing `, SECRET`.
+    expect(
+      serverSqlSources('INSERT INTO OK SELECT * FROM A JOIN B ON A.OFFSET = B.FETCH, SECRET'),
+    ).toBeNull();
+    expect(
+      serverSqlSources('INSERT INTO OK SELECT * FROM A JOIN B ON A.WHEN = B.JOIN, SECRET'),
+    ).toBeNull();
+    // The same keyword-shaped column in a clean join (no sibling) must still enumerate normally and
+    // not be mistaken for a boundary that truncates the result.
+    expect(serverSqlSources('INSERT INTO OK SELECT * FROM A JOIN B ON A.OFFSET = B.FETCH')).toEqual(
+      new Set(['A', 'B']),
+    );
+    // A genuine RESERVED boundary with its own (non-sibling) comma list is NOT a false positive:
+    // GROUP BY / ORDER BY stop the scan before their commas.
+    expect(
+      serverSqlSources('INSERT INTO OK SELECT A.X FROM A JOIN B ON A.ID = B.ID GROUP BY A.X, B.Y'),
+    ).toEqual(new Set(['A', 'B']));
+    expect(
+      serverSqlSources('INSERT INTO OK SELECT * FROM A JOIN B ON A.ID = B.ID ORDER BY A.X, B.Y'),
+    ).toEqual(new Set(['A', 'B']));
+  });
+
   it('fails closed on PIVOT / UNPIVOT / APPLY / LATERAL / MODEL constructs it cannot parse', () => {
     expect(
       serverSqlSources('INSERT INTO OK SELECT * FROM A PIVOT (SUM(X) FOR Y IN (1)), SECRET'),
