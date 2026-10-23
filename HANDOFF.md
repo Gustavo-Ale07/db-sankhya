@@ -1,5 +1,25 @@
 # HANDOFF — Rodada 2 (Prompt v2/v2.1) + Rodada 3 (ações nativas), 22/10/2026
 
+## Estado em 23/10 — retomar na segunda
+
+Fechamento de semana num ponto seguro. Branch `backup/rodada-2-2026-10-21`, HEAD **`38f8921`** (NÃO enviado: `origin/backup/rodada-2-2026-10-21` segue em `714a0da`). `main` (`f8d6a2e`) e `migration` (`0ddc4bd`) intocados. Árvore limpa.
+
+**Implementado e verde EM MOCK (gateway mock + PGlite; nunca em homologação real nem produção):**
+- Rodada 6 — rota de execução direta SERVER_SQL / "Executa Banco": ciclo prévia → confirmação → execução → verificação → auditoria via `ActionButtonsSP.executeJava` (ação `98`, bloco em `TEXTO` de registro `AD_MANIPULADADOS` dedicado criado/apagado pela ferramenta). Desligada por padrão.
+- Fiação completa no `MutationService` (`resolveServerSql` prepare, `runServerSql` execute) + `ServerSqlExecutor.dispatch` (save → executeJava → removeRecords), UX neutra na web, docs (`docs/server-sql.md`).
+- Extrator de alvo fail-closed (`serverSqlTarget` → `null` quando não resolve) e varredura de fontes/join fechando por padrão — duas revisões de segurança endereçadas.
+- CLI read-only `pnpm --filter @dbx/api probe-server-sql` (só SELECT/WITH). Rodado contra homologação real: leitura PROVADA real (`AD_MANIPULADADOS` existe, `ID NUMBER NOT NULL` + `TEXTO CLOB`, 40 linhas, sem erro Sankhya).
+- Primitiva de escopo fase-1 de PRODUÇÃO `assertServerSqlEnvironmentScope` + código `SERVER_SQL_OUT_OF_SCOPE` + testes (65/65 no arquivo), commit `38f8921`.
+
+**NÃO feito (próxima tarefa de segunda) — gate de backend fase 1:** a primitiva `assertServerSqlEnvironmentScope` existe e está testada, mas **NÃO está fiada** em lugar nenhum. Falta chamá-la em `resolveServerSql` (preparação) E no `ServerSqlExecutor.dispatch` (execução, exige adicionar `environment` ao `ServerSqlDispatchInput`), fail-closed nos dois pontos, de modo que em PRODUÇÃO fase 1 só `UPDATE` (inclusive com subconsulta/expressão) passe e `DELETE`/`DROP`/`TRUNCATE`/DDL/`MERGE`/`INSERT…SELECT`/DCL/PL-SQL sejam recusados antes de disparar, sem bypass por classificação errada nem por chamada direta à API.
+
+**Blockers reais (independentes do código, continuam abertos):**
+- (a) Autorização da API: o usuário de integração em homologação ainda recebe `"status":"0"` / `"Não autorizado"` em `DatasetSP.save` / `ActionButtonsSP.executeJava` / `removeRecords`. Leitura e autenticação funcionam; escrita não.
+- (b) Contrato da ação `98` do DBScript não validado empiricamente — parâmetros e envelope de retorno ainda não confirmados contra o servidor real.
+- (c) Versão implantada na VPS não confirmada — não há como afirmar o que está rodando lá a partir desta sessão.
+
+**Confirmação por escrito (23/10):** `SERVER_SQL_ENABLED` continua **off**; nada foi para produção nem para a VPS; nenhum deploy; nenhuma escrita real executada; nenhum push (HEAD local `38f8921` à frente de `origin` `714a0da`). `SAFE_MODE=true`, `GLOBAL_WRITE_ENABLED=false`, `WRITE_TO_SANKHYA=false` inalterados.
+
 ## Estado do git
 
 - Branch: `fix/metadata-on-demand`; `origin/fix/metadata-on-demand` = `f356880` (gates verdes). O commit seguinte (só docs: guia de publicação + este HANDOFF) foi enviado só para o backup.
