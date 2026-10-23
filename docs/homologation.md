@@ -108,22 +108,36 @@ usuário no Gateway (DatasetSP.save)". The call is not repeated and nothing is c
 
 This is decided by Sankhya, not by dbExplorer. What it means:
 
-- **Service:** `DatasetSP.save` (module `mge`); for actions, `CACSP.*` (module `mgecom`).
+- **Service:** `DatasetSP.save` (module `mge`); for actions, `CACSP.*` (module `mgecom`); for
+  the server-side route (`SERVER_SQL`, "Executa Banco"), also `ActionButtonsSP.executeJava`
+  (action `98`, module `mge`) and `DatasetSP.removeRecords` (module `mge`).
 - **Who:** the integration user/app identified by the client id and X-Token in the `.env`
   (the ERP user the integration app runs as).
 - **Entity:** the instance of the table being written (for example `AD_MANIPULADADOS`).
+
+The same "Não autorizado" envelope is returned by any of these services when the integration
+user is not allowed to call it, and the API surfaces `ActionButtonsSP.executeJava` and
+`DatasetSP.removeRecords` as `SANKHYA_WRITE_NOT_AUTHORIZED` exactly like `save`. Reads
+(`DbExplorerSP.executeQuery`, `CRUDServiceProvider.loadRecords`) are already authorized — only the
+write-side services are refused — which confirms this is a per-service authorization at Sankhya,
+not a credential or connectivity problem.
 
 To release it, someone with admin access to that Sankhya environment:
 
 1. In the **Sankhya Developer portal / Área do desenvolvedor**, on the integration app (the one
    whose client id is in the `.env`): check that the app is linked to this environment and that the
    services `DatasetSP.save` (and, for the actions, `CACSP.incluirNota`, `CACSP.incluirAlterarItemNota`,
-   `CACSP.excluirItemNota`, `CACSP.cancelarNota`) are among the services it is allowed to call.
+   `CACSP.excluirItemNota`, `CACSP.cancelarNota`; and, for the server-side route,
+   `ActionButtonsSP.executeJava` and `DatasetSP.removeRecords`) are among the services it is
+   allowed to call.
 2. In the **ERP (Sankhya Om)**, on the user the integration runs as
    (Configurações → Usuários / Segurança → Controle de acesso): give it _inclusão_ and _alteração_
    on the screen/instance of the target table (for `AD_*` tables, the screen built on that
    instance), and for notes the access to the Central de Notas / portal de movimentação and the
-   operation types (TOP) that will be used.
+   operation types (TOP) that will be used. For the server-side route, the user also needs
+   _inclusão_ and _exclusão_ on the control entity (`AD_MANIPULADADOS`) and access to run the
+   action button `98` ("Executa Banco") — the action-button access is separate from the service
+   access in step 1.
 3. Run one write again through the editor and read the answer.
 
 The menu names above are the usual ones and were **not verified** on this installation. Do not

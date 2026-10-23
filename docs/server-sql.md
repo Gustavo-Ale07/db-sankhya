@@ -79,6 +79,45 @@ legitimamente tem vários comandos, e `SERVER.PLSQL` já autoriza um bloco arbit
 
 O resultado é `EXECUTED` quando a ação volta com `status === '1'`, senão `FAILED`.
 
+### Parâmetros da ação 98 ainda NÃO confirmados na base real
+
+O corpo que esta ferramenta envia em `ActionButtonsSP.executeJava` é o mesmo do botão
+"Executa Banco" da UI, mas cada parâmetro abaixo é uma **suposição** até ser provado na
+homologação. Hoje todos são **fixos** em `DEFAULT_SERVER_SQL_ACTION`
+(`apps/api/src/services/server-sql-executor.ts`): a `mutation-factory` ainda **não** passa um
+`action`, e não existe `.env` para sobrescrevê-los. Se algum valor divergir da base real, é
+preciso ligar `serverSql.action` na factory (a partir de novas chaves `.env`) — é uma pendência
+de código, não só de configuração.
+
+| Parâmetro               | Valor assumido                             | Como confirmar na homologação                                                                                |
+| ----------------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `actionID`              | `98`                                       | capturar a chamada real do botão "Executa Banco" (DevTools / log do gateway) e ler o `actionID`              |
+| entidade de controle    | `AD_MANIPULADADOS`                         | confirmar que a entidade existe e qual instância/tela o botão 98 usa                                         |
+| campo do bloco          | `TEXTO` (CLOB)                             | confirmar o nome e o tipo da coluna que a ação lê como script                                                |
+| campo-chave             | `ID`                                       | confirmar o nome da PK da entidade de controle                                                               |
+| `refreshType`           | `NONE`                                     | confirmar que a ação aceita `NONE` (a UI pode mandar outro valor)                                            |
+| forma de `rows`/`field` | `{ row: [{ field: [{ fieldName, $ }] }] }` | confirmar que a ação 98 lê o `TEXTO` do **registro apontado pela PK** e não de um parâmetro próprio do corpo |
+| módulo                  | `mge`                                      | confirmar o módulo do serviço (a ação pode viver em outro módulo)                                            |
+
+Enquanto esses valores não forem capturados de uma chamada real, a execução server-side
+**não pode ser declarada comprovada** — ver "Onde foi provado / pendências".
+
+### Procedimento para validar a integração real (homologação)
+
+1. Capturar uma chamada real do botão "Executa Banco" na UI da homologação e preencher a
+   tabela acima; se algum valor divergir dos fixos em `DEFAULT_SERVER_SQL_ACTION`, ligar
+   `serverSql.action` na `mutation-factory` (pendência de código — hoje não há `.env` para isso).
+2. Garantir a autorização do usuário de integração para os três serviços da rota
+   (`DatasetSP.save`, `ActionButtonsSP.executeJava` ação 98, `DatasetSP.removeRecords`) —
+   ver `docs/homologation.md`, seção "Não autorizado".
+3. Com `SERVER_SQL_ENABLED=true` **apenas** na homologação, rodar um DDL inócuo (criar e
+   derrubar uma `AD_*` de teste) pelo ciclo prévia → confirmar.
+4. Conferir no log do gateway que só `save`/`executeJava`/`removeRecords` foram chamados,
+   que o `cleanup` resultou em `DELETED`, e que a auditoria registrou `route: SERVER_SQL`
+   com `simulated: false`.
+5. Confirmar no banco que o objeto foi realmente criado/derrubado (a rota reporta
+   `EXECUTED` como **não verificado** — a prova final é a consulta ao dicionário/catálogo).
+
 ## Proteções (nenhuma foi removida)
 
 Ordem de verificação, tudo fail-closed:
