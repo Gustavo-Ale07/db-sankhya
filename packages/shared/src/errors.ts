@@ -57,6 +57,10 @@ export const ERROR_HTTP_STATUS = {
   /** The object a server-side statement changes could not be determined — fail closed, do not
    * fall back to the control record (policy must be decided on the real target). */
   SERVER_SQL_TARGET_UNKNOWN: 400,
+  /** The statement shares the server-side route but is outside the scope allowed for this
+   * environment in the current rollout phase (e.g. only UPDATE is in scope against PRODUCTION in
+   * phase 1); refused at preparation AND execution, before anything is dispatched. */
+  SERVER_SQL_OUT_OF_SCOPE: 403,
   /** The statement text closes every available q-quote delimiter and cannot be wrapped safely. */
   SERVER_SQL_UNWRAPPABLE: 400,
   /** The server-side action ran but the routine reported failure (envelope status not "1"). */

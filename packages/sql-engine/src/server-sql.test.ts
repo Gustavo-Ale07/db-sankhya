@@ -2,12 +2,14 @@ import { describe, expect, it } from 'vitest';
 import { AppError } from '@dbx/shared';
 import {
   assertServerSqlAllowed,
+  assertServerSqlEnvironmentScope,
   classifyServerSql,
   serverSqlTarget,
   serverSqlWhere,
   serverSqlSources,
   wrapServerSql,
   SERVER_SQL_CATEGORIES,
+  SERVER_SQL_PRODUCTION_VERBS,
   type ServerSqlGate,
 } from './server-sql';
 
@@ -60,6 +62,61 @@ describe('assertServerSqlAllowed', () => {
     expect(() =>
       assertServerSqlAllowed({ ...ON, productionOptIn: true, safeMode: false }, 'PRODUCTION'),
     ).not.toThrow();
+  });
+});
+
+describe('assertServerSqlEnvironmentScope (phase-1 production scope)', () => {
+  // These statements all share the server-side route but are NOT in the phase-1 production scope.
+  const outOfScope = [
+    'DELETE FROM TGFCAB WHERE NUNOTA = 1',
+    'DROP TABLE AD_X',
+    'TRUNCATE TABLE AD_X',
+    'CREATE TABLE AD_X (A NUMBER)',
+    'ALTER TABLE AD_X ADD (NOME VARCHAR2(10))',
+    'MERGE INTO TGFCAB t USING TMP s ON (t.ID = s.ID) WHEN MATCHED THEN UPDATE SET t.V = s.V',
+    'INSERT INTO TGFCAB (NUNOTA) VALUES (1)',
+    'INSERT INTO TGFCAB (NUNOTA) SELECT NUNOTA FROM TMP',
+    'GRANT SELECT ON TGFCAB TO SOMEUSER',
+    'BEGIN NULL; END;',
+  ];
+
+  it('never restricts HOMOLOGATION or SANDBOX (full category set still gated elsewhere)', () => {
+    for (const env of ['HOMOLOGATION', 'SANDBOX'] as const) {
+      for (const sql of ['UPDATE TGFCAB SET V = 1 WHERE NUNOTA = 1', ...outOfScope]) {
+        expect(() => assertServerSqlEnvironmentScope(sql, env), `${env}: ${sql}`).not.toThrow();
+      }
+    }
+  });
+
+  it('allows an UPDATE against PRODUCTION, including subquery / expression UPDATEs', () => {
+    for (const sql of [
+      'UPDATE TGFCAB SET V = 1 WHERE NUNOTA = 1',
+      'UPDATE TGFCAB SET V = V + 1 WHERE NUNOTA = 1',
+      'UPDATE TGFCAB SET V = (SELECT MAX(X) FROM TMP) WHERE NUNOTA IN (SELECT NUNOTA FROM TMP)',
+      '  update tgfcab set v = 1 where nunota = 1  ',
+    ]) {
+      expect(() => assertServerSqlEnvironmentScope(sql, 'PRODUCTION'), sql).not.toThrow();
+    }
+  });
+
+  it('refuses every non-UPDATE statement against PRODUCTION with SERVER_SQL_OUT_OF_SCOPE', () => {
+    for (const sql of outOfScope) {
+      expect(codeOf(() => assertServerSqlEnvironmentScope(sql, 'PRODUCTION')), sql).toBe(
+        'SERVER_SQL_OUT_OF_SCOPE',
+      );
+    }
+  });
+
+  it('fails closed on an unreadable leading verb (q-quote / no keyword) against PRODUCTION', () => {
+    for (const sql of ["q'[UPDATE X SET Y=1]'", '', '-- just a comment', "'a string'"]) {
+      expect(codeOf(() => assertServerSqlEnvironmentScope(sql, 'PRODUCTION')), sql).toBe(
+        'SERVER_SQL_OUT_OF_SCOPE',
+      );
+    }
+  });
+
+  it('SERVER_SQL_PRODUCTION_VERBS is exactly {UPDATE} in phase 1', () => {
+    expect([...SERVER_SQL_PRODUCTION_VERBS].sort()).toEqual(['UPDATE']);
   });
 });
 

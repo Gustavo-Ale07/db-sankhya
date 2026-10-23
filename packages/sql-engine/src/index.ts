@@ -31,12 +31,14 @@ export type {
 export { classifyStatement } from './classify';
 export {
   assertServerSqlAllowed,
+  assertServerSqlEnvironmentScope,
   classifyServerSql,
   serverSqlTarget,
   serverSqlWhere,
   serverSqlSources,
   wrapServerSql,
   SERVER_SQL_CATEGORIES,
+  SERVER_SQL_PRODUCTION_VERBS,
 } from './server-sql';
 export type { ServerSqlCategory, ServerSqlClassification, ServerSqlGate } from './server-sql';
 export { splitCreateAs, splitHybrid } from './hybrid';

@@ -185,6 +185,47 @@ export function assertServerSqlAllowed(gate: ServerSqlGate, environment: ServerE
   }
 }
 
+/**
+ * The leading statement verbs the server-side ("Executa Banco") route may run against PRODUCTION in
+ * the current rollout phase. Phase 1 is UPDATE only — including an UPDATE with a subquery or an
+ * expression the gateway cannot run directly. Every other statement that shares this route and its
+ * SERVER.* permission (a generic DELETE, any DDL, MERGE, INSERT / INSERT…SELECT, DCL, a PL/SQL
+ * block) stays OUT OF SCOPE in production until a later phase opens it explicitly. Widening the
+ * phase means adding a verb here together with its own review — never by relaxing the gate below.
+ */
+export const SERVER_SQL_PRODUCTION_VERBS: ReadonlySet<string> = new Set(['UPDATE']);
+
+/**
+ * PRODUCTION phase-scope gate for the server-side route, enforced in ADDITION to the SERVER.*
+ * permission, the policy engine and `assertServerSqlAllowed`. In PRODUCTION only a statement whose
+ * leading verb is in {@link SERVER_SQL_PRODUCTION_VERBS} (phase 1: UPDATE) may run; anything else is
+ * refused with `SERVER_SQL_OUT_OF_SCOPE` BEFORE it is dispatched. HOMOLOGATION / SANDBOX are not
+ * restricted here (the switches, RBAC and policy still apply) — the gate is specifically about what
+ * the first production rollout may touch, not about weakening the other controls.
+ *
+ * Fail closed and verb-based, so it cannot be bypassed by a mis-classification (it does not trust
+ * the caller's category) nor by a `;`-smuggled second statement (the leading verb is still read
+ * from the real tokenizer, and a q-quote that could desync that tokenizer makes the statement
+ * out of scope). It is called at BOTH preparation (so no production plan is ever created for an
+ * out-of-scope statement) and execution (so a direct executor / API call cannot run one either).
+ */
+export function assertServerSqlEnvironmentScope(
+  sql: string,
+  environment: ServerEnvironment,
+): void {
+  if (environment !== 'PRODUCTION') return;
+  // A q-quote desyncs the ansi tokenizer, so the leading verb cannot be fully trusted → fail closed
+  // (out of scope). Phase-1 UPDATEs do not need a q-quote; one can be rephrased without it.
+  const verb = containsQuoteLiteral(sql) ? undefined : leadingWord(sql);
+  if (verb === undefined || !SERVER_SQL_PRODUCTION_VERBS.has(verb)) {
+    throw new AppError(
+      'SERVER_SQL_OUT_OF_SCOPE',
+      'Only an UPDATE may run on the server-side route against PRODUCTION in this phase; this statement is out of scope.',
+      { environment, phase: 'phase-1-update-only', ...(verb ? { verb } : {}) },
+    );
+  }
+}
+
 /** Raw DML/DELETE: run through EXECUTE IMMEDIATE so Oracle executes exactly one statement. */
 const DIRECT_DML = new Set<ServerSqlCategory>(['DELETE', 'DML_RAW']);
 /** DDL/DCL: not valid as a direct block statement, so also run through EXECUTE IMMEDIATE. */
