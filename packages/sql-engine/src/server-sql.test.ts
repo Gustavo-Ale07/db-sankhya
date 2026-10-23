@@ -300,6 +300,10 @@ describe('serverSqlTarget', () => {
   it('fails closed on an Oracle q-quote literal (ansi tokenizer cannot parse it)', () => {
     expect(serverSqlTarget("UPDATE tgfpar SET obs = q'[it's]' WHERE id = 1")).toBeNull();
     expect(serverSqlTarget("DELETE FROM tgfpar WHERE name = nq'{x}'")).toBeNull();
+    // A q-quote preceded by a quoted identifier that contains an apostrophe must still be detected:
+    // the raw scanner skips "…" the way the tokenizer does, so the inner ' cannot desync it and mask
+    // the q-quote (old scanner would treat the ' inside "a'b" as a string start and miss q'[x]').
+    expect(serverSqlTarget("UPDATE \"a'b\" SET n = q'[x]' WHERE id = 1")).toBeNull();
     // A q' only inside an ordinary escaped string is not a q-quote; the target still resolves.
     expect(serverSqlTarget("UPDATE tgfpar SET obs = 'a q'' b' WHERE id = 1")).toBe('TGFPAR');
   });
@@ -354,6 +358,11 @@ describe('serverSqlWhere', () => {
       present: false,
     });
     expect(serverSqlWhere("UPDATE A SET N = q'[x]' WHERE ID = 1")).toEqual({
+      required: true,
+      present: false,
+    });
+    // A quoted identifier containing an apostrophe cannot mask the q-quote → still WHERE-absent.
+    expect(serverSqlWhere("DELETE FROM \"a'b\" WHERE ID = q'[x]'")).toEqual({
       required: true,
       present: false,
     });
@@ -466,9 +475,38 @@ describe('serverSqlSources', () => {
     expect(
       serverSqlSources("DELETE FROM OK WHERE NAME = q'[x]' AND ID IN (SELECT ID FROM SECRET)"),
     ).toBeNull();
+    // A quoted identifier with an apostrophe cannot desync the scanner and hide the q-quote.
+    expect(
+      serverSqlSources("DELETE FROM \"o'k\" WHERE ID IN (SELECT ID FROM SECRET) AND N = q'[x]'"),
+    ).toBeNull();
     // A q' sequence that only appears inside an ordinary string is NOT a q-quote and is fine.
     expect(serverSqlSources("DELETE FROM OK WHERE NAME = 'a q'' b' AND ID = 1")).toEqual(
       new Set(['OK']),
     );
+  });
+
+  it('fails closed on an unterminated string/identifier the tokenizer would read differently', () => {
+    expect(
+      serverSqlSources("INSERT INTO OK SELECT * FROM SECRET WHERE N = 'unterminated"),
+    ).toBeNull();
+    expect(serverSqlSources('INSERT INTO OK SELECT * FROM SECRET WHERE "c = 1')).toBeNull();
+  });
+
+  it('fails closed on an old-style comma sibling after an ANSI join clause', () => {
+    // `JOIN B ON a=b, SECRET` is (A JOIN B) CROSS JOIN SECRET: the comma sibling is reached through no
+    // FROM/JOIN keyword, so the walk must fail closed rather than silently skip SECRET's read policy.
+    expect(
+      serverSqlSources('INSERT INTO OK SELECT * FROM A JOIN B ON A.ID = B.ID, SECRET'),
+    ).toBeNull();
+    expect(serverSqlSources('INSERT INTO OK SELECT * FROM A JOIN B USING (ID), SECRET')).toBeNull();
+    // A clean ANSI join with no trailing comma sibling is still enumerated normally.
+    expect(
+      serverSqlSources('INSERT INTO OK SELECT * FROM A JOIN B ON A.ID = B.ID WHERE A.N = 1'),
+    ).toEqual(new Set(['A', 'B']));
+    expect(
+      serverSqlSources(
+        'INSERT INTO OK SELECT * FROM A JOIN B ON A.ID = B.ID LEFT JOIN C ON B.ID = C.ID',
+      ),
+    ).toEqual(new Set(['A', 'B', 'C']));
   });
 });

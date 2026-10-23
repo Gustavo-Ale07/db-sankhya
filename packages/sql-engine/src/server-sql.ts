@@ -27,15 +27,20 @@ const IDENT_CHAR = /[A-Za-z0-9_$#]/u;
  * ordinary `'…'` strings and desyncs for the rest of the statement, so a q-quote could hide a `;`, a
  * top-level WHERE or a source table from the analyzers below. Rather than trust a desynced token
  * stream, every analyzer fails closed when this returns true (single-statement, target, WHERE and
- * sources). Scans the RAW text, skipping ordinary single-quoted strings (with `''` escape) and
- * `--` / block comments, so a `q'` sequence that merely appears inside an ordinary string or comment
- * does not count. PL/SQL (which legitimately uses q-quotes) never reaches these analyzers.
+ * sources). Scans the RAW text, skipping strings and quoted identifiers EXACTLY as the ansi
+ * tokenizer lexes them — ordinary / national strings `'…'` (with `''` escape) and quoted identifiers
+ * `"…"` / `[…]` (closing quote doubled to escape) — plus `--` / block comments, so (a) a `q'` that
+ * merely appears inside one of those does not count, and (b) an apostrophe inside a quoted identifier
+ * (`"a'b"`) cannot desync this scanner's string state from the tokenizer's and let a real q-quote slip
+ * past. An unterminated string or quoted identifier (lexers may then disagree where it ends) also
+ * returns true → fail closed. PL/SQL (which legitimately uses q-quotes) never reaches these analyzers.
  */
 function containsQuoteLiteral(sql: string): boolean {
   for (let i = 0; i < sql.length; i++) {
     const c = sql[i];
     if (c === "'") {
-      // ordinary string literal: skip to the closing quote, treating '' as an escaped quote
+      // ordinary / national string literal (N'…' reaches here at its quote): skip to the closing
+      // quote, treating '' as an escaped quote. An unterminated string → fail closed.
       i += 1;
       while (i < sql.length) {
         if (sql[i] === "'") {
@@ -44,6 +49,22 @@ function containsQuoteLiteral(sql: string): boolean {
         }
         i += 1;
       }
+      if (i >= sql.length) return true;
+      continue;
+    }
+    if (c === '"' || c === '[') {
+      // quoted identifier, as the ansi tokenizer lexes it: "…" closes on `"` (doubled to escape),
+      // […] closes on `]` (doubled to escape). An unterminated identifier → fail closed.
+      const close = c === '[' ? ']' : '"';
+      i += 1;
+      while (i < sql.length) {
+        if (sql[i] === close) {
+          if (sql[i + 1] === close) i += 1;
+          else break;
+        }
+        i += 1;
+      }
+      if (i >= sql.length) return true;
       continue;
     }
     if (c === '-' && sql[i + 1] === '-') {
@@ -515,13 +536,32 @@ export function serverSqlSources(sql: string): Set<string> | null {
         continue;
       }
       const end = sig[k];
-      if (
-        end === undefined ||
-        isSym(k, ')') ||
-        isSym(k, ';') ||
-        end.type === 'semicolon' ||
-        (end.type === 'word' && FROM_LIST_TERMINATORS.has(end.text.toUpperCase()))
-      ) {
+      if (end === undefined || isSym(k, ')') || isSym(k, ';') || end.type === 'semicolon') {
+        break;
+      }
+      if (end.type === 'word' && FROM_LIST_TERMINATORS.has(end.text.toUpperCase())) {
+        const kw = end.text.toUpperCase();
+        // An ANSI join condition (`ON <expr>`) or join column list (`USING (<cols>)`) does NOT end
+        // the FROM list: an old-style comma sibling can still follow it (`FROM A JOIN B ON a=b,
+        // SECRET` / `FROM A JOIN B USING (x), SECRET`). That sibling is not reached through any
+        // FROM/JOIN keyword, so the outer walk would never visit it and it would escape read-policy.
+        // Scan the join clause at top level (paren-balanced); a depth-0 comma before the clause ends
+        // means such a sibling exists → fail closed.
+        if (kw === 'ON' || kw === 'USING') {
+          let d = 0;
+          for (let j = k + 1; j < sig.length; j++) {
+            const tj = sig[j] as Token;
+            if (tj.type === 'symbol' && tj.text === '(') d += 1;
+            else if (tj.type === 'symbol' && tj.text === ')') {
+              if (d === 0) break; // closing paren of an enclosing subquery → FROM list ends here
+              d -= 1;
+            } else if (d === 0) {
+              if (tj.type === 'symbol' && tj.text === ',') return null; // sibling after a join
+              if (tj.type === 'semicolon') break;
+              if (tj.type === 'word' && FROM_LIST_TERMINATORS.has(tj.text.toUpperCase())) break;
+            }
+          }
+        }
         break;
       }
       return null;

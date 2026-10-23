@@ -114,7 +114,10 @@ Ordem de verificação, tudo fail-closed:
    fonte não pode ser determinada com segurança: função de tabela `TABLE(f())`, dblink
    `tabela@link`, ou **qualquer modificador de referência que não parseamos** (`SAMPLE`,
    `AS OF`, `VERSIONS`) — estes nunca são consumidos como alias, para não pular uma irmã
-   `, SECRET` à frente. Além disso, **ler da entidade de controle** (`AD_MANIPULADADOS`) é
+   `, SECRET` à frente. Também falha fechado numa **irmã vírgula ao estilo antigo após um join
+   ANSI** (`FROM A JOIN B ON a=b, SECRET` / `FROM A JOIN B USING (x), SECRET`): essa irmã não é
+   alcançada por nenhum `FROM`/`JOIN`, então a enumeração recusa em vez de pular a política de
+   leitura dela. Além disso, **ler da entidade de controle** (`AD_MANIPULADADOS`) é
    recusado como alvo (`FORBIDDEN { entity }`). **Resíduos documentados:** (a) a checagem é por
    **tabela** (nível de objeto); regras de leitura por **coluna** nas fontes não são aplicadas
    aqui; (b) uma tabela lida **indiretamente por uma função** (`WHERE c = ALGUMA_FN()`) não é
@@ -126,9 +129,12 @@ Ordem de verificação, tudo fail-closed:
    entende q-quote; um `q'[…]'` dessincroniza a leitura e poderia esconder um `WHERE`, uma
    fonte ou o alvo. Por isso `serverSqlTarget`/`serverSqlWhere`/`serverSqlSources` **falham
    fechado** diante de um q-quote (alvo/fonte → `SERVER_SQL_TARGET_UNKNOWN`; `WHERE` →
-   tratado como ausente). Isso é na camada de **autorização** — o disparo em si (`dynamicWrap`,
-   `EXECUTE IMMEDIATE q'X…X'`) já garante execução de exatamente um statement mesmo com
-   diferença de lexer, então q-quote não é vetor de statement-smuggling. PL/SQL (que usa
+   tratado como ausente). O detector varre o texto cru pulando strings `'…'` **e identificadores
+   com aspas** `"…"`/`[…]` exatamente como o tokenizer ANSI os lê, para que uma aspa dentro de
+   `"a'b"` não dessincronize o detector e deixe o q-quote passar; uma string ou identificador
+   **não terminado** também falha fechado. Isso é na camada de **autorização** — o disparo em si
+   (`dynamicWrap`, `EXECUTE IMMEDIATE q'X…X'`) já garante execução de exatamente um statement
+   mesmo com diferença de lexer, então q-quote não é vetor de statement-smuggling. PL/SQL (que usa
    q-quote legitimamente) não passa por essas análises.
 9. **Confirmação forte** quando a política/ambiente exigem — decidida no servidor, nunca
    inventada só no front.
