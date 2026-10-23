@@ -8,7 +8,8 @@
     "build": "node scripts/build.mjs",
     "start": "node dist/server.mjs",
     "typecheck": "tsc -p tsconfig.json",
-    "admin": "tsx --env-file-if-exists=../../.env src/cli/admin.ts"
+    "admin": "tsx --env-file-if-exists=../../.env src/cli/admin.ts",
+    "probe-server-sql": "tsx --env-file-if-exists=../../.env src/cli/probe-server-sql.ts"
   },
   "dependencies": {
     "@electric-sql/pglite": "0.5.10",

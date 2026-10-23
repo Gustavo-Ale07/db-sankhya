@@ -104,6 +104,13 @@ Enquanto esses valores não forem capturados de uma chamada real, a execução s
 
 ### Procedimento para validar a integração real (homologação)
 
+0. **Verificação read-only** (não escreve nada, não imprime credenciais): rodar
+   `pnpm --filter @dbx/api probe-server-sql [--connection <id|nome>] [--entity AD_MANIPULADADOS]`.
+   Usa `DbExplorerSP.executeQuery` (já autorizado) para confirmar que a entidade de controle
+   existe e tem as colunas `ID` e `TEXTO`, e quantas linhas tem. É só um `SELECT` (trava recusa
+   qualquer statement que não seja um `SELECT`/`WITH` único). **Não** confirma o contrato da ação
+   98 — isso continua dependendo do passo 1. Opcional: `--action-sql "<SELECT que você confie>"`
+   para inspecionar o binding da ação se souber onde o ERP o guarda.
 1. Capturar uma chamada real do botão "Executa Banco" na UI da homologação e preencher a
    tabela acima; se algum valor divergir dos fixos em `DEFAULT_SERVER_SQL_ACTION`, ligar
    `serverSql.action` na `mutation-factory` (pendência de código — hoje não há `.env` para isso).
