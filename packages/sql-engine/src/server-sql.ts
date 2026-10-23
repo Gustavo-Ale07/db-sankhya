@@ -444,6 +444,58 @@ const FROM_LIST_TERMINATORS = new Set([
  */
 const TABLE_REF_MODIFIERS = new Set(['SAMPLE', 'VERSIONS', 'OF']);
 
+/**
+ * REAL query-clause boundaries: once one of these appears at the top level, this query block's FROM
+ * list is finished and NO further comma-separated table reference can follow it, so the source walk
+ * may stop. This is a deliberately NARROW subset of FROM_LIST_TERMINATORS — the end-of-item check
+ * fails CLOSED on every other terminator (PIVOT / UNPIVOT / APPLY / LATERAL / MODEL / flashback
+ * modifiers) rather than assuming no sibling follows a construct we do not parse.
+ */
+const FROM_LIST_CLAUSE_END = new Set([
+  'WHERE',
+  'GROUP',
+  'HAVING',
+  'ORDER',
+  'CONNECT',
+  'START',
+  'RETURNING',
+  'SET',
+  'WHEN',
+  'FOR',
+  'INTO',
+  'UNION',
+  'INTERSECT',
+  'MINUS',
+  'EXCEPT',
+  'FETCH',
+  'OFFSET',
+]);
+
+/**
+ * Join keywords. A joined table follows and is reached by the outer walk at its `JOIN` keyword (and
+ * that join's own walk catches any comma sibling trailing its `ON`/`USING`), so the item may stop
+ * here — but we still scan the join area for a hidden old-style comma sibling and for constructs we
+ * cannot parse (see the end-of-item logic), which is why `CROSS`/`OUTER APPLY` still fails closed.
+ */
+const JOIN_KEYWORDS = new Set([
+  'JOIN',
+  'INNER',
+  'LEFT',
+  'RIGHT',
+  'FULL',
+  'CROSS',
+  'NATURAL',
+  'OUTER',
+]);
+
+/**
+ * Constructs that may appear in/after a join and whose grammar we do NOT parse. If one shows up while
+ * scanning a join area, `serverSqlSources` fails closed instead of risking a missed source: `APPLY`
+ * (CROSS/OUTER APPLY: a table function/subquery the outer walk does not re-trigger), `LATERAL`,
+ * `PIVOT`/`UNPIVOT`, `MODEL`, and `CASE` (whose `WHEN`/`THEN`/`ELSE`/`END` we do not track).
+ */
+const JOIN_READ_UNSAFE = new Set(['APPLY', 'LATERAL', 'PIVOT', 'UNPIVOT', 'MODEL']);
+
 /** Index just after the `)` matching the `(` at `open`, or -1 when the parens are unbalanced. */
 function skipParens(sig: Token[], open: number): number {
   let depth = 0;
@@ -536,34 +588,43 @@ export function serverSqlSources(sql: string): Set<string> | null {
         continue;
       }
       const end = sig[k];
-      if (end === undefined || isSym(k, ')') || isSym(k, ';') || end.type === 'semicolon') {
-        break;
-      }
-      if (end.type === 'word' && FROM_LIST_TERMINATORS.has(end.text.toUpperCase())) {
-        const kw = end.text.toUpperCase();
-        // An ANSI join condition (`ON <expr>`) or join column list (`USING (<cols>)`) does NOT end
-        // the FROM list: an old-style comma sibling can still follow it (`FROM A JOIN B ON a=b,
-        // SECRET` / `FROM A JOIN B USING (x), SECRET`). That sibling is not reached through any
-        // FROM/JOIN keyword, so the outer walk would never visit it and it would escape read-policy.
-        // Scan the join clause at top level (paren-balanced); a depth-0 comma before the clause ends
-        // means such a sibling exists → fail closed.
-        if (kw === 'ON' || kw === 'USING') {
-          let d = 0;
-          for (let j = k + 1; j < sig.length; j++) {
-            const tj = sig[j] as Token;
-            if (tj.type === 'symbol' && tj.text === '(') d += 1;
-            else if (tj.type === 'symbol' && tj.text === ')') {
-              if (d === 0) break; // closing paren of an enclosing subquery → FROM list ends here
-              d -= 1;
-            } else if (d === 0) {
-              if (tj.type === 'symbol' && tj.text === ',') return null; // sibling after a join
-              if (tj.type === 'semicolon') break;
-              if (tj.type === 'word' && FROM_LIST_TERMINATORS.has(tj.text.toUpperCase())) break;
+      if (end === undefined || isSym(k, ')') || isSym(k, ';') || end.type === 'semicolon') break;
+      if (end.type !== 'word') return null; // an unexpected symbol ends the item → fail closed
+      const kw = end.text.toUpperCase();
+      // A REAL query-clause boundary ends this block's FROM list: no comma sibling can follow, so the
+      // walk for this list is complete.
+      if (FROM_LIST_CLAUSE_END.has(kw)) break;
+      // A join clause (`ON <expr>` / `USING (<cols>)`) or a join keyword does NOT end the list: an
+      // old-style comma sibling can still trail it (`FROM A JOIN B ON a=b, SECRET`), reached through
+      // no FROM/JOIN keyword and otherwise invisible to this walk. Scan the join area at the top
+      // level (paren-balanced) and fail closed on anything that could hide a source:
+      //  - a depth-0 comma → an old-style sibling exists → null;
+      //  - CASE, or an APPLY/LATERAL/PIVOT/UNPIVOT/MODEL construct we cannot parse → null;
+      //  - a following `JOIN` or a real clause boundary → the area is accounted for; stop (the outer
+      //    walk re-enters at that `JOIN` and that join's own walk catches anything after it).
+      if (kw === 'ON' || kw === 'USING' || JOIN_KEYWORDS.has(kw)) {
+        let d = 0;
+        for (let j = k; j < sig.length; j++) {
+          const tj = sig[j] as Token;
+          if (tj.type === 'symbol' && tj.text === '(') d += 1;
+          else if (tj.type === 'symbol' && tj.text === ')') {
+            if (d === 0) break; // closing paren of an enclosing subquery → FROM list ends here
+            d -= 1;
+          } else if (d === 0) {
+            if (tj.type === 'symbol' && tj.text === ',') return null; // old-style sibling after a join
+            if (tj.type === 'semicolon') break;
+            if (tj.type === 'word') {
+              const w = tj.text.toUpperCase();
+              if (w === 'CASE' || JOIN_READ_UNSAFE.has(w)) return null;
+              if (w === 'JOIN' || FROM_LIST_CLAUSE_END.has(w)) break;
             }
           }
         }
         break;
       }
+      // Anything else (SAMPLE / AS OF / VERSIONS flashback, PIVOT / UNPIVOT / APPLY / LATERAL / MODEL
+      // as a table-ref suffix, an unrecognised modifier) means we cannot be sure every source was
+      // seen → fail closed.
       return null;
     }
   }

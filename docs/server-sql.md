@@ -114,10 +114,14 @@ Ordem de verificação, tudo fail-closed:
    fonte não pode ser determinada com segurança: função de tabela `TABLE(f())`, dblink
    `tabela@link`, ou **qualquer modificador de referência que não parseamos** (`SAMPLE`,
    `AS OF`, `VERSIONS`) — estes nunca são consumidos como alias, para não pular uma irmã
-   `, SECRET` à frente. Também falha fechado numa **irmã vírgula ao estilo antigo após um join
-   ANSI** (`FROM A JOIN B ON a=b, SECRET` / `FROM A JOIN B USING (x), SECRET`): essa irmã não é
-   alcançada por nenhum `FROM`/`JOIN`, então a enumeração recusa em vez de pular a política de
-   leitura dela. Além disso, **ler da entidade de controle** (`AD_MANIPULADADOS`) é
+   `, SECRET` à frente. O fim de um item de `FROM` só é aceito num **limite de cláusula real**
+   (lista restrita: `WHERE`, `GROUP`, `HAVING`, `ORDER`, `CONNECT`, `START`, operadores de conjunto,
+   `FETCH`, `OFFSET`, `RETURNING`, `SET`, `WHEN`, `FOR`, `INTO`) ou num join; **todo o resto falha
+   fechado por padrão**. Uma irmã vírgula ao estilo antigo após um join ANSI
+   (`FROM A JOIN B ON a=b, SECRET` / `USING (x), SECRET`) é recusada (essa irmã não é alcançada por
+   nenhum `FROM`/`JOIN`); e um `CASE` numa condição de join, ou qualquer `PIVOT`/`UNPIVOT`/`APPLY`/
+   `LATERAL`/`MODEL`, também falham fechado por não serem gramática que analisamos. Além disso,
+   **ler da entidade de controle** (`AD_MANIPULADADOS`) é
    recusado como alvo (`FORBIDDEN { entity }`). **Resíduos documentados:** (a) a checagem é por
    **tabela** (nível de objeto); regras de leitura por **coluna** nas fontes não são aplicadas
    aqui; (b) uma tabela lida **indiretamente por uma função** (`WHERE c = ALGUMA_FN()`) não é

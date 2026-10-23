@@ -509,4 +509,37 @@ describe('serverSqlSources', () => {
       ),
     ).toEqual(new Set(['A', 'B', 'C']));
   });
+
+  it('fails closed on a CASE in a join condition (WHEN/THEN/ELSE are not tracked)', () => {
+    // A CASE in the ON condition contains WHEN/THEN/ELSE; a naive scan would stop at WHEN and miss a
+    // trailing `, SECRET`. CASE in a join area therefore fails closed, with or without a sibling.
+    expect(
+      serverSqlSources(
+        'INSERT INTO OK SELECT * FROM A JOIN B ON CASE WHEN A.X = 1 THEN 1 ELSE 0 END = 1, SECRET',
+      ),
+    ).toBeNull();
+    expect(
+      serverSqlSources(
+        'INSERT INTO OK SELECT * FROM A JOIN B ON CASE WHEN A.X = 1 THEN 1 ELSE 0 END = 1 WHERE A.N = 1',
+      ),
+    ).toBeNull();
+  });
+
+  it('fails closed on PIVOT / UNPIVOT / APPLY / LATERAL / MODEL constructs it cannot parse', () => {
+    expect(
+      serverSqlSources('INSERT INTO OK SELECT * FROM A PIVOT (SUM(X) FOR Y IN (1)), SECRET'),
+    ).toBeNull();
+    expect(
+      serverSqlSources('INSERT INTO OK SELECT * FROM A UNPIVOT (X FOR Y IN (C)), SECRET'),
+    ).toBeNull();
+    expect(
+      serverSqlSources('INSERT INTO OK SELECT * FROM A CROSS APPLY TVF(A.ID), SECRET'),
+    ).toBeNull();
+    expect(
+      serverSqlSources('INSERT INTO OK SELECT * FROM A, LATERAL (SELECT 1 FROM SECRET)'),
+    ).toBeNull();
+    expect(
+      serverSqlSources('INSERT INTO OK SELECT * FROM A MODEL DIMENSION BY (X) MEASURES (Y)'),
+    ).toBeNull();
+  });
 });
