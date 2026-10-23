@@ -26,6 +26,15 @@ export const PERMISSIONS = [
   'SANKHYA.ACTION.INCLUIR_NOTA',
   'SANKHYA.ACTION.INCLUIR_ALTERAR_ITEM_NOTA',
   'SANKHYA.ACTION.EXCLUIR_ITEM_NOTA',
+  // Server-side ("Executa Banco") execution categories: the statements the gateway cannot run,
+  // dispatched through the client's server-side DBScript routine. Each is a write: it needs an
+  // explicit policy ALLOW, and it only runs behind the SERVER_SQL_ENABLED master switch and the
+  // environment gate (HOMOLOGATION / SANDBOX first). Held by SUPER_ADMIN only, by default.
+  'SERVER.DDL',
+  'SERVER.DELETE',
+  'SERVER.DML_RAW',
+  'SERVER.DCL',
+  'SERVER.PLSQL',
   'APPROVAL.DECIDE',
   'AUDIT.READ',
   'ADMIN.USERS',
@@ -34,6 +43,10 @@ export const PERMISSIONS = [
   'ADMIN.POLICIES',
   'ADMIN.CONNECTIONS',
   'ADMIN.SECURITY',
+  // Lets an account administer access policies despite holding write permissions: the one, explicit
+  // relaxation of separation of duties. Not an ADMIN.* (regular ADMIN must not hold it) and not a
+  // write (it is never policy-evaluated). Held by SUPER_ADMIN only.
+  'SECURITY.SEGREGATION_OVERRIDE',
 ] as const;
 
 export type Permission = (typeof PERMISSIONS)[number];
@@ -44,8 +57,11 @@ export function isPermission(value: string): value is Permission {
   return CATALOG.has(value);
 }
 
-export const SYSTEM_ROLES = ['VIEWER', 'OPERATOR', 'ADMIN'] as const;
+export const SYSTEM_ROLES = ['VIEWER', 'OPERATOR', 'ADMIN', 'SUPER_ADMIN'] as const;
 export type SystemRole = (typeof SYSTEM_ROLES)[number];
+
+/** Marks an account exempt from separation of duties (may administer policies while holding writes). */
+export const SEGREGATION_OVERRIDE: Permission = 'SECURITY.SEGREGATION_OVERRIDE';
 
 const TEMP: Permission[] = ['TEMP.CREATE', 'TEMP.WRITE', 'TEMP.DROP', 'TEMP.MATERIALIZE'];
 const VIEWER: Permission[] = ['QUERY.SELECT', ...TEMP];
@@ -70,10 +86,30 @@ const ADMIN: Permission[] = [
 ];
 
 /**
+ * Every command executed through the server-side ("Executa Banco") route. They are writes kept from
+ * policy administrators like the DATA.* / SANKHYA.* writes.
+ */
+const SERVER: Permission[] = [
+  'SERVER.DDL',
+  'SERVER.DELETE',
+  'SERVER.DML_RAW',
+  'SERVER.DCL',
+  'SERVER.PLSQL',
+];
+
+/**
+ * Super administrator: does every command (including the server-side route) AND administers access.
+ * It holds the whole catalog, SECURITY.SEGREGATION_OVERRIDE among it, so the separation-of-duties
+ * check lets it change policies despite holding writes. This is the one account the owner accepted
+ * as exempt; VIEWER / OPERATOR / ADMIN stay segregated.
+ */
+const SUPER_ADMIN: Permission[] = [...PERMISSIONS];
+
+/**
  * Separation of duties: an account holding any of these may not create, change or delete access
  * policy rules. Otherwise it could relax the rules (WHERE override, four-eyes, row caps) that
  * govern its own writes. The ADMIN role holds none of them. DATA.PREVIEW is not among them: it
- * writes nothing.
+ * writes nothing. SUPER_ADMIN holds them all but is exempted by SECURITY.SEGREGATION_OVERRIDE.
  */
 export const POLICY_ADMIN_CONFLICTS: readonly Permission[] = [
   'DATA.INSERT',
@@ -85,6 +121,7 @@ export const POLICY_ADMIN_CONFLICTS: readonly Permission[] = [
   'SANKHYA.ACTION.INCLUIR_NOTA',
   'SANKHYA.ACTION.INCLUIR_ALTERAR_ITEM_NOTA',
   'SANKHYA.ACTION.EXCLUIR_ITEM_NOTA',
+  ...SERVER,
 ];
 
 /** Permissions of the seeded system roles. The RBAC migration mirrors them; a test keeps both equal. */
@@ -92,6 +129,7 @@ export const SYSTEM_ROLE_PERMISSIONS: Readonly<Record<SystemRole, readonly Permi
   VIEWER,
   OPERATOR,
   ADMIN,
+  SUPER_ADMIN,
 };
 
 export type StatementKind =

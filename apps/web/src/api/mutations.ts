@@ -2,7 +2,8 @@ import { api } from './client';
 import type { Value } from './types';
 
 /** Exact preview labels of the API (honest labels: never combined into one string). */
-export type PreviewKind = 'SIMULATED_PREVIEW' | 'IMPACT_ANALYSIS' | 'TRANSACTIONAL_DRY_RUN';
+export type PreviewKind =
+  'SIMULATED_PREVIEW' | 'IMPACT_ANALYSIS' | 'TRANSACTIONAL_DRY_RUN' | 'SERVER_EXECUTION';
 export type VerificationLabel = 'VERIFIED' | 'PARTIALLY_VERIFIED' | 'UNVERIFIED' | 'FAILED';
 export type StepOutcome = 'ok' | 'error' | 'not_attempted' | 'unknown';
 
@@ -60,7 +61,8 @@ export interface PreparedPlan {
   expiresAt: string;
   /** Statement kind, computed by the server (SQL plans only; absent on business actions). */
   operation?: PlanOperation;
-  capability: { class: string; route: string; reason: string };
+  /** `action` is the SERVER.<CAT> permission on a direct-execution (SERVER_SQL) plan; absent otherwise. */
+  capability: { class: string; route: string; reason: string; action?: string };
   previewKind: PreviewKind;
   previewLabels: PreviewKind[];
   preview: {

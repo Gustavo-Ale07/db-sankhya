@@ -1,0 +1,158 @@
+# Rota de execução direta (SERVER_SQL / "Executa Banco")
+
+Esta rota permite que comandos que o Gateway REST da Sankhya **não** sabe executar
+(DDL, `DELETE` genérico, DML cru, DCL e blocos PL/SQL) passem pelo mesmo ciclo das
+demais alterações — prévia → confirmação → execução → verificação → auditoria —
+disparados pela rotina server-side do próprio cliente Sankhya (DBScript), em vez de
+pelos serviços REST.
+
+> **Estado:** desligada por padrão (`SERVER_SQL_ENABLED=false`), só em HOMOLOGAÇÃO/SANDBOX.
+> A integração está implementada e coberta por testes de integração **com mocks**. A
+> execução real contra a base de homologação é uma pendência explícita (ver o fim deste
+> documento): **mock não é prova de execução real**.
+
+## Por que existe
+
+O Gateway cobre apenas formas específicas de escrita: `SELECT` (via `executeQuery`),
+`INSERT ... VALUES` de uma linha e `UPDATE`/`DELETE` simples (via `DatasetSP.save`).
+Tudo o que foge disso — criar/alterar/derrubar tabela, `DELETE` sem a forma suportada,
+`MERGE`, `INSERT ... SELECT`, `UPDATE` com subconsulta/expressão, `GRANT`/`REVOKE`,
+blocos `BEGIN ... END` — não tem serviço REST. Essa rota preenche essa lacuna **sem**
+afrouxar nenhuma proteção: o comando segue preso aos mesmos switches, RBAC, política,
+confirmação, leitura de verificação e auditoria.
+
+## Mapa de roteamento
+
+A classificação decide, por statement, por onde a alteração passa:
+
+| Forma do comando                                           | Rota           | Serviço Sankhya                               |
+| ---------------------------------------------------------- | -------------- | --------------------------------------------- |
+| `SELECT`                                                   | leitura        | `DbExplorerSP.executeQuery`                   |
+| `INSERT ... VALUES` (uma linha), `UPDATE`/`DELETE` simples | gateway        | `DatasetSP.save`                              |
+| Qualquer coisa sobre `tmp_*`                               | scratch        | PGlite (dry run transacional)                 |
+| DDL / `DELETE` genérico / DML cru / DCL / PL/SQL           | **SERVER_SQL** | `ActionButtonsSP.executeJava` (ação DBScript) |
+
+Quando `SERVER_SQL_ENABLED=false`, a última linha **não** se aplica: o statement cai
+nos caminhos existentes e `parseWrite` recusa o que o gateway não sabe salvar
+(`SQL_UNSUPPORTED`/`SQL_PARSE_ERROR`). Nenhuma prévia é criada e nada é gravado.
+
+## Categorias (`SERVER.*`)
+
+Cada statement elegível recebe uma categoria, que é a permissão exigida:
+
+| Categoria | Permissão        | Cobre                                                            |
+| --------- | ---------------- | ---------------------------------------------------------------- |
+| `DDL`     | `SERVER.DDL`     | `CREATE` / `ALTER` / `DROP` / `TRUNCATE` / `RENAME` / `COMMENT`  |
+| `DELETE`  | `SERVER.DELETE`  | `DELETE` genérico (sem serviço de gateway documentado)           |
+| `DML_RAW` | `SERVER.DML_RAW` | `MERGE`, `INSERT ... SELECT`, `UPDATE` com subconsulta/expressão |
+| `DCL`     | `SERVER.DCL`     | `GRANT` / `REVOKE`                                               |
+| `PLSQL`   | `SERVER.PLSQL`   | bloco anônimo (`BEGIN`/`DECLARE`) ou chamada de procedure        |
+
+Um payload com mais de um statement é recusado (`SERVER_SQL_UNSUPPORTED`): assim a
+categoria — e a permissão e a decisão de política ligadas a ela — nunca são confundidas
+por um `; DROP TABLE ...` escondido atrás de um `DELETE`. PL/SQL é exceção (um bloco
+legitimamente tem vários comandos, e `SERVER.PLSQL` já autoriza um bloco arbitrário).
+
+## Contrato do DBScript (`ActionButtonsSP.executeJava`)
+
+- **CONFIRMADO pela documentação/contrato do cliente:** a ação de botão com
+  `actionID = 98` executa Java; o bloco PL/SQL vai no campo `TEXTO` de um registro de uma
+  entidade `AD_*`; DDL é executada de dentro do bloco via `EXECUTE IMMEDIATE`.
+- **COMO esta ferramenta usa:** cria um registro **dedicado** na entidade de controle
+  (`AD_MANIPULADADOS` por padrão, configurável), grava o bloco em `TEXTO`, dispara a ação
+  `98` apontando para a PK desse registro e, no fim, **apaga** o registro de controle.
+  Nunca sobrescreve um registro existente (ex.: o ID 46 da consultoria): o registro é
+  criado e controlado por esta ferramenta e removido ao final.
+- **PENDENTE de confirmação na base real:** que `AD_MANIPULADADOS` exista na homologação
+  com o campo `TEXTO`, que a ação `98` esteja publicada e que o usuário de integração
+  tenha permissão de `save`/`executeJava`/`removeRecords`. Isso só se prova executando na
+  homologação (ver pendências).
+
+### Ciclo de disparo (`ServerSqlExecutor.dispatch`)
+
+1. `save` do registro de controle (sem PK) → extrai o `ID` gerado. Se a resposta não trouxer
+   o id, lança `SANKHYA_BAD_RESPONSE` e **a ação não é disparada**.
+2. `executeJava` com `actionId: 98`, a entidade de controle e a PK do passo 1.
+3. `removeRecords` do registro de controle (limpeza), em melhor esforço: sucesso →
+   `cleanup: DELETED`; falha → `cleanup: ORPHANED` + `cleanupError` (o id fica registrado
+   para limpeza manual, mas a alteração já ocorreu).
+
+O resultado é `EXECUTED` quando a ação volta com `status === '1'`, senão `FAILED`.
+
+## Proteções (nenhuma foi removida)
+
+Ordem de verificação, tudo fail-closed:
+
+1. **Switch mestre** `SERVER_SQL_ENABLED` (padrão `false`) → `SERVER_SQL_DISABLED`.
+2. `GLOBAL_WRITE_ENABLED` e `WRITE_TO_SANKHYA` → `READ_ONLY_MODE` (mesmos switches gerais).
+3. **Ambiente:** só HOMOLOGAÇÃO/SANDBOX. PRODUÇÃO exige opt-in separado
+   (`SERVER_SQL_PRODUCTION_OPT_IN`) **e** `SAFE_MODE` desligado; caso contrário
+   `SERVER_SQL_PRODUCTION_BLOCKED`.
+4. **RBAC:** a permissão `SERVER.<categoria>` precisa estar concedida, senão `FORBIDDEN`.
+5. **Política:** decisão com ALLOW obrigatório (deny-wins) sobre o **objeto real** do comando;
+   sem ALLOW, `FORBIDDEN`. O objeto é extraído com o tokenizer real (strings, comentários e
+   identificadores entre aspas ou qualificados por schema tratados). Se o objeto de um
+   DDL/`DELETE`/DML cru/DCL **não puder ser determinado com segurança** (ex.: `ALTER SESSION`,
+   `CREATE VIEW`/`SYNONYM`/`TRIGGER`, que referenciam outros objetos), o comando é recusado
+   (`SERVER_SQL_TARGET_UNKNOWN`) em vez de cair no registro de controle — a política nunca é
+   decidida sobre `AD_MANIPULADADOS` no lugar da tabela real. PL/SQL é a exceção: não tem alvo
+   único e já é autorizado como bloco arbitrário por `SERVER.PLSQL`.
+6. **Confirmação forte** quando a política/ambiente exigem — decidida no servidor, nunca
+   inventada só no front.
+7. `UPDATE`/`DELETE` sem `WHERE` → `WHERE_REQUIRED` (salvo override explícito de política).
+
+Papéis: `LEITOR` = só `SELECT`; `OPERADOR` = `SELECT` + `INSERT` + `UPDATE`; `ADMIN` = tudo
+
+- administração via `SUPER_ADMIN` (a segregação de deveres foi preservada criando
+  `SUPER_ADMIN`, em vez de afrouxá-la para o ADMIN comum — ver `security.md`).
+
+## Interface (sem citar a rota)
+
+- Rótulo de prévia neutro **EXECUÇÃO DIRETA** (`SERVER_EXECUTION`); nunca "servidor",
+  "Executa Banco" nem `AD_MANIPULADADOS`.
+- Não há diff de linha simulado: o alvo é só um objeto. O diálogo mostra uma frase honesta
+  por categoria ("Este comando altera a estrutura do banco e será aplicado diretamente.",
+  "...remove registros...", etc.) e avisa que **não há prévia simulada** — o comando é
+  aplicado como está e o resultado é conferido em seguida.
+- Botão azul **"Confirmar alteração"** (o padrão), nunca um "executar" genérico.
+- A linha de impacto (objeto/entidade, ambiente) é mantida.
+
+## Auditoria (honesta)
+
+A auditoria registra o SQL real, a rota (`route: SERVER_SQL`), a categoria
+(`serverCategory`), o id do registro de controle, o resultado da limpeza (`cleanup`) e o
+campo **`simulated`** — `true` quando a execução correu contra o gateway mock (uma
+simulação) e `false` contra uma base real. Isso garante que um resultado de teste nunca
+possa ser lido, depois, como uma alteração real. A rota nunca é disfarçada de gateway.
+
+## Verificação por categoria
+
+A rota direta não tem read-back de linha como `UPDATE`/`DELETE` de gateway; um passo
+`EXECUTED` fica como `UNVERIFIED` (ok, sem conferência de valor) e um `FAILED` fica como
+`FAILED`. A verificação honesta por categoria (ex.: reconsultar a estrutura após um DDL,
+contar linhas após um `DELETE`) é uma pendência de refinamento documentada aqui.
+
+## Configuração
+
+| Variável                       | Padrão  | Efeito                                                         |
+| ------------------------------ | ------- | -------------------------------------------------------------- |
+| `SERVER_SQL_ENABLED`           | `false` | Liga/desliga a rota inteira (switch mestre).                   |
+| `SERVER_SQL_PRODUCTION_OPT_IN` | `false` | Opt-in separado para PRODUÇÃO (ainda exige `SAFE_MODE=false`). |
+
+## Onde foi provado / pendências
+
+- **Provado em mock:** prepare por categoria, gate de permissão/política/ambiente,
+  `WHERE` obrigatório, e o ciclo de execução (`EXECUTED`/`FAILED`/`ORPHANED`/
+  `SANKHYA_BAD_RESPONSE`/`READ_ONLY_MODE`) via um `ServerSqlClient` falso injetado — a
+  orquestração real do `MutationService` roda, só a borda do gateway é falsa. Ver
+  `apps/api/src/services/mutations.int.test.ts`,
+  `apps/api/src/services/server-sql-executor.test.ts`,
+  `packages/sql-engine/src/server-sql.test.ts` e os testes web de `MutationDialog`.
+- **NÃO verificado (pendência) — execução real na base de homologação.** Bloqueado por:
+  (1) autorização de deploy na VPS; (2) liberação de escrita/`executeJava`/`removeRecords`
+  para o usuário de integração no admin da Sankhya (a mesma credencial hoje recebe "Não
+  autorizado" em `DatasetSP.save`); (3) confirmar `AD_MANIPULADADOS`/campo `TEXTO`/ação
+  `98` publicados na homologação. **Como verificar:** com `SERVER_SQL_ENABLED=true` só na
+  homologação, rodar um DDL inócuo (ex.: criar e derrubar uma tabela `AD_*` de teste) e
+  conferir no log do gateway que só os serviços `save`/`executeJava`/`removeRecords`
+  esperados foram chamados, com a limpeza resultando em `DELETED`.

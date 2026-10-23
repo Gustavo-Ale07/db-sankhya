@@ -48,6 +48,19 @@ export const ERROR_HTTP_STATUS = {
   SANKHYA_NOT_CONFIGURED: 503,
   SANKHYA_TIMEOUT: 504,
   WRITE_OUTCOME_UNKNOWN: 502,
+  /** The server-side ("Executa Banco") path is off (SERVER_SQL_ENABLED) — fail closed. */
+  SERVER_SQL_DISABLED: 403,
+  /** The server-side path may not run against PRODUCTION (no opt-in, or SAFE_MODE on). */
+  SERVER_SQL_PRODUCTION_BLOCKED: 403,
+  /** The statement has no server-side route (e.g. a SELECT). */
+  SERVER_SQL_UNSUPPORTED: 400,
+  /** The object a server-side statement changes could not be determined — fail closed, do not
+   * fall back to the control record (policy must be decided on the real target). */
+  SERVER_SQL_TARGET_UNKNOWN: 400,
+  /** The statement text closes every available q-quote delimiter and cannot be wrapped safely. */
+  SERVER_SQL_UNWRAPPABLE: 400,
+  /** The server-side action ran but the routine reported failure (envelope status not "1"). */
+  SERVER_SQL_FAILED: 502,
   INTERNAL_ERROR: 500,
 } as const satisfies Record<string, number>;
 

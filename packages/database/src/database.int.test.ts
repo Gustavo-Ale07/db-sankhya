@@ -24,7 +24,7 @@ describe('database', () => {
     await expect(handle.ping()).resolves.toBeUndefined();
   });
 
-  it('seeds DATA.PREVIEW on ADMIN and OPERATOR only, and re-running the seed is harmless', async () => {
+  it('seeds DATA.PREVIEW on ADMIN, OPERATOR and SUPER_ADMIN, and re-running the seed is harmless', async () => {
     const holders = async () =>
       (
         await handle.db
@@ -35,10 +35,11 @@ describe('database', () => {
       )
         .map((r) => r.key)
         .sort();
-    expect(await holders()).toEqual(['ADMIN', 'OPERATOR']);
+    // SUPER_ADMIN holds the whole catalog, DATA.PREVIEW among it (0013).
+    expect(await holders()).toEqual(['ADMIN', 'OPERATOR', 'SUPER_ADMIN']);
     const seed = readFileSync(join(defaultMigrationsDir(), '0012_data_preview.sql'), 'utf8');
     await handle.db.execute(sql.raw(seed));
-    expect(await holders()).toEqual(['ADMIN', 'OPERATOR']);
+    expect(await holders()).toEqual(['ADMIN', 'OPERATOR', 'SUPER_ADMIN']);
   });
 
   it('enforces unique lower-case e-mails', async () => {
@@ -59,7 +60,7 @@ describe('database', () => {
 
   it('seeds the system roles and validates role keys', async () => {
     const seeded = await handle.db.select().from(roles);
-    expect(seeded.map((r) => r.key).sort()).toEqual(['ADMIN', 'OPERATOR', 'VIEWER']);
+    expect(seeded.map((r) => r.key).sort()).toEqual(['ADMIN', 'OPERATOR', 'SUPER_ADMIN', 'VIEWER']);
     expect(seeded.every((r) => r.system)).toBe(true);
     const admin = seeded.find((r) => r.key === 'ADMIN')!;
     const perms = await handle.db
@@ -68,6 +69,17 @@ describe('database', () => {
       .where(eq(rolePermissions.roleId, admin.id));
     expect(perms.map((p) => p.permission)).toContain('ADMIN.USERS');
     expect(perms.map((p) => p.permission)).not.toContain('DATA.UPDATE');
+    // ADMIN stays segregated: no server-side permission and no override.
+    expect(perms.map((p) => p.permission)).not.toContain('SERVER.DDL');
+    expect(perms.map((p) => p.permission)).not.toContain('SECURITY.SEGREGATION_OVERRIDE');
+    const superAdmin = seeded.find((r) => r.key === 'SUPER_ADMIN')!;
+    const superPerms = await handle.db
+      .select()
+      .from(rolePermissions)
+      .where(eq(rolePermissions.roleId, superAdmin.id));
+    expect(superPerms.map((p) => p.permission)).toEqual(
+      expect.arrayContaining(['SERVER.DDL', 'DATA.DELETE', 'SECURITY.SEGREGATION_OVERRIDE']),
+    );
     await expect(handle.db.insert(roles).values({ key: 'lower', name: 'Bad' })).rejects.toThrow();
   });
 

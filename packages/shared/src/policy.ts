@@ -205,6 +205,12 @@ export const POLICY_ACTION_CLASS: Readonly<Record<Permission, 'write' | 'permiss
     'SANKHYA.ACTION.INCLUIR_NOTA': 'write',
     'SANKHYA.ACTION.INCLUIR_ALTERAR_ITEM_NOTA': 'write',
     'SANKHYA.ACTION.EXCLUIR_ITEM_NOTA': 'write',
+    // Server-side route: each needs an explicit ALLOW (per user × entity × environment).
+    'SERVER.DDL': 'write',
+    'SERVER.DELETE': 'write',
+    'SERVER.DML_RAW': 'write',
+    'SERVER.DCL': 'write',
+    'SERVER.PLSQL': 'write',
     'APPROVAL.DECIDE': 'permission-only',
     'AUDIT.READ': 'permission-only',
     'ADMIN.USERS': 'permission-only',
@@ -213,6 +219,8 @@ export const POLICY_ACTION_CLASS: Readonly<Record<Permission, 'write' | 'permiss
     'ADMIN.POLICIES': 'permission-only',
     'ADMIN.CONNECTIONS': 'permission-only',
     'ADMIN.SECURITY': 'permission-only',
+    // A marker, never policy-evaluated (like ADMIN.*): it only relaxes separation of duties.
+    'SECURITY.SEGREGATION_OVERRIDE': 'permission-only',
   });
 
 /** Writes need an explicit ALLOW rule. An unknown action counts as a write (fail closed). */

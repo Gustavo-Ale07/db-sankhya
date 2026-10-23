@@ -328,6 +328,11 @@ describe('policies: separation of duties', () => {
     'SANKHYA.ACTION.INCLUIR_NOTA',
     'SANKHYA.ACTION.INCLUIR_ALTERAR_ITEM_NOTA',
     'SANKHYA.ACTION.EXCLUIR_ITEM_NOTA',
+    'SERVER.DDL',
+    'SERVER.DELETE',
+    'SERVER.DML_RAW',
+    'SERVER.DCL',
+    'SERVER.PLSQL',
   ] as const)('refuses a policy change by an ADMIN that also holds %s', async (permission) => {
     const h = await setup();
     const actor = await h.userWithRoles(['ADMIN'], [permission]);
@@ -342,6 +347,33 @@ describe('policies: separation of duties', () => {
       conflicting: [permission],
     });
     expect(await h.app.services.policies.list()).toEqual([]);
+  });
+
+  it('lets an account carrying SECURITY.SEGREGATION_OVERRIDE change policies despite holding writes', async () => {
+    const h = await setup();
+    // Everything a SUPER_ADMIN carries at once: policy administration, write permissions that
+    // would otherwise conflict, and the explicit override that lifts the separation of duties.
+    const sudo = await h.userWithRoles(
+      ['ADMIN'],
+      ['DATA.INSERT', 'SERVER.DDL', 'SECURITY.SEGREGATION_OVERRIDE'],
+    );
+    const created = await h.call(sudo.cookie, {
+      method: 'POST',
+      url: '/api/admin/policies',
+      payload: POLICY,
+    });
+    expect(created.statusCode, created.body).toBe(201);
+    const id = created.json().item.id as string;
+    for (const opts of policyChanges(id).slice(1)) {
+      const res = await h.call(sudo.cookie, opts);
+      expect(res.statusCode, `${opts.method} ${opts.url} ${res.body}`).toBe(200);
+    }
+    // The override lifts only separation of duties; the changes still land as real policy edits.
+    for (const action of ['policy.create', 'policy.update', 'policy.delete']) {
+      const rows = await h.auditRows(action);
+      expect(rows, action).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ status: 'success', userId: sudo.id });
+    }
   });
 
   it('lets a plain ADMIN change policies, and still refuses them granting themselves OPERATOR', async () => {

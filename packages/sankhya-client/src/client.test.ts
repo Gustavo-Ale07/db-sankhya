@@ -265,6 +265,92 @@ describe('SankhyaClient', () => {
     expect(transport.send).not.toHaveBeenCalled();
   });
 
+  it('executeJava sends the DBScript action envelope and returns the raw status', async () => {
+    const { client, requests } = setup(() =>
+      ok({ feedback: 'ok' }, { transactionId: 'TXE', status: '1' }),
+    );
+    const out = await client.executeJava({
+      actionId: '98',
+      entityName: 'AD_MANIPULADADOS',
+      pk: { ID: 999 },
+    });
+    expect(requests[0]).toEqual({
+      module: 'mge',
+      serviceName: 'ActionButtonsSP.executeJava',
+      requestBody: {
+        javaCall: {
+          actionID: '98',
+          entityName: 'AD_MANIPULADADOS',
+          refreshType: 'NONE',
+          rows: { row: [{ field: [{ fieldName: 'ID', $: '999' }] }] },
+        },
+      },
+    });
+    expect(out.status).toBe('1');
+    expect(out.transactionId).toBe('TXE');
+    expect(out.responseBody).toEqual({ feedback: 'ok' });
+  });
+
+  it('executeJava honours the module override', async () => {
+    const { client, requests } = setup(() => ok({}));
+    await client.executeJava({ module: 'mgecom', actionId: '5', entityName: 'E', pk: { ID: 1 } });
+    expect(requests[0]?.module).toBe('mgecom');
+  });
+
+  it('executeJava is never retried on an ambiguous outcome (sent exactly once)', async () => {
+    // A 5xx is retryable for idempotent calls; a server-side action is not idempotent.
+    const { client, requests } = setup(() => status(503));
+    const err = await errorOf(
+      client.executeJava({ actionId: '98', entityName: 'AD_MANIPULADADOS', pk: { ID: 1 } }),
+    );
+    expect(err.code).toBe('WRITE_OUTCOME_UNKNOWN');
+    expect(requests).toHaveLength(1);
+  });
+
+  it('executeJava surfaces "Não autorizado" as a 200 auth error (maps to WRITE_NOT_AUTHORIZED)', async () => {
+    const { client, requests } = setup(() =>
+      status(200, {
+        serviceName: 'ActionButtonsSP.executeJava',
+        status: '0',
+        statusMessage: 'Não autorizado',
+      }),
+    );
+    const err = await errorOf(
+      client.executeJava({ actionId: '98', entityName: 'AD_MANIPULADADOS', pk: { ID: 1 } }),
+    );
+    expect(err.code).toBe('SANKHYA_AUTH_ERROR');
+    expect(err.details?.httpStatus).toBe(200);
+    expect(requests).toHaveLength(1);
+  });
+
+  it('removeRecords sends the delete-by-pk envelope and returns the raw status', async () => {
+    const { client, requests } = setup(() => ok({}, { status: '1', transactionId: 'TXR' }));
+    const out = await client.removeRecords({
+      entityName: 'AD_MANIPULADADOS',
+      pks: [{ ID: '777' }],
+    });
+    expect(requests[0]).toEqual({
+      module: 'mge',
+      serviceName: 'DatasetSP.removeRecords',
+      requestBody: {
+        entityName: 'AD_MANIPULADADOS',
+        standAlone: false,
+        pks: [{ ID: '777' }],
+      },
+    });
+    expect(out.status).toBe('1');
+    expect(out.transactionId).toBe('TXR');
+  });
+
+  it('removeRecords is sent exactly once on an ambiguous outcome (it is a write)', async () => {
+    const { client, requests } = setup(() => status(503));
+    const err = await errorOf(
+      client.removeRecords({ entityName: 'AD_MANIPULADADOS', pks: [{ ID: '1' }] }),
+    );
+    expect(err.code).toBe('WRITE_OUTCOME_UNKNOWN');
+    expect(requests).toHaveLength(1);
+  });
+
   it('uses the module in the URL', async () => {
     const urls: string[] = [];
     const fetch = ((url: string | URL) => {

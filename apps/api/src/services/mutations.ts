@@ -27,12 +27,22 @@
  */
 import { AppError, SNAPSHOT_MAX_ROWS, isAppError } from '@dbx/shared';
 import type { Environment, ErrorCode, Permission, PolicyColumn, PolicyDecision } from '@dbx/shared';
-import { classifyStatement, isTrivialWhere, resolveCapability } from '@dbx/sql-engine';
+import {
+  assertServerSqlAllowed,
+  classifyServerSql,
+  classifyStatement,
+  isTrivialWhere,
+  resolveCapability,
+  serverSqlTarget,
+  wrapServerSql,
+} from '@dbx/sql-engine';
 import type {
   Capability,
+  CapabilityAction,
   Classified,
   Expr,
   InsertStatement,
+  ServerSqlCategory,
   UpdateStatement,
   Value,
 } from '@dbx/sql-engine';
@@ -55,6 +65,8 @@ import type { ConsumedPlan, PlanRow, PlansService } from './plans';
 import { strongConfirmationPhrase, targetsHashOf } from './plans';
 import type { PolicyService } from './policy';
 import { executeRead } from './read-executor';
+import { ServerSqlExecutor } from './server-sql-executor';
+import type { ServerSqlActionConfig, ServerSqlDispatch } from './server-sql-executor';
 import {
   SCRATCH_CONNECTION_ID,
   SCRATCH_ENVIRONMENT,
@@ -88,7 +100,16 @@ import type { ExecutionReport, ExecutionStep, VerifyResult } from './verificatio
 
 export type { ExecutionReport, ExecutionStep } from './verification';
 
-export type PreviewKind = 'SIMULATED_PREVIEW' | 'IMPACT_ANALYSIS' | 'TRANSACTIONAL_DRY_RUN';
+export type PreviewKind =
+  | 'SIMULATED_PREVIEW'
+  | 'IMPACT_ANALYSIS'
+  | 'TRANSACTIONAL_DRY_RUN'
+  /**
+   * The server-side ("Executa Banco") route cannot simulate or dry-run an arbitrary DDL/DELETE/DCL
+   * statement: the change is applied for real and then verified. The honest label says so — it is
+   * never shown as a simulated or impact preview.
+   */
+  | 'SERVER_EXECUTION';
 
 export type RecordValues = Record<string, Value>;
 
@@ -211,6 +232,12 @@ export interface MutationDeps {
   scratchMaxReadRows?: number;
   /** BUSINESS_ACTIONS_ENABLED: action ids allowed on live connections (none when absent). */
   businessActionsEnabled?: readonly string[];
+  /**
+   * SERVER_SQL_ENABLED (and the separate PRODUCTION opt-in): the server-side ("Executa Banco")
+   * route. Absent or `enabled: false` means the route is off — `prepare` never diverts to it and
+   * `execute` fails a server-side plan closed with SERVER_SQL_DISABLED.
+   */
+  serverSql?: { enabled: boolean; productionOptIn: boolean; action?: ServerSqlActionConfig };
   /** Errors that cannot reach the audit (only ids and codes are logged, never values). */
   logger?: { error(obj: Record<string, unknown>, msg: string): void };
 }
@@ -230,6 +257,20 @@ const PERMISSION: Record<WriteClassified['kind'], Permission> = {
   UPDATE: 'DATA.UPDATE',
   DELETE: 'DATA.DELETE',
 };
+
+/** A runnable server-side category (never UNSUPPORTED). */
+type ServerCategory = Exclude<ServerSqlCategory, 'UNSUPPORTED'>;
+
+const SERVER_PERMISSION: Record<ServerCategory, CapabilityAction> = {
+  DDL: 'SERVER.DDL',
+  DELETE: 'SERVER.DELETE',
+  DML_RAW: 'SERVER.DML_RAW',
+  DCL: 'SERVER.DCL',
+  PLSQL: 'SERVER.PLSQL',
+};
+
+/** Custom-table prefix: custom (AD_*) DDL is a generated artifact, not a server-side execution. */
+const CUSTOM_TABLE = /^AD_/i;
 
 const SCRATCH_TABLE = /^tmp_/i;
 const IDENT = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
@@ -308,6 +349,25 @@ interface ActionResolution {
   targets: PreviewTarget[];
 }
 
+/**
+ * AUTHORIZE → PREVIEW of a server-side ("Executa Banco") statement, at prepare and again at
+ * execute. The statement is the one the gateway cannot run (DDL, generic DELETE, raw DML, DCL or a
+ * PL/SQL block): it is wrapped once here and dispatched through the client's server-side action.
+ */
+interface ServerSqlResolution {
+  category: ServerCategory;
+  permission: CapabilityAction;
+  environment: Environment;
+  capability: Capability;
+  decision: PolicyDecision;
+  /** The BEGIN/END block actually sent to the server-side action (never shown to the user). */
+  block: string;
+  /** One honest target: the object the statement acts on. No before/after is simulated. */
+  targets: PreviewTarget[];
+  /** Display/audit object name (the best-effort target, else the control record). */
+  entity: string;
+}
+
 const invalidPlan = (message: string) => new AppError('CONFIRMATION_INVALID', message);
 
 /**
@@ -355,6 +415,29 @@ export class MutationService {
           ...(d.copies.length > 0
             ? { sankhyaParts: d.copies, sourceConnectionId: ctx.connectionId }
             : {}),
+        });
+      }
+
+      // The gateway cannot run this statement (native DDL, a generic DELETE, raw DML, DCL or a
+      // PL/SQL block): route it through the client's server-side ("Executa Banco") action, but
+      // only when that path is switched on. When it is off, the statement falls through to the
+      // existing paths unchanged (parseWrite refuses what the gateway cannot save).
+      const serverCat = this.deps.serverSql?.enabled ? serverSqlEligible(classified, sql) : null;
+      if (serverCat) {
+        const sv = await this.resolveServerSql(auth, ctx.connectionId, sql, serverCat, (e) => {
+          environment = e;
+        });
+        return await this.finishPlan(ctx, {
+          operation: serverCat,
+          permission: sv.permission,
+          environment: sv.environment,
+          connectionId: ctx.connectionId,
+          capability: sv.capability,
+          decision: sv.decision,
+          targets: sv.targets,
+          entity: sv.entity,
+          previewKind: 'SERVER_EXECUTION',
+          previewLabels: ['SERVER_EXECUTION'],
         });
       }
 
@@ -638,6 +721,135 @@ export class MutationService {
       previewKind,
       previewLabels,
     };
+  }
+
+  /**
+   * AUTHORIZE → PLAN → PREVIEW of a server-side ("Executa Banco") statement. Used by `prepare`,
+   * and again by `execute` with fresh grants and rules, so both see exactly the same checks.
+   *
+   * The category's SERVER.* permission is required, then the connection is authorized as a read to
+   * resolve the environment, then the master switch and environment gate are enforced fail-closed
+   * (SERVER_SQL_DISABLED → READ_ONLY_MODE → SERVER_SQL_PRODUCTION_BLOCKED). The statement is
+   * wrapped once (an unwrappable or multi-statement text is a VALIDATE refusal), and the policy
+   * engine must ALLOW the category on the target entity and the control record. A generic
+   * UPDATE/DELETE without a WHERE is refused unless the engine applied a WHERE override, exactly as
+   * for a gateway write. No before/after is simulated: the single preview target is the object the
+   * statement acts on; the real result is confirmed only after the run (see `runServerSql`).
+   */
+  private async resolveServerSql(
+    auth: AuthState,
+    connectionId: string,
+    sql: string,
+    category: ServerCategory,
+    onEnvironment?: (environment: Environment) => void,
+  ): Promise<ServerSqlResolution> {
+    const permission = SERVER_PERMISSION[category];
+    if (!auth.grants.permissions.has(permission)) {
+      throw refuse(
+        'AUTHORIZE',
+        new AppError('FORBIDDEN', 'You do not have permission for this action', { permission }),
+      );
+    }
+    const { policies, connections } = this.deps;
+    const defaults = { maxReadRows: this.deps.maxReadRows };
+    const groupIds = await this.deps.authz.activeGroupIds(auth.user.id);
+    const access = await authorizeConnection({
+      policies,
+      auth,
+      groupIds,
+      action: 'QUERY.SELECT',
+      connectionId,
+      connections,
+    });
+    if (!access.ok) throw refuse('AUTHORIZE', connectionDenied(), { reasons: access.reasons });
+    const environment = access.environment;
+    onEnvironment?.(environment);
+
+    // The master switch and the environment gate, fail-closed. Enforced at prepare so a plan is
+    // never created for a route that is off, and independently again at execute (assertSwitches).
+    try {
+      assertServerSqlAllowed(
+        {
+          serverSqlEnabled: this.deps.serverSql?.enabled ?? false,
+          globalWriteEnabled: true,
+          writeToSankhya: true,
+          safeMode: this.deps.switches.safeMode,
+          productionOptIn: this.deps.serverSql?.productionOptIn ?? false,
+        },
+        environment,
+      );
+    } catch (e) {
+      throw refuse('AUTHORIZE', e as AppError);
+    }
+
+    // Wrap once, here: an unwrappable or smuggled multi-statement text is refused before any
+    // policy decision names an entity.
+    let block: string;
+    try {
+      block = wrapServerSql(sql, category);
+    } catch (e) {
+      throw refuse('VALIDATE', e as AppError);
+    }
+
+    // The object the statement acts on: the parser's table when it carries one (INSERT / UPDATE /
+    // DELETE / native DDL on a real table), else parsed from the statement with the real tokenizer
+    // (quoted and schema-qualified identifiers handled).
+    const classified = classifyStatement(sql);
+    const extracted =
+      'table' in classified && typeof (classified as { table?: unknown }).table === 'string'
+        ? (classified as { table: string }).table.toUpperCase()
+        : serverSqlTarget(sql);
+    // Fail closed: a DDL/DELETE/DML_RAW/DCL whose target cannot be pinned down must NOT fall back
+    // to the control record — policy would then be decided on AD_MANIPULADADOS, not the real
+    // target, authorizing a change against an unparsed table. PL/SQL has no single target by
+    // design and is authorized as an arbitrary block (SERVER.PLSQL), so it resolves to the
+    // control record alone (also its display and audit name).
+    if (extracted === null && category !== 'PLSQL') {
+      throw refuse(
+        'VALIDATE',
+        new AppError(
+          'SERVER_SQL_TARGET_UNKNOWN',
+          'The object this statement changes could not be determined, so it cannot be authorized. Rewrite it so the target object is explicit.',
+        ),
+      );
+    }
+    const control = (this.deps.serverSql?.action?.entityName ?? 'AD_MANIPULADADOS').toUpperCase();
+    const entity = extracted ?? control;
+    const entities = extracted ? [extracted, control] : [control];
+    const needsWhere = classified.kind === 'UPDATE' || classified.kind === 'DELETE';
+    const hasWhere = needsWhere ? classified.hasWhere : true;
+
+    const decision = await evaluateFor({
+      policies,
+      auth,
+      groupIds,
+      action: permission,
+      environment,
+      connectionId,
+      entities,
+      hasWhere,
+      defaults,
+    });
+    if (decision.effect !== 'ALLOW') {
+      throw refuse('AUTHORIZE', new AppError('FORBIDDEN', 'The change was denied by policy'), {
+        reasons: decision.reasons,
+        matchedRuleIds: decision.matchedRuleIds,
+        policyVersion: decision.policyVersion,
+      });
+    }
+    if (needsWhere && !hasWhere && !overrideApplies(decision)) {
+      throw refuse('VALIDATE', whereRequired(classified.kind), { reasons: decision.reasons });
+    }
+
+    const capability: Capability = {
+      class: 'SUPPORTED',
+      route: 'SERVER_SQL',
+      reason: `Server-side ${category} executed through the "Executa Banco" action.`,
+      action: permission,
+      actions: [permission],
+    };
+    const targets: PreviewTarget[] = [{ key: { OBJECT: entity }, before: null, after: {} }];
+    return { category, permission, environment, capability, decision, block, targets, entity };
   }
 
   /** IMPACT: persists the immutable plan, audits it and shapes the response. */
@@ -1526,14 +1738,18 @@ export class MutationService {
     // ---------------------------------------------------------------- RE-AUTHORIZE
     let write: WriteClassified | undefined;
     let ddl: DdlClassified | null = null;
+    let serverCat: ServerCategory | null = null;
     // Holds ephemeral Sankhya copies until the run ends (dropped on every path).
     let ddlResolution: ScratchDdlResolution | undefined;
+    // The real server-side dispatch result, kept for the audit (route, control record, cleanup).
+    let serverDispatch: ServerSqlDispatch | undefined;
     let operation: string;
     let resolved:
       | { sankhya: SankhyaResolution }
       | { scratch: ScratchResolution }
       | { scratchDdl: ScratchDdlResolution }
-      | { action: ActionResolution };
+      | { action: ActionResolution }
+      | { serverSql: ServerSqlResolution };
     let decision: PolicyDecision;
     let targets: PreviewTarget[];
     let entity: string;
@@ -1552,6 +1768,15 @@ export class MutationService {
         if (ddl) {
           lctx.capability = DDL_PERMISSION[ddl.kind];
           operation = ddl.kind;
+        } else if (isServerSqlPlan(plan)) {
+          // A server-side plan is re-derived from its statement, never trusted from the switch:
+          // if it is no longer eligible, the plan is invalid.
+          serverCat = serverSqlEligible(classified, plan.sql);
+          if (!serverCat) {
+            throw refuse('RE-AUTHORIZE', invalidPlan('The plan no longer matches its statement.'));
+          }
+          lctx.capability = SERVER_PERMISSION[serverCat];
+          operation = serverCat;
         } else {
           write = parseWrite(classified);
           lctx.capability = scratch ? 'TEMP.WRITE' : PERMISSION[write.kind];
@@ -1594,6 +1819,15 @@ export class MutationService {
         decision = s.decision;
         targets = s.targets;
         entity = s.entity;
+      } else if (serverCat) {
+        const sv = await this.resolveServerSql(fresh, plan.connectionId, plan.sql, serverCat);
+        if (sv.environment !== plan.environment) {
+          throw refuse('RE-AUTHORIZE', invalidPlan('The connection changed after the preview.'));
+        }
+        resolved = { serverSql: sv };
+        decision = sv.decision;
+        targets = sv.targets;
+        entity = sv.entity;
       } else {
         const r = await this.resolveSankhya(fresh, plan.connectionId, write!, 'execute');
         if (r.environment !== plan.environment) {
@@ -1611,7 +1845,9 @@ export class MutationService {
             ? resolved.action.capability
             : 'scratchDdl' in resolved
               ? resolved.scratchDdl.capability
-              : resolved.scratch.capability;
+              : 'serverSql' in resolved
+                ? resolved.serverSql.capability
+                : resolved.scratch.capability;
       if (canonical(capability) !== canonical(plan.capability)) {
         throw refuse('RE-AUTHORIZE', invalidPlan('The capability changed after the preview.'));
       }
@@ -1677,7 +1913,11 @@ export class MutationService {
               ? await this.runScratchDdl(resolved.scratchDdl).finally(() =>
                   this.dropCopies(resolved.scratchDdl),
                 )
-              : await this.runScratch(resolved.scratch);
+              : 'serverSql' in resolved
+                ? await this.runServerSql(plan, resolved.serverSql, guard, (d) => {
+                    serverDispatch = d;
+                  })
+                : await this.runScratch(resolved.scratch);
     } catch (err) {
       // Nothing was sent (the runtime could not be built, for example): a failed execution.
       await this.deps.audit.recordPlanExecuted(lctx, {
@@ -1693,7 +1933,7 @@ export class MutationService {
       throw err;
     }
 
-    if (!scratch) {
+    if (!scratch && !('serverSql' in resolved)) {
       // The child rows of an action belong to their own table: checked against it.
       const child = 'action' in resolved ? resolved.action.childTable : undefined;
       steps = child
@@ -1734,6 +1974,27 @@ export class MutationService {
           report: reportForAudit(report, {
             snapshots: decision.limits.auditSnapshots !== false,
           }),
+          // The audit tells the truth about the route: a server-side ("Executa Banco") run is
+          // recorded as such, with its control record and whether that record was cleaned up,
+          // and is never disguised as a gateway write.
+          ...('serverSql' in resolved
+            ? {
+                route: 'SERVER_SQL',
+                serverCategory: resolved.serverSql.category,
+                ...(serverDispatch
+                  ? {
+                      // Whether this ran against the mock gateway (a simulation) or a real base:
+                      // recorded so a test run can never be read, later, as a real change.
+                      simulated: serverDispatch.simulated,
+                      recordId: serverDispatch.recordId,
+                      cleanup: serverDispatch.cleanup,
+                      ...(serverDispatch.cleanupError
+                        ? { cleanupError: serverDispatch.cleanupError }
+                        : {}),
+                    }
+                  : {}),
+              }
+            : {}),
         },
         before: attempted.flatMap((t) => (t.before ? [t.before] : [])),
         after: attempted.map((t) => t.after),
@@ -2009,6 +2270,49 @@ export class MutationService {
   }
 
   /**
+   * The one server-side ("Executa Banco") dispatch for a plan, guarded like a save and never
+   * retried. The real result is read from the routine's envelope: EXECUTED is reported `ok` but
+   * UNVERIFIED (`verified` left undefined) because the route cannot independently read an
+   * arbitrary DDL/DCL/DML change back; a reported FAILED is an `error` (SERVER_SQL_FAILED); and
+   * anything indefinite is `unknown` (WRITE_OUTCOME_UNKNOWN), so a run is never shown as done when
+   * it could not be confirmed. The dispatch is handed back for the audit via `onDispatch`.
+   */
+  private async runServerSql(
+    plan: PlanRow,
+    r: ServerSqlResolution,
+    guard: () => Promise<AppError | null>,
+    onDispatch?: (d: ServerSqlDispatch) => void,
+  ): Promise<ExecutionStep[]> {
+    const key = r.targets[0]!.key;
+    const stop = await guard();
+    if (stop) return [{ key, outcome: 'not_attempted', errorCode: stop.code }];
+    const runtime = await this.deps.connections.getRuntime(plan.connectionId);
+    const executor = new ServerSqlExecutor({
+      client: runtime.client,
+      ...(this.deps.serverSql?.action ? { config: this.deps.serverSql.action } : {}),
+      ...(this.deps.logger ? { logger: this.deps.logger } : {}),
+    });
+    try {
+      const dispatch = await executor.dispatch({
+        category: r.category,
+        sql: plan.sql,
+        block: r.block,
+        simulated: runtime.mode === 'mock',
+      });
+      onDispatch?.(dispatch);
+      if (dispatch.status === 'FAILED') {
+        return [{ key, outcome: 'error', errorCode: 'SERVER_SQL_FAILED', verified: false }];
+      }
+      return [{ key, outcome: 'ok' }];
+    } catch (err) {
+      const code = stepErrorCode(err);
+      return [
+        { key, outcome: code === 'WRITE_OUTCOME_UNKNOWN' ? 'unknown' : 'error', errorCode: code },
+      ];
+    }
+  }
+
+  /**
    * The row values a caller may see in the report: only the written columns the current policy
    * still lets them read (QUERY.SELECT, checked per column right after the read-back). A column
    * that is not readable, or any failure of the check, leaves its values out (fail closed). The
@@ -2118,6 +2422,24 @@ export class MutationService {
     if (scratch) return;
     if (!this.deps.switches.writeToSankhya) throw off('WRITE_TO_SANKHYA');
     if (plan.environment === 'PRODUCTION' && this.deps.switches.safeMode) throw off('SAFE_MODE');
+    // A server-side ("Executa Banco") plan has its own master switch and environment gate, checked
+    // again here right before the run, independently of the one at RE-AUTHORIZE: fail closed.
+    if (isServerSqlPlan(plan)) {
+      try {
+        assertServerSqlAllowed(
+          {
+            serverSqlEnabled: this.deps.serverSql?.enabled ?? false,
+            globalWriteEnabled: true,
+            writeToSankhya: true,
+            safeMode: this.deps.switches.safeMode,
+            productionOptIn: this.deps.serverSql?.productionOptIn ?? false,
+          },
+          plan.environment,
+        );
+      } catch (e) {
+        throw refuse('EXECUTE', e as AppError);
+      }
+    }
   }
 
   /** The consume refused the request: `write.denied` with stage CONFIRM. */
@@ -2232,6 +2554,48 @@ function scratchDdlOf(c: Classified): DdlClassified | null {
     SCRATCH_TABLE.test(c.table)
     ? c
     : null;
+}
+
+/** A persisted plan is a server-side ("Executa Banco") plan when its frozen route says so. */
+function isServerSqlPlan(plan: { capability: unknown }): boolean {
+  const cap = plan.capability;
+  return (
+    typeof cap === 'object' && cap !== null && (cap as { route?: unknown }).route === 'SERVER_SQL'
+  );
+}
+
+/** A runnable server-side category, or null when UNSUPPORTED. */
+function serverCategoryOf(sql: string): ServerCategory | null {
+  const category = classifyServerSql(sql).category;
+  return category === 'UNSUPPORTED' ? null : category;
+}
+
+/**
+ * Which statements the gateway cannot run and so route server-side, and which stay on their
+ * existing path. SELECT never routes; a scratch (`tmp_`) write or DDL stays local; a gateway-
+ * savable INSERT/UPDATE shape (`stmt` present) stays on the save service; custom (`AD_*`) DDL
+ * stays a generated artifact. Everything else — a generic DELETE, a raw/expression DML shape, a
+ * native DDL, a DCL or PL/SQL statement — is eligible for the server-side route.
+ */
+function serverSqlEligible(c: Classified, sql: string): ServerCategory | null {
+  switch (c.kind) {
+    case 'SELECT':
+      return null;
+    case 'INSERT':
+    case 'UPDATE':
+      if (SCRATCH_TABLE.test(c.table) || c.stmt) return null;
+      return serverCategoryOf(sql);
+    case 'DELETE':
+      if (SCRATCH_TABLE.test(c.table)) return null;
+      return serverCategoryOf(sql);
+    case 'CREATE_TABLE':
+    case 'ALTER_TABLE':
+    case 'DROP_TABLE':
+      if (SCRATCH_TABLE.test(c.table) || CUSTOM_TABLE.test(c.table)) return null;
+      return serverCategoryOf(sql);
+    case 'UNKNOWN':
+      return serverCategoryOf(sql);
+  }
 }
 
 /** A structure as plan values: compared by `targetsHash` at execute and kept by the audit. */

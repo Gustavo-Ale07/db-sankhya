@@ -15,13 +15,16 @@ export const CAPABILITY_CLASSES = [
 export type CapabilityClass = (typeof CAPABILITY_CLASSES)[number];
 
 /**
- * `SANKHYA_ACTION` is never produced by `resolveCapability`: it marks a plan for a typed business
- * action of the API registry (a gateway service call, not a SQL statement).
+ * `SANKHYA_ACTION` and `SERVER_SQL` are never produced by `resolveCapability`: the first marks a
+ * plan for a typed business action of the API registry, the second a statement the gateway cannot
+ * run that the service routes through the client's server-side ("Executa Banco") action. Both are
+ * synthesized by the mutation service (a gateway service call, not a plain SQL statement).
  */
 export type CapabilityRoute =
   | 'SANKHYA_READ'
   | 'SANKHYA_SAVE'
   | 'SANKHYA_ACTION'
+  | 'SERVER_SQL'
   | 'SCRATCH'
   | 'HYBRID'
   | 'DDL_ARTIFACT'
@@ -42,7 +45,12 @@ export type CapabilityAction =
   | 'SANKHYA.ACTION.INCLUIR_NOTA'
   | 'SANKHYA.ACTION.INCLUIR_ALTERAR_ITEM_NOTA'
   | 'SANKHYA.ACTION.EXCLUIR_ITEM_NOTA'
-  | 'DDL.CUSTOM.GENERATE';
+  | 'DDL.CUSTOM.GENERATE'
+  | 'SERVER.DDL'
+  | 'SERVER.DELETE'
+  | 'SERVER.DML_RAW'
+  | 'SERVER.DCL'
+  | 'SERVER.PLSQL';
 
 export interface Capability {
   class: CapabilityClass;

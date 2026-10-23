@@ -43,6 +43,8 @@ describe('loadConfig', () => {
     expect(c.globalWriteEnabled).toBe(false);
     expect(c.writeToSankhya).toBe(false);
     expect(c.businessActionsEnabled).toEqual([]);
+    expect(c.serverSqlEnabled).toBe(false);
+    expect(c.serverSqlProductionOptIn).toBe(false);
     expect(c).not.toHaveProperty('ai');
     expect(c.port).toBe(3001);
     expect(c.session.hours).toBe(12);
@@ -51,6 +53,13 @@ describe('loadConfig', () => {
 
   it('refuses NODE_ENV=test together with APP_ENV=production', () => {
     expect(() => loadConfig({ NODE_ENV: 'test', APP_ENV: 'production' })).toThrow(ConfigError);
+  });
+
+  it('reads the server-side SQL switches, both off by default and settable', () => {
+    expect(loadConfig({ SERVER_SQL_ENABLED: 'true' }).serverSqlEnabled).toBe(true);
+    expect(loadConfig({ SERVER_SQL_PRODUCTION_OPT_IN: 'true' }).serverSqlProductionOptIn).toBe(
+      true,
+    );
   });
 
   it('reads BUSINESS_ACTIONS_ENABLED as a list of action ids, empty when blank', () => {

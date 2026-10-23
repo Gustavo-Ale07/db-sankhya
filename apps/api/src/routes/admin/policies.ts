@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { AppError, POLICY_ADMIN_CONFLICTS } from '@dbx/shared';
+import { AppError, POLICY_ADMIN_CONFLICTS, SEGREGATION_OVERRIDE } from '@dbx/shared';
 import type { AuthState } from '../../context';
 import type { PolicyInput, PolicyPatch } from '../../services/policy';
 import { noStore, parseBody, requirePermission, uuidParam } from '../../http';
@@ -31,6 +31,9 @@ const ruleFields = {
  * or a row cap for itself). Reading the rules stays allowed.
  */
 function assertSeparateFromWrites(auth: AuthState): void {
+  // SECURITY.SEGREGATION_OVERRIDE (held only by SUPER_ADMIN) is the one, explicit exemption: such
+  // an account may administer policies even though it can write. Everyone else stays segregated.
+  if (auth.grants.permissions.has(SEGREGATION_OVERRIDE)) return;
   const conflicting = POLICY_ADMIN_CONFLICTS.filter((p) => auth.grants.permissions.has(p));
   if (conflicting.length > 0) {
     throw new AppError(

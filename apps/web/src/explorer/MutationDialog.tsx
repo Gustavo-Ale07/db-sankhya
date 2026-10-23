@@ -127,6 +127,9 @@ function removesRow(t: PreviewTarget, operation: Operation | null): boolean {
  * nothing tells (a business action without targets): the capability label stands in for it.
  */
 function operationOf(plan: PreparedPlan): Operation | null {
+  // A direct-execution plan carries only a synthetic object target (before: null): never read it
+  // as an INSERT. Its operation stays neutral so the confirm button is the plain blue one.
+  if (isServerExecution(plan)) return null;
   if (plan.operation) return plan.operation;
   const targets = plan.preview.targets;
   if (targets.some((t) => t.before === null)) return 'INSERT';
@@ -168,6 +171,62 @@ function confirmLabel(op: Operation | null): string {
   if (op === 'CREATE_TABLE') return 'Confirmar criação';
   if (op === 'DROP_TABLE') return 'Confirmar exclusão';
   return 'Confirmar alteração';
+}
+
+/**
+ * An honest, route-neutral sentence for each direct-execution family. It never names the path
+ * that carries the statement (no "servidor", no "Executa Banco"): the SQL is shown as-is above
+ * and the plan is verified after it runs.
+ */
+const SERVER_CATEGORY_TEXT: Record<string, string> = {
+  DDL: 'Este comando altera a estrutura do banco e será aplicado diretamente.',
+  DELETE: 'Este comando remove registros e será aplicado diretamente.',
+  DML_RAW: 'Este comando altera dados e será aplicado diretamente.',
+  DCL: 'Este comando altera permissões de acesso e será aplicado diretamente.',
+  PLSQL: 'Este bloco de comandos será executado diretamente.',
+};
+
+/** The short, route-neutral word shown as the operation of each direct-execution family. */
+const SERVER_CATEGORY_WORD: Record<string, string> = {
+  DDL: 'DDL',
+  DELETE: 'DELETE',
+  DML_RAW: 'DML',
+  DCL: 'DCL',
+  PLSQL: 'PL/SQL',
+};
+
+/** A plan applied directly and then verified: there is no simulation to diff. */
+function isServerExecution(plan: PreparedPlan): boolean {
+  return plan.previewKind === 'SERVER_EXECUTION' || plan.capability.route === 'SERVER_SQL';
+}
+
+/** The statement family of a direct-execution plan, from its capability action (SERVER.<CAT>). */
+function serverCategoryOf(plan: PreparedPlan): string | null {
+  const action = plan.capability.action;
+  if (typeof action !== 'string' || !action.startsWith('SERVER.')) return null;
+  const cat = action.slice('SERVER.'.length);
+  return Object.hasOwn(SERVER_CATEGORY_TEXT, cat) ? cat : null;
+}
+
+/** Direct-execution plan: an honest statement of what runs, with no fabricated row diff. */
+function ServerExecution({ category }: { category: string | null }) {
+  const text =
+    (category && SERVER_CATEGORY_TEXT[category]) ?? 'Este comando será aplicado diretamente.';
+  return (
+    <div className="space-y-2" data-testid="server-execution">
+      <p className="text-sm font-semibold" data-testid="impact-rows">
+        {text}
+      </p>
+      <p
+        className="rounded border border-warn/60 bg-warn/10 px-3 py-2 text-warn"
+        role="note"
+        data-testid="server-execution-note"
+      >
+        Esta alteração não tem prévia simulada: o comando é aplicado exatamente como está acima e o
+        resultado é conferido em seguida. Revise o comando antes de confirmar.
+      </p>
+    </div>
+  );
 }
 
 function StructureSide({
@@ -1002,6 +1061,8 @@ export function MutationDialog({
   const labels = previewLabelsOf(preview);
   const blocked = blockingSwitches(preview);
   const operation = operationOf(preview);
+  const server = isServerExecution(preview);
+  const serverCategory = server ? serverCategoryOf(preview) : null;
   const structure = preview.preview.structure;
   const danger = operation === 'DELETE' || operation === 'DROP_TABLE';
   const environment = preview.impact.environment;
@@ -1042,7 +1103,9 @@ export function MutationDialog({
               className={`font-mono font-semibold ${danger ? 'text-danger' : ''}`}
               data-testid="mutation-operation"
             >
-              {`${operation ?? preview.capability.class} • ${entities}`}
+              {server
+                ? `${serverCategory ? SERVER_CATEGORY_WORD[serverCategory] : 'EXECUÇÃO DIRETA'} • ${entities}`
+                : `${operation ?? preview.capability.class} • ${entities}`}
             </span>
             <span
               className={`badge font-semibold ${
@@ -1106,31 +1169,34 @@ export function MutationDialog({
             {sql}
           </pre>
 
-          {report === null && (
-            <>
-              <p
-                className={`text-sm font-semibold ${danger ? 'text-danger' : ''}`}
-                data-testid="impact-rows"
-              >
-                {structure
-                  ? structureSentence(operation, structure)
-                  : countSentence(operation, rows)}
-              </p>
-              {structure ? (
-                <Structure
-                  structure={structure}
-                  lostRows={preview.preview.lostRows}
-                  parts={preview.preview.sankhyaParts}
-                />
-              ) : (
-                <Diff
-                  targets={preview.preview.targets}
-                  affected={preview.preview.affected}
-                  operation={preview.operation ?? null}
-                />
-              )}
-            </>
-          )}
+          {report === null &&
+            (server ? (
+              <ServerExecution category={serverCategory} />
+            ) : (
+              <>
+                <p
+                  className={`text-sm font-semibold ${danger ? 'text-danger' : ''}`}
+                  data-testid="impact-rows"
+                >
+                  {structure
+                    ? structureSentence(operation, structure)
+                    : countSentence(operation, rows)}
+                </p>
+                {structure ? (
+                  <Structure
+                    structure={structure}
+                    lostRows={preview.preview.lostRows}
+                    parts={preview.preview.sankhyaParts}
+                  />
+                ) : (
+                  <Diff
+                    targets={preview.preview.targets}
+                    affected={preview.preview.affected}
+                    operation={preview.operation ?? null}
+                  />
+                )}
+              </>
+            ))}
 
           {!permitted && report === null && (
             <p

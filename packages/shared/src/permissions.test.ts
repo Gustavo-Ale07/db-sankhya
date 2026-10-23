@@ -26,6 +26,11 @@ describe('permission catalog', () => {
       'SANKHYA.ACTION.INCLUIR_NOTA',
       'SANKHYA.ACTION.INCLUIR_ALTERAR_ITEM_NOTA',
       'SANKHYA.ACTION.EXCLUIR_ITEM_NOTA',
+      'SERVER.DDL',
+      'SERVER.DELETE',
+      'SERVER.DML_RAW',
+      'SERVER.DCL',
+      'SERVER.PLSQL',
       'APPROVAL.DECIDE',
       'AUDIT.READ',
       'ADMIN.USERS',
@@ -34,6 +39,7 @@ describe('permission catalog', () => {
       'ADMIN.POLICIES',
       'ADMIN.CONNECTIONS',
       'ADMIN.SECURITY',
+      'SECURITY.SEGREGATION_OVERRIDE',
     ]);
   });
 
@@ -73,12 +79,33 @@ describe('permission catalog', () => {
   });
 
   it('separates policy administration from every write permission, and ADMIN holds none', () => {
-    // DATA.PREVIEW writes nothing, so it is the one DATA.* that does not conflict.
+    // DATA.PREVIEW writes nothing, so it is the one DATA.* that does not conflict. SERVER.* are
+    // writes (the server-side route), so they conflict too; SECURITY.* is a marker, not a write.
     expect([...POLICY_ADMIN_CONFLICTS].sort()).toEqual(
-      PERMISSIONS.filter((p) => /^(DATA|DDL|SANKHYA)\./.test(p) && p !== 'DATA.PREVIEW').sort(),
+      PERMISSIONS.filter(
+        (p) => /^(DATA|DDL|SANKHYA|SERVER)\./.test(p) && p !== 'DATA.PREVIEW',
+      ).sort(),
     );
     expect(POLICY_ADMIN_CONFLICTS).not.toContain('DATA.PREVIEW');
+    expect(POLICY_ADMIN_CONFLICTS).not.toContain('SECURITY.SEGREGATION_OVERRIDE');
     for (const p of POLICY_ADMIN_CONFLICTS) expect(SYSTEM_ROLE_PERMISSIONS.ADMIN).not.toContain(p);
+  });
+
+  it('SUPER_ADMIN holds the whole catalog: every command and administration, with the override', () => {
+    const superAdmin = SYSTEM_ROLE_PERMISSIONS.SUPER_ADMIN;
+    expect([...superAdmin].sort()).toEqual([...PERMISSIONS].sort());
+    // It is exempt from separation of duties precisely because it carries the override marker.
+    expect(superAdmin).toContain('SECURITY.SEGREGATION_OVERRIDE');
+    for (const p of POLICY_ADMIN_CONFLICTS) expect(superAdmin).toContain(p);
+  });
+
+  it('server-side permissions and the override are held only by SUPER_ADMIN, not the other roles', () => {
+    const serverSide = PERMISSIONS.filter((p) => p.startsWith('SERVER.'));
+    expect(serverSide).toHaveLength(5);
+    for (const role of ['VIEWER', 'OPERATOR', 'ADMIN'] as const) {
+      for (const p of [...serverSide, 'SECURITY.SEGREGATION_OVERRIDE' as const])
+        expect(SYSTEM_ROLE_PERMISSIONS[role], role).not.toContain(p);
+    }
   });
 
   it('seeded roles have no duplicates and only catalog permissions', () => {

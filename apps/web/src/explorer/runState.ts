@@ -83,6 +83,9 @@ export const PREVIEW_KIND_LABEL: Record<PreviewKind, string> = {
   SIMULATED_PREVIEW: 'PRÉVIA SIMULADA',
   IMPACT_ANALYSIS: 'ANÁLISE DE IMPACTO',
   TRANSACTIONAL_DRY_RUN: 'DRY RUN TRANSACIONAL',
+  // Applied directly and then verified: there is no simulation to show. The label stays neutral
+  // (it never names the server-side route).
+  SERVER_EXECUTION: 'EXECUÇÃO DIRETA',
 };
 
 const isKnownKind = (k: unknown): k is PreviewKind =>

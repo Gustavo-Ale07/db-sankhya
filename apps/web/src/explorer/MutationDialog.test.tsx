@@ -1466,3 +1466,75 @@ describe('MutationDialog scratch DDL (tmp_*)', () => {
     expect(execButton().className).toContain('btn-danger');
   });
 });
+
+describe('MutationDialog direct execution (EXECUÇÃO DIRETA)', () => {
+  const server = (over: Partial<MutationPreview> = {}): MutationPreview =>
+    preview({
+      capability: {
+        class: 'SUPPORTED',
+        route: 'SERVER_SQL',
+        reason: 'direct',
+        action: 'SERVER.DDL',
+      },
+      previewKind: 'SERVER_EXECUTION',
+      previewLabels: ['SERVER_EXECUTION'],
+      impact: { entities: ['FOO'], rows: 1, environment: 'HOMOLOGATION' },
+      requires: { strongConfirmation: null, approval: false },
+      preview: { affected: 1, targets: [{ key: { OBJECT: 'FOO' }, before: null, after: {} }] },
+      ...over,
+    });
+
+  it('shows the neutral EXECUÇÃO DIRETA label and no fabricated row diff', () => {
+    render(
+      <MutationDialog preview={server()} sql="CREATE TABLE FOO (ID NUMBER)" onClose={() => {}} />,
+    );
+    expect(screen.getAllByTestId('preview-label').map((e) => e.textContent)).toEqual([
+      'EXECUÇÃO DIRETA',
+    ]);
+    // The synthetic object target is never rendered as a "novo registro" diff.
+    expect(screen.queryByTestId('mutation-diff')).toBeNull();
+    expect(screen.getByTestId('server-execution')).toBeTruthy();
+    expect(document.body.textContent).not.toContain('novo registro será criado');
+    // The route is never named in the visible text.
+    expect(document.body.textContent).not.toContain('servidor');
+    expect(document.body.textContent).not.toContain('Executa Banco');
+    expect(document.body.textContent).not.toContain('AD_MANIPULADADOS');
+  });
+
+  it('states the family honestly and keeps the plain blue "Confirmar alteração" button', () => {
+    render(
+      <MutationDialog preview={server()} sql="CREATE TABLE FOO (ID NUMBER)" onClose={() => {}} />,
+    );
+    expect(screen.getByTestId('impact-rows').textContent).toContain('estrutura do banco');
+    expect(screen.getByTestId('mutation-operation').textContent).toBe('DDL • FOO');
+    expect(screen.getByTestId('server-execution-note').textContent).toContain(
+      'não tem prévia simulada',
+    );
+    const btn = execButton();
+    expect(btn.textContent).toBe('Confirmar alteração');
+    expect(btn.className).toContain('btn-primary');
+    expect(btn.className).not.toContain('btn-danger');
+    // No phrase and switches open: it is executable straight away.
+    expect(btn.disabled).toBe(false);
+  });
+
+  it('describes a DELETE family as a removal without naming the route', () => {
+    render(
+      <MutationDialog
+        preview={server({
+          capability: {
+            class: 'SUPPORTED',
+            route: 'SERVER_SQL',
+            reason: 'direct',
+            action: 'SERVER.DELETE',
+          },
+          impact: { entities: ['TGFPAR'], rows: 1, environment: 'HOMOLOGATION' },
+        })}
+        sql="DELETE FROM TGFPAR WHERE CODPARC = 999"
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.getByTestId('impact-rows').textContent).toContain('remove registros');
+    expect(screen.getByTestId('mutation-operation').textContent).toBe('DELETE • TGFPAR');
+  });
+});

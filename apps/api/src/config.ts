@@ -130,6 +130,13 @@ const envSchema = z.object({
   WRITE_TO_SANKHYA: bool(false),
   GLOBAL_WRITE_ENABLED: bool(false),
   /**
+   * Master switch for the server-side ("Executa Banco") execution path (DDL, DELETE, MERGE,
+   * INSERT…SELECT, expression UPDATE, DCL, PL/SQL). Off by default; HOMOLOGATION/SANDBOX only.
+   */
+  SERVER_SQL_ENABLED: bool(false),
+  /** Separate, explicit opt-in before the server-side path may run against PRODUCTION. */
+  SERVER_SQL_PRODUCTION_OPT_IN: bool(false),
+  /**
    * Business action ids (e.g. `CACSP.cancelarNota`) allowed on `live` connections. Empty (the
    * default) disables every action on a live connection: fail closed.
    */
@@ -235,6 +242,10 @@ export interface AppConfig {
   safeMode: boolean;
   writeToSankhya: boolean;
   globalWriteEnabled: boolean;
+  /** SERVER_SQL_ENABLED: master switch for the server-side execution path (off by default). */
+  serverSqlEnabled: boolean;
+  /** SERVER_SQL_PRODUCTION_OPT_IN: separate opt-in before the server-side path touches PRODUCTION. */
+  serverSqlProductionOptIn: boolean;
   /** BUSINESS_ACTIONS_ENABLED: action ids allowed on live connections (empty: none). */
   businessActionsEnabled: string[];
   demoMode: boolean;
@@ -431,6 +442,8 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
     safeMode: e.SAFE_MODE,
     writeToSankhya: e.WRITE_TO_SANKHYA,
     globalWriteEnabled: e.GLOBAL_WRITE_ENABLED,
+    serverSqlEnabled: e.SERVER_SQL_ENABLED,
+    serverSqlProductionOptIn: e.SERVER_SQL_PRODUCTION_OPT_IN,
     businessActionsEnabled: e.BUSINESS_ACTIONS_ENABLED,
     demoMode: e.DEMO_MODE,
     planTtlSeconds: e.PLAN_TTL_SECONDS,

@@ -18,6 +18,11 @@ export type Permission =
   | 'SANKHYA.ACTION.INCLUIR_NOTA'
   | 'SANKHYA.ACTION.INCLUIR_ALTERAR_ITEM_NOTA'
   | 'SANKHYA.ACTION.EXCLUIR_ITEM_NOTA'
+  | 'SERVER.DDL'
+  | 'SERVER.DELETE'
+  | 'SERVER.DML_RAW'
+  | 'SERVER.DCL'
+  | 'SERVER.PLSQL'
   | 'APPROVAL.DECIDE'
   | 'AUDIT.READ'
   | 'ADMIN.USERS'
@@ -25,9 +30,10 @@ export type Permission =
   | 'ADMIN.ROLES'
   | 'ADMIN.POLICIES'
   | 'ADMIN.CONNECTIONS'
-  | 'ADMIN.SECURITY';
+  | 'ADMIN.SECURITY'
+  | 'SECURITY.SEGREGATION_OVERRIDE';
 /** Role keys seeded by the server; administrators may add custom roles. */
-export const SYSTEM_ROLES = ['VIEWER', 'OPERATOR', 'ADMIN'] as const;
+export const SYSTEM_ROLES = ['VIEWER', 'OPERATOR', 'ADMIN', 'SUPER_ADMIN'] as const;
 export type Value = string | number | boolean | null;
 
 export interface User {

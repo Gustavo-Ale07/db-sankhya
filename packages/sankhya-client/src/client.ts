@@ -6,12 +6,16 @@ import type { CallRateLimiter } from './limiter';
 import { ConcurrencyLimiter, abortError } from './limiter';
 import type {
   CallTrace,
+  ExecuteJavaInput,
+  ExecuteJavaResult,
   GatewayEnvelope,
   GatewayRequest,
   GatewayTransport,
   LoadRecordsInput,
   LoadRecordsResult,
   QueryResult,
+  RemoveRecordsInput,
+  RemoveRecordsResult,
   SaveInput,
   SaveResult,
   TransportResponse,
@@ -185,6 +189,68 @@ export class SankhyaClient {
       results: result.map((row) => (Array.isArray(row) ? (row as unknown[]) : [row])),
     };
     if (envelope.transactionId) out.transactionId = envelope.transactionId;
+    return out;
+  }
+
+  /**
+   * DatasetSP.removeRecords: deletes records by primary key. Sent exactly once (idempotent:
+   * false), like every other write. Used to clean up the dedicated AD_MANIPULADADOS record of
+   * the server-side path; the caller treats any failure here as best-effort (an orphaned record,
+   * not a failed operation). The envelope shape is documented-but-unconfirmed (see types).
+   */
+  async removeRecords(
+    input: RemoveRecordsInput,
+    signal?: AbortSignal,
+  ): Promise<RemoveRecordsResult> {
+    const envelope = await this.call(
+      {
+        module: 'mge',
+        serviceName: 'DatasetSP.removeRecords',
+        requestBody: {
+          entityName: input.entityName,
+          standAlone: false,
+          pks: input.pks,
+        },
+      },
+      { idempotent: false, ...(signal ? { signal } : {}) },
+    );
+    const out: RemoveRecordsResult = { status: envelope.status };
+    if (envelope.statusMessage !== undefined) out.statusMessage = envelope.statusMessage;
+    if (envelope.transactionId !== undefined) out.transactionId = envelope.transactionId;
+    return out;
+  }
+
+  /**
+   * ActionButtonsSP.executeJava: runs a server-side action button against one record. Sent
+   * exactly once (idempotent: false) — a DBScript routine may have side effects, so an
+   * ambiguous outcome becomes WRITE_OUTCOME_UNKNOWN and is never replayed. A "Não autorizado"
+   * envelope surfaces as SANKHYA_AUTH_ERROR with httpStatus 200, which the caller maps to
+   * SANKHYA_WRITE_NOT_AUTHORIZED, exactly like DatasetSP.save.
+   */
+  async executeJava(input: ExecuteJavaInput, signal?: AbortSignal): Promise<ExecuteJavaResult> {
+    const field = Object.entries(input.pk).map(([fieldName, value]) => ({
+      fieldName,
+      $: String(value),
+    }));
+    const envelope = await this.call(
+      {
+        module: input.module ?? 'mge',
+        serviceName: 'ActionButtonsSP.executeJava',
+        requestBody: {
+          javaCall: {
+            actionID: input.actionId,
+            entityName: input.entityName,
+            refreshType: input.refreshType ?? 'NONE',
+            rows: { row: [{ field }] },
+          },
+        },
+      },
+      { idempotent: false, ...(signal ? { signal } : {}) },
+    );
+    const out: ExecuteJavaResult = { status: envelope.status };
+    if (envelope.statusMessage !== undefined) out.statusMessage = envelope.statusMessage;
+    if (envelope.transactionId !== undefined) out.transactionId = envelope.transactionId;
+    if (envelope.responseBody !== undefined) out.responseBody = envelope.responseBody;
     return out;
   }
 

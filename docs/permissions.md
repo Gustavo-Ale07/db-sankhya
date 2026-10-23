@@ -23,31 +23,37 @@ node scripts/permissions-doc.mjs --check   # fails when the table and the code d
 
 <!-- permissions:start (written by scripts/permissions-doc.mjs) -->
 
-| Permission                                 | Policy class    | VIEWER | OPERATOR | ADMIN |
-| ------------------------------------------ | --------------- | ------ | -------- | ----- |
-| `QUERY.SELECT`                             | permission-only | yes    | yes      | yes   |
-| `TEMP.CREATE`                              | permission-only | yes    | yes      | yes   |
-| `TEMP.WRITE`                               | permission-only | yes    | yes      | yes   |
-| `TEMP.DROP`                                | permission-only | yes    | yes      | yes   |
-| `TEMP.MATERIALIZE`                         | permission-only | yes    | yes      | yes   |
-| `DATA.PREVIEW`                             | permission-only |        | yes      | yes   |
-| `DATA.INSERT`                              | write           |        | yes      |       |
-| `DATA.UPDATE`                              | write           |        | yes      |       |
-| `DATA.DELETE`                              | write           |        |          |       |
-| `DDL.CUSTOM.GENERATE`                      | write           |        |          |       |
-| `SANKHYA.BUSINESS_ACTION.EXECUTE`          | write           |        |          |       |
-| `SANKHYA.ACTION.CANCELAR_NOTA`             | write           |        |          |       |
-| `SANKHYA.ACTION.INCLUIR_NOTA`              | write           |        |          |       |
-| `SANKHYA.ACTION.INCLUIR_ALTERAR_ITEM_NOTA` | write           |        |          |       |
-| `SANKHYA.ACTION.EXCLUIR_ITEM_NOTA`         | write           |        |          |       |
-| `APPROVAL.DECIDE`                          | permission-only |        |          | yes   |
-| `AUDIT.READ`                               | permission-only |        |          | yes   |
-| `ADMIN.USERS`                              | permission-only |        |          | yes   |
-| `ADMIN.GROUPS`                             | permission-only |        |          | yes   |
-| `ADMIN.ROLES`                              | permission-only |        |          | yes   |
-| `ADMIN.POLICIES`                           | permission-only |        |          | yes   |
-| `ADMIN.CONNECTIONS`                        | permission-only |        |          | yes   |
-| `ADMIN.SECURITY`                           | permission-only |        |          | yes   |
+| Permission                                 | Policy class    | VIEWER | OPERATOR | ADMIN | SUPER_ADMIN |
+| ------------------------------------------ | --------------- | ------ | -------- | ----- | ----------- |
+| `QUERY.SELECT`                             | permission-only | yes    | yes      | yes   | yes         |
+| `TEMP.CREATE`                              | permission-only | yes    | yes      | yes   | yes         |
+| `TEMP.WRITE`                               | permission-only | yes    | yes      | yes   | yes         |
+| `TEMP.DROP`                                | permission-only | yes    | yes      | yes   | yes         |
+| `TEMP.MATERIALIZE`                         | permission-only | yes    | yes      | yes   | yes         |
+| `DATA.PREVIEW`                             | permission-only |        | yes      | yes   | yes         |
+| `DATA.INSERT`                              | write           |        | yes      |       | yes         |
+| `DATA.UPDATE`                              | write           |        | yes      |       | yes         |
+| `DATA.DELETE`                              | write           |        |          |       | yes         |
+| `DDL.CUSTOM.GENERATE`                      | write           |        |          |       | yes         |
+| `SANKHYA.BUSINESS_ACTION.EXECUTE`          | write           |        |          |       | yes         |
+| `SANKHYA.ACTION.CANCELAR_NOTA`             | write           |        |          |       | yes         |
+| `SANKHYA.ACTION.INCLUIR_NOTA`              | write           |        |          |       | yes         |
+| `SANKHYA.ACTION.INCLUIR_ALTERAR_ITEM_NOTA` | write           |        |          |       | yes         |
+| `SANKHYA.ACTION.EXCLUIR_ITEM_NOTA`         | write           |        |          |       | yes         |
+| `SERVER.DDL`                               | write           |        |          |       | yes         |
+| `SERVER.DELETE`                            | write           |        |          |       | yes         |
+| `SERVER.DML_RAW`                           | write           |        |          |       | yes         |
+| `SERVER.DCL`                               | write           |        |          |       | yes         |
+| `SERVER.PLSQL`                             | write           |        |          |       | yes         |
+| `APPROVAL.DECIDE`                          | permission-only |        |          | yes   | yes         |
+| `AUDIT.READ`                               | permission-only |        |          | yes   | yes         |
+| `ADMIN.USERS`                              | permission-only |        |          | yes   | yes         |
+| `ADMIN.GROUPS`                             | permission-only |        |          | yes   | yes         |
+| `ADMIN.ROLES`                              | permission-only |        |          | yes   | yes         |
+| `ADMIN.POLICIES`                           | permission-only |        |          | yes   | yes         |
+| `ADMIN.CONNECTIONS`                        | permission-only |        |          | yes   | yes         |
+| `ADMIN.SECURITY`                           | permission-only |        |          | yes   | yes         |
+| `SECURITY.SEGREGATION_OVERRIDE`            | permission-only |        |          |       | yes         |
 
 <!-- permissions:end -->
 

@@ -1262,7 +1262,7 @@ describe('validatePolicyRule', () => {
 });
 
 describe('action classification', () => {
-  it('only DATA.*, DDL.* and SANKHYA.* are writes', () => {
+  it('only DATA.*, DDL.*, SANKHYA.* and SERVER.* are writes', () => {
     const writes = PERMISSIONS.filter((p) => POLICY_ACTION_CLASS[p] === 'write');
     expect(writes).toEqual([
       'DATA.INSERT',
@@ -1274,6 +1274,11 @@ describe('action classification', () => {
       'SANKHYA.ACTION.INCLUIR_NOTA',
       'SANKHYA.ACTION.INCLUIR_ALTERAR_ITEM_NOTA',
       'SANKHYA.ACTION.EXCLUIR_ITEM_NOTA',
+      'SERVER.DDL',
+      'SERVER.DELETE',
+      'SERVER.DML_RAW',
+      'SERVER.DCL',
+      'SERVER.PLSQL',
     ]);
     expect(Object.keys(POLICY_ACTION_CLASS).sort()).toEqual([...PERMISSIONS].sort());
     // Previewing writes nothing: policy is evaluated on the statement's own write action.

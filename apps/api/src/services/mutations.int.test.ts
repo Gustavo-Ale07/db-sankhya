@@ -7,6 +7,15 @@ import { createDatabase, rolePermissions, roles } from '@dbx/database';
 import type { DatabaseHandle } from '@dbx/database';
 import { MOCK_CREDENTIALS, createMockSankhya } from '@dbx/sankhya-client/mock';
 import type { MockSankhya, MockSankhyaOptions } from '@dbx/sankhya-client/mock';
+import type {
+  SankhyaClient,
+  SaveInput,
+  SaveResult,
+  ExecuteJavaInput,
+  ExecuteJavaResult,
+  RemoveRecordsInput,
+  RemoveRecordsResult,
+} from '@dbx/sankhya-client';
 import type { Permission } from '@dbx/shared';
 import { buildApp } from '../app';
 import { loadConfig, secretValues } from '../config';
@@ -14,8 +23,11 @@ import { loggerOptions } from '../logger';
 import type { AuthState } from '../context';
 import { ApprovalsService } from './approvals';
 import { ENV_CONNECTION_ID } from './connections';
+import type { ConnectionsService } from './connections';
+import type { ConnectionMode, SankhyaRuntime } from './sankhya-runtime';
 import { MutationService, renderExpr } from './mutations';
 import type { PreparedMutation } from './mutations';
+import type { ServerSqlActionConfig, ServerSqlClient } from './server-sql-executor';
 import { PlansService } from './plans';
 import type { PolicyInput } from './policy';
 
@@ -66,7 +78,14 @@ const open: Harness[] = [];
 
 async function setup(
   env: Record<string, string> = {},
-  opts: { logs?: string[]; mock?: MockSankhyaOptions } = {},
+  opts: {
+    logs?: string[];
+    mock?: MockSankhyaOptions;
+    /** Turns the server-side ("Executa Banco") route on for this harness (off when omitted). */
+    serverSql?: { enabled: boolean; productionOptIn: boolean; action?: ServerSqlActionConfig };
+    /** Wraps the real connections service, e.g. to make `getRuntime` return a fake client. */
+    wrapConnections?: (real: ConnectionsService) => ConnectionsService;
+  } = {},
 ): Promise<Harness> {
   const config = loadConfig({ ...BASE_ENV, ...env });
   const database = await createDatabase(config.databaseUrl);
@@ -118,7 +137,7 @@ async function setup(
   const service = new MutationService({
     policies: s.policies,
     authz: s.authz,
-    connections: s.connections,
+    connections: opts.wrapConnections ? opts.wrapConnections(s.connections) : s.connections,
     metadata: s.metadata,
     audit: s.audit,
     scratch: s.scratch,
@@ -128,6 +147,7 @@ async function setup(
     switches: { safeMode: config.safeMode, writeToSankhya: config.writeToSankhya },
     maxReadRows: ceilings.sankhyaMaxReadRows,
     scratchMaxReadRows: ceilings.scratchMaxReadRows,
+    ...(opts.serverSql ? { serverSql: opts.serverSql } : {}),
   });
   const call: Harness['call'] = (cookie, opts) =>
     app.inject({
@@ -3111,5 +3131,336 @@ describe('a dictionary bigger than the gateway row cap', () => {
     expect(saves(h.mock)).toEqual([]);
     expect(writeCalls(h.mock)).toEqual([]);
     expect(await partner(h.mock, 1)).toBe(before);
+  });
+});
+
+// ------------------------------------------------------- server-side route ("Executa Banco")
+
+/** Statements routed server-side, with the category and the object the plan should bind to. */
+type ServerCategory = 'DDL' | 'DELETE' | 'DML_RAW' | 'DCL' | 'PLSQL';
+const SERVER_ON = { enabled: true, productionOptIn: false } as const;
+const SERVER_PERMS: Permission[] = [
+  'QUERY.SELECT',
+  'SERVER.DDL',
+  'SERVER.DELETE',
+  'SERVER.DML_RAW',
+  'SERVER.DCL',
+  'SERVER.PLSQL',
+];
+/** Server writes are default-deny like any other: a test that should pass grants SERVER.* first. */
+const allowServer = (h: Harness) =>
+  h.policy({ name: 'server allowed', effect: 'ALLOW', actions: ['SERVER.*'] });
+
+interface FakeServerCalls {
+  save: SaveInput[];
+  exec: ExecuteJavaInput[];
+  remove: RemoveRecordsInput[];
+}
+interface FakeServerOptions {
+  /** Id the gateway returns for the dedicated record; null -> none (the action must not fire). */
+  recordId?: string | null;
+  /** Raw envelope status of the action ("1" success, anything else a reported failure). */
+  actionStatus?: string;
+  /** The action call rejects (the record is cleaned up, then the error surfaces). */
+  executeThrows?: unknown;
+  /** The cleanup rejects (the record is orphaned; the outcome is unchanged). */
+  removeThrows?: unknown;
+}
+
+/**
+ * A fake of the minimal client surface the server-side route drives, recording every call. It
+ * stands in for the gateway at its boundary only: the real MutationService orchestration
+ * (routing, re-authorization, the executor lifecycle, verification, audit) runs unchanged. It is
+ * never evidence of a real database change -- that remains an explicit pendencia.
+ */
+function fakeServerClient(options: FakeServerOptions = {}): {
+  client: ServerSqlClient;
+  calls: FakeServerCalls;
+} {
+  const calls: FakeServerCalls = { save: [], exec: [], remove: [] };
+  const recordId = options.recordId === undefined ? '7001' : options.recordId;
+  const client: ServerSqlClient = {
+    save(input: SaveInput): Promise<SaveResult> {
+      calls.save.push(input);
+      return Promise.resolve({ results: recordId ? [[recordId]] : [] });
+    },
+    executeJava(input: ExecuteJavaInput): Promise<ExecuteJavaResult> {
+      calls.exec.push(input);
+      if (options.executeThrows) return Promise.reject(options.executeThrows);
+      return Promise.resolve({ status: options.actionStatus ?? '1' });
+    },
+    removeRecords(input: RemoveRecordsInput): Promise<RemoveRecordsResult> {
+      calls.remove.push(input);
+      if (options.removeThrows) return Promise.reject(options.removeThrows);
+      return Promise.resolve({ status: '1' });
+    },
+  };
+  return { client, calls };
+}
+
+/**
+ * Wraps the real connections service so `getRuntime` returns a runtime bound to `client` (the real
+ * `get`, environment and dialect are delegated through the prototype). `mode` decides whether the
+ * run is flagged simulated ('mock') or real ('live').
+ */
+function serverConnections(
+  client: ServerSqlClient,
+  mode: ConnectionMode = 'mock',
+): (real: ConnectionsService) => ConnectionsService {
+  return (real) => {
+    const wrapper = Object.create(real) as ConnectionsService;
+    wrapper.getRuntime = (id: string): Promise<SankhyaRuntime> =>
+      Promise.resolve({
+        client: client as unknown as SankhyaClient,
+        connectionId: id,
+        environment: 'HOMOLOGATION',
+        dialect: 'oracle',
+        mode,
+        close() {},
+      });
+    return wrapper;
+  };
+}
+
+const PREPARE_CASES: Array<{ cat: ServerCategory; sql: string; object?: string }> = [
+  { cat: 'DDL', sql: 'CREATE TABLE FOO (ID NUMBER)', object: 'FOO' },
+  { cat: 'DELETE', sql: 'DELETE FROM TGFPAR WHERE CODPARC = 999', object: 'TGFPAR' },
+  {
+    cat: 'DML_RAW',
+    sql: "MERGE INTO TGFPAR T USING DUAL ON (T.CODPARC = 1) WHEN MATCHED THEN UPDATE SET T.NOMEPARC = 'X'",
+    object: 'TGFPAR',
+  },
+  { cat: 'DCL', sql: 'GRANT SELECT ON TGFPAR TO SOMEROLE' },
+  { cat: 'PLSQL', sql: 'BEGIN NULL; END;' },
+];
+
+describe('MutationService server-side route (Executa Banco)', () => {
+  describe('prepare', () => {
+    it('is off by default: a statement with no gateway route stays SQL_UNSUPPORTED', async () => {
+      const h = await setup();
+      const { auth } = await h.userWith(WRITER);
+      // A MERGE has no gateway route; with the server route off it is refused (never routed
+      // server-side), so no plan is created and nothing is written.
+      await expect(
+        prepare(
+          h,
+          auth,
+          "MERGE INTO TGFPAR T USING DUAL ON (T.CODPARC = 1) WHEN MATCHED THEN UPDATE SET T.NOMEPARC = 'X'",
+        ),
+      ).rejects.toMatchObject({ code: expect.stringMatching(/^SQL_(UNSUPPORTED|PARSE_ERROR)$/) });
+      expect(await h.audit('PLAN_CREATED')).toEqual([]);
+      expect(writeCalls(h.mock)).toEqual([]);
+    });
+
+    it.each(PREPARE_CASES)(
+      'plans $cat as a server-side execution with a neutral preview and no gateway write',
+      async ({ cat, sql, object }) => {
+        const h = await setup({}, { serverSql: SERVER_ON });
+        await allowServer(h);
+        const { auth } = await h.userWith(SERVER_PERMS);
+        const p = await prepare(h, auth, sql);
+        expect(p.previewKind).toBe('SERVER_EXECUTION');
+        expect(p.previewLabels).toEqual(['SERVER_EXECUTION']);
+        expect(p.capability).toMatchObject({
+          class: 'SUPPORTED',
+          route: 'SERVER_SQL',
+          action: `SERVER.${cat}`,
+        });
+        // One honest target: the object the statement acts on (no row count is simulated).
+        expect(p.preview.affected).toBe(1);
+        expect(p.preview.targets).toHaveLength(1);
+        if (object) expect(p.preview.targets[0]!.key).toEqual({ OBJECT: object });
+        // Prepare never dispatches: nothing but reads can have touched the gateway.
+        expect(writeCalls(h.mock)).toEqual([]);
+        const created = await h.audit('PLAN_CREATED');
+        expect(created).toHaveLength(1);
+        expect(created[0]).toMatchObject({ planId: p.planId });
+      },
+    );
+
+    it('fails closed when the DDL target cannot be determined (never the control record)', async () => {
+      const h = await setup({}, { serverSql: SERVER_ON });
+      await allowServer(h);
+      const { auth } = await h.userWith(SERVER_PERMS);
+      // ALTER SESSION is DDL but has no table target: it must be refused, not authorized against
+      // the AD_MANIPULADADOS control record (a policy ALLOW scoped there would otherwise pass).
+      await expect(
+        prepare(h, auth, "ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD'"),
+      ).rejects.toMatchObject({ code: 'SERVER_SQL_TARGET_UNKNOWN' });
+      expect(await h.audit('PLAN_CREATED')).toEqual([]);
+      expect(writeCalls(h.mock)).toEqual([]);
+    });
+
+    it('refuses without the category permission (FORBIDDEN), before any policy decision', async () => {
+      const h = await setup({}, { serverSql: SERVER_ON });
+      await allowServer(h);
+      const { auth } = await h.userWith(['QUERY.SELECT']);
+      await expect(prepare(h, auth, 'CREATE TABLE FOO (ID NUMBER)')).rejects.toMatchObject({
+        code: 'FORBIDDEN',
+        details: { permission: 'SERVER.DDL' },
+      });
+      expect(await h.audit('PLAN_CREATED')).toEqual([]);
+    });
+
+    it('needs an explicit SERVER.* ALLOW rule: denied by policy when none matches', async () => {
+      const h = await setup({}, { serverSql: SERVER_ON });
+      // Only the bench DATA.* ALLOW exists; SERVER.* is default-deny.
+      const { auth } = await h.userWith(SERVER_PERMS);
+      await expect(prepare(h, auth, 'CREATE TABLE FOO (ID NUMBER)')).rejects.toMatchObject({
+        code: 'FORBIDDEN',
+      });
+      await allowServer(h);
+      const ok = await prepare(h, auth, 'CREATE TABLE FOO (ID NUMBER)');
+      expect(ok.capability).toMatchObject({ route: 'SERVER_SQL', action: 'SERVER.DDL' });
+    });
+
+    it('blocks PRODUCTION without the separate opt-in (SERVER_SQL_PRODUCTION_BLOCKED)', async () => {
+      const h = await setup({ SANKHYA_ENVIRONMENT: 'PRODUCTION' }, { serverSql: SERVER_ON });
+      await allowServer(h);
+      const { auth } = await h.userWith(SERVER_PERMS);
+      await expect(prepare(h, auth, 'CREATE TABLE FOO (ID NUMBER)')).rejects.toMatchObject({
+        code: 'SERVER_SQL_PRODUCTION_BLOCKED',
+      });
+    });
+
+    it('keeps the WHERE protection: a no-WHERE DELETE is refused (WHERE_REQUIRED)', async () => {
+      const h = await setup({}, { serverSql: SERVER_ON });
+      await allowServer(h);
+      const { auth } = await h.userWith(SERVER_PERMS);
+      await expect(prepare(h, auth, 'DELETE FROM TGFPAR')).rejects.toMatchObject({
+        code: 'WHERE_REQUIRED',
+      });
+    });
+  });
+
+  describe('execute', () => {
+    it('runs the real lifecycle; EXECUTED is reported ok but UNVERIFIED and audited truthfully', async () => {
+      const { client, calls } = fakeServerClient({ recordId: '7001', actionStatus: '1' });
+      const h = await setup(WRITES, {
+        serverSql: SERVER_ON,
+        wrapConnections: serverConnections(client, 'mock'),
+      });
+      await allowServer(h);
+      const { auth } = await h.userWith(SERVER_PERMS);
+      const p = await prepare(h, auth, 'CREATE TABLE FOO (ID NUMBER)');
+      expect(calls.save).toEqual([]); // prepare never dispatches
+
+      const report = await execute(h, auth, p);
+      expect(report).toMatchObject({
+        status: 'success',
+        verification: 'UNVERIFIED',
+        steps: [{ key: { OBJECT: 'FOO' }, outcome: 'ok' }],
+      });
+      expect(report.steps[0]!.verified).toBeUndefined();
+
+      // create the dedicated record (always an INSERT) -> fire action 98 -> clean it up.
+      expect(calls.save).toHaveLength(1);
+      expect(calls.save[0]).toMatchObject({ entityName: 'AD_MANIPULADADOS', fields: ['TEXTO'] });
+      expect(calls.exec).toHaveLength(1);
+      expect(calls.exec[0]).toMatchObject({
+        actionId: '98',
+        entityName: 'AD_MANIPULADADOS',
+        pk: { ID: '7001' },
+      });
+      expect(calls.remove).toHaveLength(1);
+      // The route never used the gateway write service.
+      expect(saves(h.mock)).toEqual([]);
+
+      const [executed] = await h.audit('PLAN_EXECUTED');
+      expect(executed).toMatchObject({
+        status: 'success',
+        planId: p.planId,
+        capability: 'SERVER.DDL',
+        errorCode: null,
+      });
+      expect(executed!.details).toMatchObject({
+        route: 'SERVER_SQL',
+        serverCategory: 'DDL',
+        simulated: true,
+        recordId: '7001',
+        cleanup: 'DELETED',
+      });
+    });
+
+    it('a reported failure is an error (SERVER_SQL_FAILED) and the report is FAILED', async () => {
+      const { client } = fakeServerClient({ actionStatus: '0' });
+      const h = await setup(WRITES, {
+        serverSql: SERVER_ON,
+        wrapConnections: serverConnections(client),
+      });
+      await allowServer(h);
+      const { auth } = await h.userWith(SERVER_PERMS);
+      const p = await prepare(h, auth, 'DELETE FROM TGFPAR WHERE CODPARC = 999');
+      const report = await execute(h, auth, p);
+      expect(report).toMatchObject({
+        status: 'failed',
+        verification: 'FAILED',
+        steps: [
+          {
+            key: { OBJECT: 'TGFPAR' },
+            outcome: 'error',
+            errorCode: 'SERVER_SQL_FAILED',
+            verified: false,
+          },
+        ],
+      });
+      const [executed] = await h.audit('PLAN_EXECUTED');
+      expect(executed).toMatchObject({ status: 'failed', errorCode: 'SERVER_SQL_FAILED' });
+    });
+
+    it('a failed cleanup orphans the control record without changing the outcome', async () => {
+      const { client, calls } = fakeServerClient({
+        actionStatus: '1',
+        removeThrows: new Error('cleanup failed'),
+      });
+      const h = await setup(WRITES, {
+        serverSql: SERVER_ON,
+        wrapConnections: serverConnections(client),
+      });
+      await allowServer(h);
+      const { auth } = await h.userWith(SERVER_PERMS);
+      const p = await prepare(h, auth, 'CREATE TABLE FOO (ID NUMBER)');
+      const report = await execute(h, auth, p);
+      expect(report.status).toBe('success');
+      expect(calls.remove).toHaveLength(1);
+      const [executed] = await h.audit('PLAN_EXECUTED');
+      expect(executed!.details).toMatchObject({
+        cleanup: 'ORPHANED',
+        cleanupError: 'INTERNAL_ERROR',
+      });
+    });
+
+    it('never fires the action when the gateway returns no record id (SANKHYA_BAD_RESPONSE)', async () => {
+      const { client, calls } = fakeServerClient({ recordId: null });
+      const h = await setup(WRITES, {
+        serverSql: SERVER_ON,
+        wrapConnections: serverConnections(client),
+      });
+      await allowServer(h);
+      const { auth } = await h.userWith(SERVER_PERMS);
+      const p = await prepare(h, auth, 'CREATE TABLE FOO (ID NUMBER)');
+      const report = await execute(h, auth, p);
+      expect(report.status).toBe('failed');
+      expect(report.steps[0]).toMatchObject({
+        outcome: 'error',
+        errorCode: 'SANKHYA_BAD_RESPONSE',
+      });
+      expect(calls.save).toHaveLength(1);
+      expect(calls.exec).toEqual([]); // the action was never fired
+      expect(calls.remove).toEqual([]);
+    });
+
+    it('is READ_ONLY_MODE when the write switches are off, even with the route on', async () => {
+      const { client, calls } = fakeServerClient();
+      const h = await setup(
+        {},
+        { serverSql: SERVER_ON, wrapConnections: serverConnections(client) },
+      );
+      await allowServer(h);
+      const { auth } = await h.userWith(SERVER_PERMS);
+      const p = await prepare(h, auth, 'CREATE TABLE FOO (ID NUMBER)');
+      await expect(execute(h, auth, p)).rejects.toMatchObject({ code: 'READ_ONLY_MODE' });
+      expect(calls.save).toEqual([]);
+    });
   });
 });

@@ -19,6 +19,7 @@ describe('preview labels', () => {
       SIMULATED_PREVIEW: 'PRÉVIA SIMULADA',
       IMPACT_ANALYSIS: 'ANÁLISE DE IMPACTO',
       TRANSACTIONAL_DRY_RUN: 'DRY RUN TRANSACIONAL',
+      SERVER_EXECUTION: 'EXECUÇÃO DIRETA',
     });
   });
 

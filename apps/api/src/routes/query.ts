@@ -124,6 +124,10 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
     }),
     security,
     switches: { safeMode: config.safeMode, writeToSankhya: config.writeToSankhya },
+    serverSql: {
+      enabled: config.serverSqlEnabled,
+      productionOptIn: config.serverSqlProductionOptIn,
+    },
     maxReadRows: ceilings.sankhyaMaxReadRows,
     scratchMaxReadRows: ceilings.scratchMaxReadRows,
     logger: app.log,

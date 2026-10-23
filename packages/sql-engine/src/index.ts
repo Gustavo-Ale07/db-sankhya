@@ -29,6 +29,14 @@ export type {
   CapabilityRoute,
 } from './capability';
 export { classifyStatement } from './classify';
+export {
+  assertServerSqlAllowed,
+  classifyServerSql,
+  serverSqlTarget,
+  wrapServerSql,
+  SERVER_SQL_CATEGORIES,
+} from './server-sql';
+export type { ServerSqlCategory, ServerSqlClassification, ServerSqlGate } from './server-sql';
 export { splitCreateAs, splitHybrid } from './hybrid';
 export type { CreateAs, HybridPart, HybridSplit } from './hybrid';
 export type { Classified, DdlKind, WriteKind as ClassifiedWriteKind } from './classify';
