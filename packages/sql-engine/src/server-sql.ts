@@ -209,10 +209,7 @@ export const SERVER_SQL_PRODUCTION_VERBS: ReadonlySet<string> = new Set(['UPDATE
  * out of scope). It is called at BOTH preparation (so no production plan is ever created for an
  * out-of-scope statement) and execution (so a direct executor / API call cannot run one either).
  */
-export function assertServerSqlEnvironmentScope(
-  sql: string,
-  environment: ServerEnvironment,
-): void {
+export function assertServerSqlEnvironmentScope(sql: string, environment: ServerEnvironment): void {
   if (environment !== 'PRODUCTION') return;
   // A q-quote desyncs the ansi tokenizer, so the leading verb cannot be fully trusted → fail closed
   // (out of scope). Phase-1 UPDATEs do not need a q-quote; one can be rephrased without it.

@@ -101,17 +101,19 @@ describe('assertServerSqlEnvironmentScope (phase-1 production scope)', () => {
 
   it('refuses every non-UPDATE statement against PRODUCTION with SERVER_SQL_OUT_OF_SCOPE', () => {
     for (const sql of outOfScope) {
-      expect(codeOf(() => assertServerSqlEnvironmentScope(sql, 'PRODUCTION')), sql).toBe(
-        'SERVER_SQL_OUT_OF_SCOPE',
-      );
+      expect(
+        codeOf(() => assertServerSqlEnvironmentScope(sql, 'PRODUCTION')),
+        sql,
+      ).toBe('SERVER_SQL_OUT_OF_SCOPE');
     }
   });
 
   it('fails closed on an unreadable leading verb (q-quote / no keyword) against PRODUCTION', () => {
     for (const sql of ["q'[UPDATE X SET Y=1]'", '', '-- just a comment', "'a string'"]) {
-      expect(codeOf(() => assertServerSqlEnvironmentScope(sql, 'PRODUCTION')), sql).toBe(
-        'SERVER_SQL_OUT_OF_SCOPE',
-      );
+      expect(
+        codeOf(() => assertServerSqlEnvironmentScope(sql, 'PRODUCTION')),
+        sql,
+      ).toBe('SERVER_SQL_OUT_OF_SCOPE');
     }
   });
 
