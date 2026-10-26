@@ -72,6 +72,7 @@ export async function actionRoutes(app: FastifyInstance): Promise<void> {
     maxReadRows: ceilings.sankhyaMaxReadRows,
     scratchMaxReadRows: ceilings.scratchMaxReadRows,
     businessActionsEnabled: config.businessActionsEnabled,
+    writeInstances: config.sankhyaWriteInstances,
     logger: app.log,
   });
 

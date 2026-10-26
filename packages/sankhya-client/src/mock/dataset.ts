@@ -215,7 +215,10 @@ const iso = (d: Date) =>
 export async function seedMockDataset(
   db: PGlite,
   seed: number,
-  opts: { dictionaryPadding?: number } = {},
+  opts: {
+    dictionaryPadding?: number;
+    extraInstances?: Readonly<Record<string, readonly string[]>>;
+  } = {},
 ): Promise<void> {
   const rand = createRandom(seed);
   await db.exec(DICTIONARY_DDL + MOCK_TABLES.map(ddl).join('\n') + CATALOG_DDL);
@@ -241,6 +244,8 @@ export async function seedMockDataset(
     tddtab.push([t.table, t.description]);
     tddins.push([t.entity, t.table, t.description]);
     for (const other of t.moreInstances ?? []) tddins.push([other, t.table, t.description]);
+    for (const other of opts.extraInstances?.[t.table] ?? [])
+      tddins.push([other, t.table, t.description]);
     t.columns.forEach((c, i) => {
       tddcam.push([nucampo++, t.table, c.name, c.description, c.type, c.size ?? null, i + 1]);
     });

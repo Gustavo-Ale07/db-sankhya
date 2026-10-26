@@ -70,6 +70,31 @@ const csv = (fallback: string) =>
         .filter((s) => s.length > 0),
     );
 
+/**
+ * SANKHYA_WRITE_INSTANCES entries (`TABLE:Instance`) → upper-case table name → instance name, kept
+ * as written (TDDINS names are matched exactly). A malformed or repeated table is a problem.
+ */
+function parseWriteInstances(
+  entries: readonly string[],
+  problems: string[],
+): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (const entry of entries) {
+    const m = /^([A-Za-z][A-Za-z0-9_$#]{0,127})\s*:\s*([A-Za-z][A-Za-z0-9_]{0,127})$/.exec(entry);
+    if (!m) {
+      problems.push(`SANKHYA_WRITE_INSTANCES: "${entry}" is not TABLE:Instance`);
+      continue;
+    }
+    const table = m[1]!.toUpperCase();
+    if (Object.hasOwn(map, table)) {
+      problems.push(`SANKHYA_WRITE_INSTANCES: ${table} is listed more than once`);
+      continue;
+    }
+    map[table] = m[2]!;
+  }
+  return map;
+}
+
 export const ENVIRONMENTS = ['PRODUCTION', 'HOMOLOGATION', 'SANDBOX'] as const;
 export type Environment = (typeof ENVIRONMENTS)[number];
 
@@ -141,6 +166,11 @@ const envSchema = z.object({
    * default) disables every action on a live connection: fail closed.
    */
   BUSINESS_ACTIONS_ENABLED: csv(''),
+  /**
+   * `TABLE:Instance` pairs (e.g. `TGFPAR:Parceiro`): the TDDINS instance a write to a table with
+   * more than one instance saves through. Empty (the default): such tables are refused.
+   */
+  SANKHYA_WRITE_INSTANCES: csv(''),
   PLAN_TTL_SECONDS: int(300, 30, 3600),
   /** Lifetime of a plan that requires approval (four eyes), in minutes. */
   APPROVAL_TTL_MINUTES: int(60, 1, 24 * 60),
@@ -248,6 +278,8 @@ export interface AppConfig {
   serverSqlProductionOptIn: boolean;
   /** BUSINESS_ACTIONS_ENABLED: action ids allowed on live connections (empty: none). */
   businessActionsEnabled: string[];
+  /** SANKHYA_WRITE_INSTANCES: upper-case table name → TDDINS instance to write through. */
+  sankhyaWriteInstances: Readonly<Record<string, string>>;
   demoMode: boolean;
   planTtlSeconds: number;
   /** APPROVAL_TTL_MINUTES: lifetime of plans that require approval. */
@@ -428,6 +460,7 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
       'BOOTSTRAP_ADMIN_PASSWORD is no longer supported: remove it and create the first administrator with the bootstrap token or the admin CLI',
     );
   }
+  const writeInstances = parseWriteInstances(e.SANKHYA_WRITE_INSTANCES, problems);
   if (problems.length > 0) throw new ConfigError(problems);
 
   return {
@@ -445,6 +478,7 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
     serverSqlEnabled: e.SERVER_SQL_ENABLED,
     serverSqlProductionOptIn: e.SERVER_SQL_PRODUCTION_OPT_IN,
     businessActionsEnabled: e.BUSINESS_ACTIONS_ENABLED,
+    sankhyaWriteInstances: writeInstances,
     demoMode: e.DEMO_MODE,
     planTtlSeconds: e.PLAN_TTL_SECONDS,
     approvalTtlMinutes: e.APPROVAL_TTL_MINUTES,

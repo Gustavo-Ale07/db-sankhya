@@ -69,6 +69,26 @@ describe('loadConfig', () => {
     ).toEqual(['CACSP.cancelarNota']);
   });
 
+  it('reads SANKHYA_WRITE_INSTANCES as TABLE:Instance pairs, empty when blank', () => {
+    expect(loadConfig({}).sankhyaWriteInstances).toEqual({});
+    expect(
+      loadConfig({ SANKHYA_WRITE_INSTANCES: ' tgfpar : Parceiro , TGFEST:EstoqueLocal' })
+        .sankhyaWriteInstances,
+    ).toEqual({ TGFPAR: 'Parceiro', TGFEST: 'EstoqueLocal' });
+  });
+
+  it('refuses a malformed or repeated SANKHYA_WRITE_INSTANCES entry', () => {
+    expect(problemsOf({ SANKHYA_WRITE_INSTANCES: 'TGFPAR' })).toContain(
+      'SANKHYA_WRITE_INSTANCES: "TGFPAR" is not TABLE:Instance',
+    );
+    expect(problemsOf({ SANKHYA_WRITE_INSTANCES: 'TGFPAR:Parceiro:X' })).toContain(
+      'SANKHYA_WRITE_INSTANCES: "TGFPAR:Parceiro:X" is not TABLE:Instance',
+    );
+    expect(problemsOf({ SANKHYA_WRITE_INSTANCES: 'TGFPAR:Parceiro,tgfpar:Outro' })).toContain(
+      'SANKHYA_WRITE_INSTANCES: TGFPAR is listed more than once',
+    );
+  });
+
   it('treats an empty DATABASE_URL (as shipped in .env.example) as unset', () => {
     expect(loadConfig({ DATABASE_URL: '' }).databaseUrl).toBe('pglite:memory');
   });

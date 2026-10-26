@@ -130,6 +130,7 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
     },
     maxReadRows: ceilings.sankhyaMaxReadRows,
     scratchMaxReadRows: ceilings.scratchMaxReadRows,
+    writeInstances: config.sankhyaWriteInstances,
     logger: app.log,
   });
 

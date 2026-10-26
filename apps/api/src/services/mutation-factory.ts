@@ -43,6 +43,7 @@ export function createMutationService(app: FastifyInstance): MutationService {
     },
     maxReadRows: ceilings.sankhyaMaxReadRows,
     scratchMaxReadRows: ceilings.scratchMaxReadRows,
+    writeInstances: config.sankhyaWriteInstances,
     logger: app.log,
   });
 }

@@ -3,7 +3,7 @@ import { Writable } from 'node:stream';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance, InjectOptions } from 'fastify';
 import { and, eq } from 'drizzle-orm';
-import { createDatabase, rolePermissions, roles } from '@dbx/database';
+import { createDatabase, plans, rolePermissions, roles } from '@dbx/database';
 import type { DatabaseHandle } from '@dbx/database';
 import { MOCK_CREDENTIALS, createMockSankhya } from '@dbx/sankhya-client/mock';
 import type { MockSankhya, MockSankhyaOptions } from '@dbx/sankhya-client/mock';
@@ -147,6 +147,7 @@ async function setup(
     switches: { safeMode: config.safeMode, writeToSankhya: config.writeToSankhya },
     maxReadRows: ceilings.sankhyaMaxReadRows,
     scratchMaxReadRows: ceilings.scratchMaxReadRows,
+    writeInstances: config.sankhyaWriteInstances,
     ...(opts.serverSql ? { serverSql: opts.serverSql } : {}),
   });
   const call: Harness['call'] = (cookie, opts) =>
@@ -478,6 +479,83 @@ describe('MutationService.prepare', () => {
       ),
     });
     expect(writeCalls(h.mock)).toEqual([]);
+  });
+
+  describe('SANKHYA_WRITE_INSTANCES', () => {
+    // TGFPAR as production lists it: several instances, the partner one among them.
+    const MULTI = { mock: { extraInstances: { TGFPAR: ['ParceiroAux', 'ParceiroContato'] } } };
+    const SQL = "UPDATE TGFPAR SET NOMEPARC = 'Novo nome' WHERE CODPARC = 1";
+
+    it('a multi-instance table with a configured instance saves through it', async () => {
+      const h = await setup({ ...WRITES, SANKHYA_WRITE_INSTANCES: 'tgfpar:Parceiro' }, MULTI);
+      const { auth } = await h.userWith(WRITER);
+      const p = await prepare(h, auth, SQL);
+      expect(p.preview).toMatchObject({ entityName: 'Parceiro', affected: 1 });
+
+      const report = await execute(h, auth, p);
+      expect(report).toMatchObject({ status: 'success', verification: 'VERIFIED' });
+      const [save] = saves(h.mock);
+      expect(save!.requestBody).toMatchObject({ entityName: 'Parceiro' });
+      expect(await partner(h.mock, 1)).toBe('Novo nome');
+      // The instance is frozen in the stored plan, which execute checks against.
+      const [stored] = await h.database.db
+        .select({ preview: plans.preview })
+        .from(plans)
+        .where(eq(plans.id, p.planId));
+      expect(stored!.preview).toMatchObject({ entityName: 'Parceiro' });
+    });
+
+    it('a configured instance the dictionary does not list is refused, with no write', async () => {
+      const h = await setup({ ...WRITES, SANKHYA_WRITE_INSTANCES: 'TGFPAR:Parceria' }, MULTI);
+      const { auth } = await h.userWith(WRITER);
+      await expect(prepare(h, auth, SQL)).rejects.toMatchObject({
+        code: 'OPERATION_NOT_SUPPORTED',
+        message: expect.stringContaining('TGFPAR: the configured instance Parceria is not one of'),
+      });
+      expect(writeCalls(h.mock)).toEqual([]);
+    });
+
+    it('a multi-instance table that is not mapped is still refused', async () => {
+      const h = await setup({ ...WRITES, SANKHYA_WRITE_INSTANCES: 'TGFPAR:Parceiro' }, MULTI);
+      const { auth } = await h.userWith(WRITER);
+      await expect(
+        prepare(
+          h,
+          auth,
+          'UPDATE TGFEST SET ESTOQUE = 1 WHERE CODEMP = 1 AND CODPROD = 1 AND CODLOCAL = 1',
+        ),
+      ).rejects.toMatchObject({
+        code: 'OPERATION_NOT_SUPPORTED',
+        message: expect.stringContaining('TGFEST has 2 instances in the data dictionary'),
+      });
+      await expect(prepare(h, auth, SQL.replace('Novo', 'Outro'))).resolves.toMatchObject({
+        preview: { entityName: 'Parceiro' },
+      });
+      expect(writeCalls(h.mock)).toEqual([]);
+    });
+
+    it('a multi-instance table without any mapping is refused', async () => {
+      const h = await setup(WRITES, MULTI);
+      const { auth } = await h.userWith(WRITER);
+      await expect(prepare(h, auth, SQL)).rejects.toMatchObject({
+        code: 'OPERATION_NOT_SUPPORTED',
+        message: expect.stringContaining(
+          'TGFPAR has 3 instances in the data dictionary (Parceiro, ParceiroAux, ParceiroContato)',
+        ),
+      });
+      expect(writeCalls(h.mock)).toEqual([]);
+    });
+
+    it('a single-instance table is unchanged, whatever the mapping says', async () => {
+      const h = await setup({ ...WRITES, SANKHYA_WRITE_INSTANCES: 'TGFPAR:Parceiro' });
+      const { auth } = await h.userWith(WRITER);
+      const p = await prepare(h, auth, 'UPDATE TGFPRO SET VLRVENDA = 10 WHERE CODPROD = 1');
+      expect(p.preview).toMatchObject({ entityName: 'Produto' });
+      const plain = await setup(WRITES);
+      const { auth: auth2 } = await plain.userWith(WRITER);
+      const q = await prepare(plain, auth2, SQL);
+      expect(q.preview).toMatchObject({ entityName: 'Parceiro' });
+    });
   });
 
   it('refuses unparseable input (fail closed)', async () => {

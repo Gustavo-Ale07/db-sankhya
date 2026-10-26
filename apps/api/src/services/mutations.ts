@@ -236,6 +236,11 @@ export interface MutationDeps {
   /** BUSINESS_ACTIONS_ENABLED: action ids allowed on live connections (none when absent). */
   businessActionsEnabled?: readonly string[];
   /**
+   * SANKHYA_WRITE_INSTANCES: upper-case table name → the TDDINS instance a write to that table
+   * saves through, when the dictionary lists more than one (none when absent: such tables refused).
+   */
+  writeInstances?: Readonly<Record<string, string>>;
+  /**
    * SERVER_SQL_ENABLED (and the separate PRODUCTION opt-in): the server-side ("Executa Banco")
    * route. Absent or `enabled: false` means the route is off — `prepare` never diverts to it and
    * `execute` fails a server-side plan closed with SERVER_SQL_DISABLED.
@@ -661,8 +666,7 @@ export class MutationService {
         new AppError('OPERATION_NOT_SUPPORTED', 'This statement shape cannot be previewed.'),
       );
     }
-    const table = catalogTable(catalog, write.table);
-    writeInstance(table);
+    const table = writeInstance(catalogTable(catalog, write.table), this.deps.writeInstances);
 
     const decision = await evaluateFor({
       policies,
@@ -1185,8 +1189,7 @@ export class MutationService {
     }
 
     const catalog = await tableCatalog(metadata, connectionId, action.entity);
-    const table = catalogTable(catalog, action.entity);
-    writeInstance(table);
+    const table = writeInstance(catalogTable(catalog, action.entity), this.deps.writeInstances);
     const entity = table.name.toUpperCase();
     const known = new Set(table.columns.map((c) => c.name.toUpperCase()));
     const pk = table.columns.filter((c) => c.pk).map((c) => c.name.toUpperCase());
@@ -1380,11 +1383,10 @@ export class MutationService {
     input: Record<string, unknown>,
     parentPk: string[],
   ): Promise<{ table: CatalogTable; pk: string[]; rows: RecordValues[]; columns: string[] }> {
-    const table = catalogTable(
-      await tableCatalog(this.deps.metadata, connectionId, spec.entity),
-      spec.entity,
+    const table = writeInstance(
+      catalogTable(await tableCatalog(this.deps.metadata, connectionId, spec.entity), spec.entity),
+      this.deps.writeInstances,
     );
-    writeInstance(table);
     const known = new Set(table.columns.map((c) => c.name.toUpperCase()));
     const pk = table.columns.filter((c) => c.pk).map((c) => c.name.toUpperCase());
     if (
@@ -2885,23 +2887,40 @@ async function tableCatalog(
 }
 
 /**
- * Refuses a Sankhya write to a table TDDINS lists with more than one instance: which of them the
- * change is meant for cannot be guessed, and each may save differently. A per-table choice of
- * instance (configuration) would be read here; there is none yet, so such a table is refused.
+ * The table a Sankhya write saves through, with `entityName` set to the TDDINS instance to use.
+ * One instance (or none): the table as it is. Several: which of them the change is meant for
+ * cannot be guessed, and each may save differently, so the instance must be configured
+ * (SANKHYA_WRITE_INSTANCES) and be one of those the dictionary lists; otherwise it is refused.
  */
-function writeInstance(table: CatalogTable): void {
+function writeInstance(
+  table: CatalogTable,
+  configured: Readonly<Record<string, string>> = {},
+): CatalogTable {
   const names = table.entityNames ?? [];
-  if (names.length > 1) {
-    const name = table.name.toUpperCase();
+  if (names.length <= 1) return table;
+  const name = table.name.toUpperCase();
+  const chosen = Object.hasOwn(configured, name) ? configured[name] : undefined;
+  if (chosen === undefined) {
     throw refuse(
       'PLAN',
       new AppError(
         'OPERATION_NOT_SUPPORTED',
-        `${name} has ${names.length} instances in the data dictionary (${names.join(', ')}); configure the instance to use before changing it.`,
+        `${name} has ${names.length} instances in the data dictionary (${names.join(', ')}); configure the instance to use before changing it (SANKHYA_WRITE_INSTANCES).`,
         { instances: names },
       ),
     );
   }
+  if (!names.includes(chosen)) {
+    throw refuse(
+      'PLAN',
+      new AppError(
+        'OPERATION_NOT_SUPPORTED',
+        `${name}: the configured instance ${chosen} is not one of the ${names.length} instances in the data dictionary (${names.join(', ')}).`,
+        { instances: names, configured: chosen },
+      ),
+    );
+  }
+  return { ...table, entityName: chosen };
 }
 
 function catalogTable(catalog: Catalog, name: string): CatalogTable {
