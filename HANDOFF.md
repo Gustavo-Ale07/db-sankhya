@@ -1,5 +1,24 @@
 # HANDOFF — Rodada 2 (Prompt v2/v2.1) + Rodada 3 (ações nativas), 22/10/2026
 
+## Estado em 26/10/2026 — em produção, escrita UPDATE validada
+
+- **Deploy:** `ed56ff4` (branch `backup/rodada-2-2026-10-21`) em produção na VPS, `/var/www/db-sankhya`, imagem `db-sankhya:latest`; commit confirmado via `/api/meta`. `main` e `migration` intocados.
+- **Teste de escrita em PRODUÇÃO:** `UPDATE TGFPAR SET COMPLEMENTO = … WHERE CODPARC = 5778`, resolvido pela instância `Parceiro` (`SANKHYA_WRITE_INSTANCES=TGFPAR:Parceiro`). Resultado **VERIFIED** (gravou, releu no Sankhya e conferiu). Revert também **VERIFIED**: produção voltou ao valor original `de 700/701 ao fim`, sem resíduo.
+- **RESOLVIDO — blocker (a) para UPDATE:** o `DatasetSP.save` do Sankhya **está autorizado em produção** para UPDATE simples (`SET coluna = literal` + `WHERE`). Os bloqueios anteriores eram todos do nosso lado (deny-by-default de política + trava multi-instância), não da API Sankhya.
+- **Config de produção vigente** (`.env` da VPS, só nomes/valores de switch):
+
+  | Chave                     | Valor                                    |
+  | ------------------------- | ---------------------------------------- |
+  | `SANKHYA_ENVIRONMENT`     | `PRODUCTION`                             |
+  | `SAFE_MODE`               | `false`                                  |
+  | `GLOBAL_WRITE_ENABLED`    | `true`                                   |
+  | `WRITE_TO_SANKHYA`        | `true`                                   |
+  | `SANKHYA_WRITE_INSTANCES` | `TGFPAR:Parceiro`                        |
+  | `SERVER_SQL_*`            | ausente (rota server-side **DESLIGADA**) |
+
+- **Caveat:** outras tabelas com várias instâncias no TDDINS continuam recusadas com `OPERATION_NOT_SUPPORTED` até serem mapeadas em `SANKHYA_WRITE_INSTANCES` (`TABELA:Instancia`, separado por vírgula) + recriação do container (`docker compose up -d`, que relê o `.env`).
+- **Fase 2 continua bloqueada:** CREATE/DROP/DDL/DELETE via "Executa Banco" (`ActionButtonsSP.executeJava`, ação `98`) aguardam o chamado Sankhya de AutorizacaoApi. **NÃO habilitar `SERVER_SQL_*`** até a liberação + validação do contrato do `executeJava` (blocker (b) abaixo segue aberto).
+
 ## Estado em 23/10 — retomar na segunda
 
 Fechamento de semana num ponto seguro. Branch `backup/rodada-2-2026-10-21`, HEAD **`38f8921`** (NÃO enviado: `origin/backup/rodada-2-2026-10-21` segue em `714a0da`). `main` (`f8d6a2e`) e `migration` (`0ddc4bd`) intocados. Árvore limpa.

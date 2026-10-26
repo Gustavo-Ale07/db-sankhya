@@ -2,6 +2,9 @@
 
 > **Documento, não execução.** Nada aqui foi rodado. Não executar antes de todas as
 > [pré-condições](#1-pré-condições-não-deployar-antes) estarem cumpridas.
+>
+> **Atualização 26/10/2026:** deploy feito (`ed56ff4`), sem a rota SERVER_SQL. Ver
+> [7. Executado em 26/10/2026](#7-executado-em-26102026).
 
 ## 0. Estado inspecionado (26/10/2026, somente leitura)
 
@@ -224,3 +227,27 @@ legíveis.
   estão; limpeza é tarefa separada.
 - `.env.example` ainda não documenta `SERVER_SQL_ENABLED` / `SERVER_SQL_PRODUCTION_OPT_IN`
   (estão em `docs/server-sql.md`). Pendência de documentação.
+
+## 7. Executado em 26/10/2026
+
+- **Deploy:** `ed56ff4` (branch `backup/rodada-2-2026-10-21`) em produção, `/var/www/db-sankhya`,
+  imagem `db-sankhya:latest`; commit confirmado via `/api/meta`. Inclui `SANKHYA_WRITE_INSTANCES`
+  (instância de gravação por tabela com várias instâncias no TDDINS).
+- **`.env` vigente (switches):** `SANKHYA_ENVIRONMENT=PRODUCTION`, `SAFE_MODE=false`,
+  `GLOBAL_WRITE_ENABLED=true`, `WRITE_TO_SANKHYA=true`, `SANKHYA_WRITE_INSTANCES=TGFPAR:Parceiro`,
+  `SERVER_SQL_*` ausente. Isso substitui a recomendação da seção 4 de manter `SAFE_MODE=true`:
+  a escrita em produção pela rota `DatasetSP.save` foi ligada por decisão do responsável.
+- **Primeira operação real (rota `DatasetSP.save`, não SERVER_SQL):**
+  `UPDATE TGFPAR SET COMPLEMENTO = … WHERE CODPARC = 5778`, pela instância `Parceiro` →
+  **VERIFIED** (gravou, releu no Sankhya e conferiu). Revert também **VERIFIED**: valor original
+  `de 700/701 ao fim` restaurado, sem resíduo.
+- **Resolvido:** o `DatasetSP.save` está autorizado em produção para UPDATE simples
+  (`SET coluna = literal` + `WHERE`). Os bloqueios anteriores eram do nosso lado
+  (deny-by-default de política + trava multi-instância), não da API Sankhya.
+- **Outras tabelas multi-instância:** recusadas com `OPERATION_NOT_SUPPORTED` até serem
+  acrescentadas em `SANKHYA_WRITE_INSTANCES` (`TABELA:Instancia`, separado por vírgula) e o
+  container ser recriado com `sudo docker compose up -d --no-build app` (relê o `.env`).
+- **SERVER_SQL (fase 2) continua desligada:** CREATE/DROP/DDL/DELETE via "Executa Banco"
+  (`ActionButtonsSP.executeJava`, ação `98`) aguardam o chamado Sankhya de AutorizacaoApi.
+  **Não** acrescentar `SERVER_SQL_*` ao `.env` até a liberação + validação do contrato do
+  `executeJava`; as seções 1 e 6 continuam valendo para essa rota.
