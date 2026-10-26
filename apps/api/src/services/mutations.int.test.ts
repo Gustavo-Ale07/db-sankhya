@@ -3323,6 +3323,94 @@ describe('MutationService server-side route (Executa Banco)', () => {
       });
     });
 
+    describe('PRODUCTION phase-1 scope (UPDATE only)', () => {
+      const PROD_ENV = { ...WRITES, SANKHYA_ENVIRONMENT: 'PRODUCTION' };
+      const SERVER_PROD = { enabled: true, productionOptIn: true } as const;
+      const SERVER_UPDATE =
+        'UPDATE TGFPAR SET NOMEPARC = (SELECT MAX(P.NOMEPARC) FROM TGFPAR P) WHERE CODPARC = 1';
+      const OUT_OF_SCOPE = [
+        'DELETE FROM TGFPAR WHERE CODPARC = 999',
+        'DROP TABLE FOO',
+        'TRUNCATE TABLE FOO',
+        'CREATE TABLE FOO (ID NUMBER)',
+        'ALTER TABLE FOO ADD (C NUMBER)',
+        "MERGE INTO TGFPAR T USING DUAL ON (T.CODPARC = 1) WHEN MATCHED THEN UPDATE SET T.NOMEPARC = 'X'",
+        'INSERT INTO FOO SELECT CODPARC FROM TGFPAR',
+        'GRANT SELECT ON TGFPAR TO SOMEROLE',
+        'BEGIN NULL; END;',
+      ];
+
+      it.each(OUT_OF_SCOPE)(
+        'refuses %s with SERVER_SQL_OUT_OF_SCOPE before any plan or dispatch',
+        async (sql) => {
+          const { client, calls } = fakeServerClient();
+          const h = await setup(PROD_ENV, {
+            serverSql: SERVER_PROD,
+            wrapConnections: serverConnections(client),
+          });
+          await allowServer(h);
+          const { auth } = await h.userWith(SERVER_PERMS);
+          await expect(prepare(h, auth, sql)).rejects.toMatchObject({
+            code: 'SERVER_SQL_OUT_OF_SCOPE',
+          });
+          expect(await h.audit('PLAN_CREATED')).toEqual([]);
+          expect(calls.save).toEqual([]);
+          expect(calls.exec).toEqual([]);
+          expect(writeCalls(h.mock)).toEqual([]);
+        },
+      );
+
+      it('refuses an out-of-scope statement through the API too (403, no plan)', async () => {
+        // The app's own route reads the switches from config, not from the harness option.
+        const h = await setup({
+          ...PROD_ENV,
+          SERVER_SQL_ENABLED: 'true',
+          SERVER_SQL_PRODUCTION_OPT_IN: 'true',
+        });
+        await allowServer(h);
+        const { cookie } = await h.userWith(SERVER_PERMS);
+        const res = await h.call(cookie, {
+          method: 'POST',
+          url: '/api/query/preview',
+          payload: { sql: 'DELETE FROM TGFPAR WHERE CODPARC = 999' },
+        });
+        expect(res.statusCode, res.body).toBe(403);
+        expect(res.json()).toMatchObject({ error: { code: 'SERVER_SQL_OUT_OF_SCOPE' } });
+        expect(await h.audit('PLAN_CREATED')).toEqual([]);
+        expect(writeCalls(h.mock)).toEqual([]);
+      });
+
+      it('lets a server-side UPDATE (subquery) through: plan, strong confirmation, dispatch', async () => {
+        const { client, calls } = fakeServerClient();
+        const h = await setup(PROD_ENV, {
+          serverSql: SERVER_PROD,
+          wrapConnections: serverConnections(client),
+        });
+        await allowServer(h);
+        const { auth } = await h.userWith(SERVER_PERMS);
+        const p = await prepare(h, auth, SERVER_UPDATE);
+        expect(p.capability).toMatchObject({ route: 'SERVER_SQL', action: 'SERVER.DML_RAW' });
+        expect(calls.save).toEqual([]);
+        // PRODUCTION keeps its strong confirmation on this route too.
+        expect(p.requires.strongConfirmation).toEqual(expect.any(String));
+        const report = await execute(h, auth, p, {
+          strongConfirmation: p.requires.strongConfirmation!,
+        });
+        expect(report).toMatchObject({ status: 'success', verification: 'UNVERIFIED' });
+        expect(calls.save).toHaveLength(1);
+        expect(calls.exec).toHaveLength(1);
+        expect(calls.remove).toHaveLength(1);
+      });
+
+      it('leaves HOMOLOGATION unrestricted: the same DELETE still plans', async () => {
+        const h = await setup({}, { serverSql: SERVER_ON });
+        await allowServer(h);
+        const { auth } = await h.userWith(SERVER_PERMS);
+        const p = await prepare(h, auth, 'DELETE FROM TGFPAR WHERE CODPARC = 999');
+        expect(p.capability).toMatchObject({ route: 'SERVER_SQL', action: 'SERVER.DELETE' });
+      });
+    });
+
     it('keeps the WHERE protection: a no-WHERE DELETE is refused (WHERE_REQUIRED)', async () => {
       const h = await setup({}, { serverSql: SERVER_ON });
       await allowServer(h);

@@ -15,6 +15,8 @@
  *
  * The routing decision (which statements come here), the switches/environment gate, the RBAC
  * permission and the policy engine are all enforced by the caller BEFORE a dispatch is built; the
+ * production phase scope (`assertServerSqlEnvironmentScope`) is enforced by the caller AND again
+ * here, fail-closed, before the first gateway call; the
  * wrapped block is produced by `wrapServerSql` in @dbx/sql-engine. This module only performs the
  * lifecycle and reports, truthfully, what the gateway did.
  *
@@ -22,8 +24,8 @@
  * change: the executor behaves identically either way (the mock transport answers the same calls),
  * but every result and audit record states which it was.
  */
-import { AppError, isAppError } from '@dbx/shared';
-import type { ServerSqlCategory } from '@dbx/sql-engine';
+import { AppError, isAppError, type Environment } from '@dbx/shared';
+import { assertServerSqlEnvironmentScope, type ServerSqlCategory } from '@dbx/sql-engine';
 import type { SankhyaClient } from '@dbx/sankhya-client';
 
 /** The minimal client surface a dispatch needs; keeps the executor unit-testable with a fake. */
@@ -57,6 +59,11 @@ export interface ServerSqlDispatchInput {
   block: string;
   /** The connection runs on the mock gateway: this dispatch is a simulation, not a real change. */
   simulated: boolean;
+  /**
+   * Environment of the connection the plan was authorized for. Required so the phase scope is
+   * re-checked here, on the raw statement, before anything is dispatched.
+   */
+  environment: Environment;
   signal?: AbortSignal;
 }
 
@@ -124,6 +131,10 @@ export class ServerSqlExecutor {
     if (input.category === 'UNSUPPORTED') {
       throw new AppError('SERVER_SQL_UNSUPPORTED', 'This statement has no server-side route.');
     }
+    // Production phase scope, enforced here too (not only at prepare) and decided from the raw
+    // statement's own verb, never from `category`: a direct executor call or a mis-classified plan
+    // cannot run an out-of-scope statement. Nothing is created or fired when it throws.
+    assertServerSqlEnvironmentScope(input.sql, input.environment);
     const started = this.now();
     const { entityName, actionId, textField, keyField } = this.config;
     const { signal } = input;

@@ -29,6 +29,7 @@ import { AppError, SNAPSHOT_MAX_ROWS, isAppError } from '@dbx/shared';
 import type { Environment, ErrorCode, Permission, PolicyColumn, PolicyDecision } from '@dbx/shared';
 import {
   assertServerSqlAllowed,
+  assertServerSqlEnvironmentScope,
   classifyServerSql,
   classifyStatement,
   isTrivialWhere,
@@ -797,6 +798,15 @@ export class MutationService {
         },
         environment,
       );
+    } catch (e) {
+      throw refuse('AUTHORIZE', e as AppError);
+    }
+    // Production phase scope (phase 1: UPDATE only), decided from the statement's own leading verb
+    // rather than `category`, so no production plan is ever created for an out-of-scope statement.
+    // Re-checked on re-authorization (this same path) and again by the executor right before the
+    // dispatch.
+    try {
+      assertServerSqlEnvironmentScope(sql, environment);
     } catch (e) {
       throw refuse('AUTHORIZE', e as AppError);
     }
@@ -2403,6 +2413,7 @@ export class MutationService {
         sql: plan.sql,
         block: r.block,
         simulated: runtime.mode === 'mock',
+        environment: plan.environment,
       });
       onDispatch?.(dispatch);
       if (dispatch.status === 'FAILED') {

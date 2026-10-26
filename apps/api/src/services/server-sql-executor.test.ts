@@ -14,6 +14,7 @@ import {
   extractRecordId,
   type ServerSqlClient,
 } from './server-sql-executor';
+import type { ServerSqlCategory } from '@dbx/sql-engine';
 
 /** Programmable fake of the three client calls a dispatch uses; records every request. */
 function fakeClient(
@@ -77,6 +78,7 @@ describe('ServerSqlExecutor', () => {
       sql: 'ALTER TABLE AD_X MODIFY (NOME VARCHAR2(120))',
       block: BLOCK,
       simulated: true,
+      environment: 'HOMOLOGATION',
     });
 
     // 1. INSERT into AD_MANIPULADADOS: the block in TEXTO, and NO pk (never overwrites a record).
@@ -115,6 +117,7 @@ describe('ServerSqlExecutor', () => {
       sql: 'DELETE FROM TGFCAB WHERE NUNOTA = 1',
       block: 'BEGIN\nDELETE FROM TGFCAB WHERE NUNOTA = 1;\nEND;',
       simulated: false,
+      environment: 'HOMOLOGATION',
     });
     expect(out.simulated).toBe(false);
     expect(out.status).toBe('EXECUTED');
@@ -124,7 +127,13 @@ describe('ServerSqlExecutor', () => {
     const f = fakeClient({ save: () => ({ results: [] }) });
     const executor = new ServerSqlExecutor({ client: f.client });
     const err = await executor
-      .dispatch({ category: 'DDL', sql: 'DROP TABLE AD_X', block: BLOCK, simulated: true })
+      .dispatch({
+        category: 'DDL',
+        sql: 'DROP TABLE AD_X',
+        block: BLOCK,
+        simulated: true,
+        environment: 'HOMOLOGATION',
+      })
       .catch((e: unknown) => e);
     expect(isAppError(err) && err.code).toBe('SANKHYA_BAD_RESPONSE');
     expect(f.actions).toHaveLength(0);
@@ -144,6 +153,7 @@ describe('ServerSqlExecutor', () => {
         sql: 'MERGE INTO A USING B ON (1=1)',
         block: BLOCK,
         simulated: true,
+        environment: 'HOMOLOGATION',
       })
       .catch((e: unknown) => e);
     expect(isAppError(err) && err.code).toBe('WRITE_OUTCOME_UNKNOWN');
@@ -164,6 +174,7 @@ describe('ServerSqlExecutor', () => {
       sql: 'ALTER TABLE AD_X ADD (C NUMBER)',
       block: BLOCK,
       simulated: true,
+      environment: 'HOMOLOGATION',
     });
     expect(out.status).toBe('EXECUTED');
     expect(out.cleanup).toBe('ORPHANED');
@@ -179,6 +190,7 @@ describe('ServerSqlExecutor', () => {
       sql: 'GRANT SELECT ON AD_X TO ROLE_X',
       block: BLOCK,
       simulated: true,
+      environment: 'HOMOLOGATION',
     });
     expect(out.status).toBe('FAILED');
     expect(out.action).toMatchObject({ status: '0', statusMessage: 'erro' });
@@ -190,10 +202,93 @@ describe('ServerSqlExecutor', () => {
     const f = fakeClient();
     const executor = new ServerSqlExecutor({ client: f.client });
     const err = await executor
-      .dispatch({ category: 'UNSUPPORTED', sql: 'SELECT 1', block: '', simulated: true })
+      .dispatch({
+        category: 'UNSUPPORTED',
+        sql: 'SELECT 1',
+        block: '',
+        simulated: true,
+        environment: 'HOMOLOGATION',
+      })
       .catch((e: unknown) => e);
     expect(isAppError(err) && err.code).toBe('SERVER_SQL_UNSUPPORTED');
     expect(f.saves).toHaveLength(0);
+  });
+
+  describe('production phase scope (phase 1: UPDATE only)', () => {
+    const PROD_OUT_OF_SCOPE: Array<{ category: ServerSqlCategory; sql: string }> = [
+      { category: 'DELETE', sql: 'DELETE FROM TGFCAB WHERE NUNOTA = 1' },
+      { category: 'DDL', sql: 'DROP TABLE AD_X' },
+      { category: 'DDL', sql: 'TRUNCATE TABLE AD_X' },
+      { category: 'DDL', sql: 'ALTER TABLE AD_X ADD (C NUMBER)' },
+      {
+        category: 'DML_RAW',
+        sql: 'MERGE INTO A USING B ON (1=1) WHEN MATCHED THEN UPDATE SET A.X = 1',
+      },
+      { category: 'DML_RAW', sql: 'INSERT INTO A SELECT * FROM B' },
+      { category: 'DCL', sql: 'GRANT SELECT ON AD_X TO ROLE_X' },
+      { category: 'PLSQL', sql: 'BEGIN NULL; END;' },
+    ];
+
+    it.each(PROD_OUT_OF_SCOPE)(
+      'refuses $sql in PRODUCTION before any gateway call (SERVER_SQL_OUT_OF_SCOPE)',
+      async ({ category, sql }) => {
+        const f = fakeClient();
+        const executor = new ServerSqlExecutor({ client: f.client });
+        const err = await executor
+          .dispatch({ category, sql, block: BLOCK, simulated: false, environment: 'PRODUCTION' })
+          .catch((e: unknown) => e);
+        expect(isAppError(err) && err.code).toBe('SERVER_SQL_OUT_OF_SCOPE');
+        expect(f.saves).toHaveLength(0);
+        expect(f.actions).toHaveLength(0);
+        expect(f.removes).toHaveLength(0);
+      },
+    );
+
+    it('decides from the statement, not the category: a DELETE labelled DML_RAW is still refused', async () => {
+      const f = fakeClient();
+      const executor = new ServerSqlExecutor({ client: f.client });
+      const err = await executor
+        .dispatch({
+          category: 'DML_RAW',
+          sql: 'DELETE FROM TGFCAB WHERE NUNOTA = 1',
+          block: BLOCK,
+          simulated: false,
+          environment: 'PRODUCTION',
+        })
+        .catch((e: unknown) => e);
+      expect(isAppError(err) && err.code).toBe('SERVER_SQL_OUT_OF_SCOPE');
+      expect(f.saves).toHaveLength(0);
+    });
+
+    it('lets an UPDATE with a subquery run in PRODUCTION', async () => {
+      const f = fakeClient();
+      const executor = new ServerSqlExecutor({ client: f.client });
+      const out = await executor.dispatch({
+        category: 'DML_RAW',
+        sql: 'UPDATE TGFPAR SET NOMEPARC = (SELECT MAX(NOMEPARC) FROM TGFPAR) WHERE CODPARC = 1',
+        block: BLOCK,
+        simulated: false,
+        environment: 'PRODUCTION',
+      });
+      expect(out.status).toBe('EXECUTED');
+      expect(f.actions).toHaveLength(1);
+    });
+
+    it.each(['HOMOLOGATION', 'SANDBOX'] as const)(
+      'does not restrict %s (a DELETE still dispatches)',
+      async (environment) => {
+        const f = fakeClient();
+        const executor = new ServerSqlExecutor({ client: f.client });
+        const out = await executor.dispatch({
+          category: 'DELETE',
+          sql: 'DELETE FROM TGFCAB WHERE NUNOTA = 1',
+          block: BLOCK,
+          simulated: true,
+          environment,
+        });
+        expect(out.status).toBe('EXECUTED');
+      },
+    );
   });
 
   it('exposes the probed action contract as the default', () => {

@@ -133,7 +133,12 @@ Ordem de verificação, tudo fail-closed:
 2. `GLOBAL_WRITE_ENABLED` e `WRITE_TO_SANKHYA` → `READ_ONLY_MODE` (mesmos switches gerais).
 3. **Ambiente:** só HOMOLOGAÇÃO/SANDBOX. PRODUÇÃO exige opt-in separado
    (`SERVER_SQL_PRODUCTION_OPT_IN`) **e** `SAFE_MODE` desligado; caso contrário
-   `SERVER_SQL_PRODUCTION_BLOCKED`.
+   `SERVER_SQL_PRODUCTION_BLOCKED`. Mesmo com o opt-in, PRODUÇÃO fase 1 só aceita `UPDATE`
+   (inclusive com subconsulta/expressão): `DELETE`, DDL (`DROP`/`TRUNCATE`/…), `MERGE`,
+   `INSERT`/`INSERT…SELECT`, DCL e PL/SQL são recusados com `SERVER_SQL_OUT_OF_SCOPE` (403).
+   A decisão vem do verbo real do statement (não da categoria) e é checada na preparação, na
+   reautorização e de novo no `ServerSqlExecutor.dispatch`, antes de qualquer chamada ao
+   gateway. HOMOLOGAÇÃO/SANDBOX não têm essa restrição.
 4. **RBAC:** a permissão `SERVER.<categoria>` precisa estar concedida, senão `FORBIDDEN`.
 5. **Entidade de controle reservada:** nenhum comando — nem pela rota SERVER_SQL nem pelo
    gateway — pode ter a entidade de controle (`AD_MANIPULADADOS`, configurável) como alvo.
