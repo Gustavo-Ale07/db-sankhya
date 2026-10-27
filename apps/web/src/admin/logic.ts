@@ -1,4 +1,31 @@
-import type { GlobalWriteState, PolicyLimits, PolicyRule } from '../api/types';
+import type { GlobalWriteState, Permission, PolicyLimits, PolicyRule } from '../api/types';
+
+/**
+ * The actions a policy rule can select: the permission catalog (packages/shared/src/permissions.ts)
+ * minus the RBAC-only ones that are never policy-evaluated (DATA.PREVIEW, APPROVAL.*, AUDIT.*,
+ * ADMIN.*, SECURITY.*). A test keeps it in step with the catalog.
+ */
+export const POLICY_ACTION_OPTIONS: readonly Permission[] = [
+  'QUERY.SELECT',
+  'TEMP.CREATE',
+  'TEMP.WRITE',
+  'TEMP.DROP',
+  'TEMP.MATERIALIZE',
+  'DATA.INSERT',
+  'DATA.UPDATE',
+  'DATA.DELETE',
+  'DDL.CUSTOM.GENERATE',
+  'SANKHYA.BUSINESS_ACTION.EXECUTE',
+  'SANKHYA.ACTION.CANCELAR_NOTA',
+  'SANKHYA.ACTION.INCLUIR_NOTA',
+  'SANKHYA.ACTION.INCLUIR_ALTERAR_ITEM_NOTA',
+  'SANKHYA.ACTION.EXCLUIR_ITEM_NOTA',
+  'SERVER.DDL',
+  'SERVER.DELETE',
+  'SERVER.DML_RAW',
+  'SERVER.DCL',
+  'SERVER.PLSQL',
+];
 
 /** Comma or newline separated text to a trimmed list without blanks or duplicates. */
 export function parseList(text: string): string[] {

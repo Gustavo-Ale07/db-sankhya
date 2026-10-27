@@ -149,6 +149,24 @@ describe('PoliciesPage', () => {
     expect(await within(dialog).findByText(/unknown action FOO/)).toBeTruthy();
   });
 
+  it('offers the five SERVER.* actions in the rule editor and sends them on save', async () => {
+    vi.mocked(api.get).mockResolvedValue({ items: [], policyVersion: 'c'.repeat(64), invalid: [] });
+    vi.mocked(api.post).mockResolvedValue({ item: {}, policyVersion: 'd'.repeat(64) });
+    renderPage(<PoliciesPage />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Nova política' }));
+    const dialog = openDialog();
+    fireEvent.change(within(dialog).getByLabelText('Nome'), { target: { value: 'Servidor' } });
+    const server = ['SERVER.DDL', 'SERVER.DELETE', 'SERVER.DML_RAW', 'SERVER.DCL', 'SERVER.PLSQL'];
+    for (const a of server) fireEvent.click(within(dialog).getByLabelText(a));
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Salvar', hidden: true }));
+    await waitFor(() =>
+      expect(api.post).toHaveBeenCalledWith(
+        '/api/admin/policies',
+        expect.objectContaining({ actions: server }),
+      ),
+    );
+  });
+
   it('warns when stored enabled rules are invalid', async () => {
     vi.mocked(api.get).mockResolvedValue({
       items: [],

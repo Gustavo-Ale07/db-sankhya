@@ -1,12 +1,35 @@
 import { describe, expect, it } from 'vitest';
+// Test-only: the browser bundle never imports server packages, but the action list must follow them.
+import { PERMISSIONS } from '../../../../packages/shared/src/permissions';
+import { POLICY_ACTION_CLASS } from '../../../../packages/shared/src/policy';
 import {
   EMPTY_POLICY,
+  POLICY_ACTION_OPTIONS,
   describeSecurity,
   formFromRule,
   parseLimit,
   parseList,
   policyPayload,
 } from './logic';
+
+describe('POLICY_ACTION_OPTIONS', () => {
+  it('is the catalog minus the RBAC-only permissions, in catalog order', () => {
+    const rbacOnly = /^(DATA\.PREVIEW|APPROVAL\.|AUDIT\.|ADMIN\.|SECURITY\.)/;
+    expect(POLICY_ACTION_OPTIONS).toEqual(PERMISSIONS.filter((p) => !rbacOnly.test(p)));
+  });
+
+  it('offers every policy write, the server-side SERVER.* included', () => {
+    const writes = PERMISSIONS.filter((p) => POLICY_ACTION_CLASS[p] === 'write');
+    for (const w of writes) expect(POLICY_ACTION_OPTIONS).toContain(w);
+    expect(POLICY_ACTION_OPTIONS.filter((a) => a.startsWith('SERVER.'))).toEqual([
+      'SERVER.DDL',
+      'SERVER.DELETE',
+      'SERVER.DML_RAW',
+      'SERVER.DCL',
+      'SERVER.PLSQL',
+    ]);
+  });
+});
 
 describe('parseList', () => {
   it('splits on commas and newlines, trims and dedupes', () => {

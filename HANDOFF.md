@@ -1,5 +1,12 @@
 # HANDOFF — Rodada 2 (Prompt v2/v2.1) + Rodada 3 (ações nativas), 22/10/2026
 
+## Estado em 27/10/2026 (noite) — tela de Políticas oferece as ações SERVER.\*
+
+- **Problema:** a edição de política (`PoliciesPage.tsx`) tinha uma lista fixa de ações sem `SERVER.DDL/DELETE/DML_RAW/DCL/PLSQL`, então não dava para conceder a rota server-side pela UI. O backend já as aceitava (`validatePolicyRule` valida contra `PERMISSIONS`; a rota admin não tem allowlist própria).
+- **Correção:** a lista virou `POLICY_ACTION_OPTIONS` em `apps/web/src/admin/logic.ts` (o web não importa `@dbx/shared` no bundle), agora com as 5 `SERVER.*`. Um teste (`logic.test.ts`) a compara com o catálogo (`PERMISSIONS` menos as só-RBAC: `DATA.PREVIEW`, `APPROVAL.*`, `AUDIT.*`, `ADMIN.*`, `SECURITY.*`), então dessincronizar quebra o teste. Backend sem mudança.
+- **Testes novos:** `AdminPages.test.tsx` (as 5 caixas aparecem e vão no POST); `mutations.int.test.ts` (regra ALLOW `SERVER.DDL`, usuário, PRODUÇÃO, todas as tabelas, salva pela rota admin → `invalid` vazio; antes dela a prévia de `CREATE TABLE AD_DBX_TESTE (ID NUMBER)` dá `FORBIDDEN` "denied by policy", depois planeja `SERVER.DDL`).
+- **Políticas existentes:** não alteradas; a regra "Teste" o usuário edita pela UI.
+
 ## Estado em 27/10/2026 (tarde) — correção: o editor agora leva DDL Oracle/MERGE/GRANT/PL-SQL à prévia
 
 - **Bug:** pela UI, `CREATE TABLE AD_DBX_TESTE (ID NUMBER)` voltava `SQL_FORBIDDEN` ("keyword CREATE is not allowed in a read"). O parser PG/T-SQL classifica DDL com tipo Oracle, `MERGE`, `GRANT` e PL/SQL como `UNKNOWN`; o `/api/query` mandava `UNKNOWN` ao gate de leitura. Além disso, `serverSqlEligible` excluía DDL sobre `AD_*`, então `DROP TABLE AD_DBX_TESTE` (reconhecido como `DROP_TABLE`) seria recusado na prévia.

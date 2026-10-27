@@ -3634,6 +3634,52 @@ describe('MutationService server-side route (Executa Banco)', () => {
         },
       );
 
+      it('a SERVER.DDL ALLOW saved through the policy admin route is valid and lets CREATE through', async () => {
+        const { h } = await httpHarness(SERVER_ENV);
+        const server = await h.userWith(SERVER_PERMS);
+        const admin = await h.userWith(['QUERY.SELECT', 'ADMIN.POLICIES']);
+        const sql = 'CREATE TABLE AD_DBX_TESTE (ID NUMBER)';
+        const preview = () =>
+          h.call(server.cookie, { method: 'POST', url: '/api/query/preview', payload: { sql } });
+
+        const denied = await preview();
+        expect(denied.statusCode, denied.body).toBe(403);
+        expect(denied.json().error).toMatchObject({ code: 'FORBIDDEN' });
+        expect(denied.json().error.message).toMatch(/denied by policy/);
+
+        // The body the policy editor sends: user subject, PRODUCTION, every table.
+        const saved = await h.call(admin.cookie, {
+          method: 'POST',
+          url: '/api/admin/policies',
+          payload: {
+            name: 'Teste',
+            effect: 'ALLOW',
+            subjectType: 'user',
+            subjectId: server.auth.user.id,
+            environments: ['PRODUCTION'],
+            connectionIds: [],
+            actions: ['SERVER.DDL'],
+            entities: [],
+            columns: [],
+            limits: {},
+            overrideWhereRequired: false,
+            enabled: true,
+          },
+        });
+        expect(saved.statusCode, saved.body).toBe(201);
+        const listed = await h.call(admin.cookie, { method: 'GET', url: '/api/admin/policies' });
+        expect(listed.json().invalid).toEqual([]);
+
+        const pointed = await query(h, server.cookie, sql);
+        expect(pointed.json().error).toMatchObject({ details: { preview: '/api/query/preview' } });
+        const planned = await preview();
+        expect(planned.statusCode, planned.body).toBe(200);
+        expect(planned.json().capability).toMatchObject({
+          route: 'SERVER_SQL',
+          action: 'SERVER.DDL',
+        });
+      });
+
       it('with SERVER_SQL on, a SELECT still runs as a read', async () => {
         const h = await setup(SERVER_ENV);
         const { cookie } = await h.userWith(SERVER_PERMS);

@@ -11,27 +11,11 @@ import {
   ENVIRONMENT_OPTIONS,
   EMPTY_POLICY,
   LIMIT_FLAGS,
+  POLICY_ACTION_OPTIONS,
   formFromRule,
   policyPayload,
 } from './logic';
 import type { PolicyForm } from './logic';
-
-const ACTION_OPTIONS = [
-  'QUERY.SELECT',
-  'TEMP.CREATE',
-  'TEMP.WRITE',
-  'TEMP.DROP',
-  'TEMP.MATERIALIZE',
-  'DATA.INSERT',
-  'DATA.UPDATE',
-  'DATA.DELETE',
-  'DDL.CUSTOM.GENERATE',
-  'SANKHYA.BUSINESS_ACTION.EXECUTE',
-  'SANKHYA.ACTION.CANCELAR_NOTA',
-  'SANKHYA.ACTION.INCLUIR_NOTA',
-  'SANKHYA.ACTION.INCLUIR_ALTERAR_ITEM_NOTA',
-  'SANKHYA.ACTION.EXCLUIR_ITEM_NOTA',
-];
 
 interface PolicyList {
   items: PolicyRule[];
@@ -335,7 +319,7 @@ export function PoliciesPage() {
             </fieldset>
             <fieldset className="grid grid-cols-1 gap-x-4 gap-y-1 sm:grid-cols-2">
               <legend className="font-medium">Ações (obrigatório)</legend>
-              {[...new Set([...ACTION_OPTIONS, ...f.actions])].map((a) => (
+              {[...new Set<string>([...POLICY_ACTION_OPTIONS, ...f.actions])].map((a) => (
                 <label key={a} className="flex items-center gap-1 font-mono">
                   <input
                     type="checkbox"
