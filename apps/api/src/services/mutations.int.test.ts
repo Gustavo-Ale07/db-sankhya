@@ -3401,44 +3401,119 @@ describe('MutationService server-side route (Executa Banco)', () => {
       });
     });
 
-    describe('PRODUCTION phase-1 scope (UPDATE only)', () => {
+    describe('PRODUCTION scope (phase 2: every category, still gated)', () => {
       const PROD_ENV = { ...WRITES, SANKHYA_ENVIRONMENT: 'PRODUCTION' };
       const SERVER_PROD = { enabled: true, productionOptIn: true } as const;
       const SERVER_UPDATE =
         'UPDATE TGFPAR SET NOMEPARC = (SELECT MAX(P.NOMEPARC) FROM TGFPAR P) WHERE CODPARC = 1';
-      const OUT_OF_SCOPE = [
-        'DELETE FROM TGFPAR WHERE CODPARC = 999',
-        'DROP TABLE FOO',
-        'TRUNCATE TABLE FOO',
-        'CREATE TABLE FOO (ID NUMBER)',
-        'ALTER TABLE FOO ADD (C NUMBER)',
-        "MERGE INTO TGFPAR T USING DUAL ON (T.CODPARC = 1) WHEN MATCHED THEN UPDATE SET T.NOMEPARC = 'X'",
-        'INSERT INTO FOO SELECT CODPARC FROM TGFPAR',
-        'GRANT SELECT ON TGFPAR TO SOMEROLE',
-        'BEGIN NULL; END;',
+      const PROD_CASES: Array<{ cat: ServerCategory; sql: string }> = [
+        { cat: 'DELETE', sql: 'DELETE FROM TGFPAR WHERE CODPARC = 999' },
+        { cat: 'DDL', sql: 'DROP TABLE FOO' },
+        { cat: 'DDL', sql: 'TRUNCATE TABLE FOO' },
+        { cat: 'DDL', sql: 'CREATE TABLE FOO (ID NUMBER)' },
+        { cat: 'DDL', sql: 'ALTER TABLE FOO ADD (C NUMBER)' },
+        {
+          cat: 'DML_RAW',
+          sql: "MERGE INTO TGFPAR T USING DUAL ON (T.CODPARC = 1) WHEN MATCHED THEN UPDATE SET T.NOMEPARC = 'X'",
+        },
+        { cat: 'DML_RAW', sql: 'INSERT INTO FOO SELECT CODPARC FROM TGFPAR' },
+        { cat: 'DCL', sql: 'GRANT SELECT ON TGFPAR TO SOMEROLE' },
+        { cat: 'PLSQL', sql: 'BEGIN NULL; END;' },
       ];
+      const prodHarness = async () => {
+        const { client, calls } = fakeServerClient();
+        const h = await setup(PROD_ENV, {
+          serverSql: SERVER_PROD,
+          wrapConnections: serverConnections(client),
+        });
+        return { h, calls };
+      };
 
-      it.each(OUT_OF_SCOPE)(
-        'refuses %s with SERVER_SQL_OUT_OF_SCOPE before any plan or dispatch',
-        async (sql) => {
-          const { client, calls } = fakeServerClient();
-          const h = await setup(PROD_ENV, {
-            serverSql: SERVER_PROD,
-            wrapConnections: serverConnections(client),
-          });
+      it.each(PROD_CASES)(
+        'plans $sql as SERVER.$cat with the strong confirmation and no dispatch',
+        async ({ cat, sql }) => {
+          const { h, calls } = await prodHarness();
           await allowServer(h);
           const { auth } = await h.userWith(SERVER_PERMS);
-          await expect(prepare(h, auth, sql)).rejects.toMatchObject({
-            code: 'SERVER_SQL_OUT_OF_SCOPE',
-          });
-          expect(await h.audit('PLAN_CREATED')).toEqual([]);
+          const p = await prepare(h, auth, sql);
+          expect(p.capability).toMatchObject({ route: 'SERVER_SQL', action: `SERVER.${cat}` });
+          expect(p.requires.strongConfirmation).toEqual(expect.any(String));
           expect(calls.save).toEqual([]);
           expect(calls.exec).toEqual([]);
           expect(writeCalls(h.mock)).toEqual([]);
         },
       );
 
-      it('refuses an out-of-scope statement through the API too (403, no plan)', async () => {
+      it.each(['CREATE TABLE FOO (ID NUMBER)', 'DROP TABLE FOO'])(
+        'runs %s end to end: plan, strong confirmation, dispatch, cleanup',
+        async (sql) => {
+          const { h, calls } = await prodHarness();
+          await allowServer(h);
+          const { auth } = await h.userWith(SERVER_PERMS);
+          const p = await prepare(h, auth, sql);
+          // Without the strong confirmation nothing is dispatched.
+          await expect(execute(h, auth, p)).rejects.toBeTruthy();
+          expect(calls.save).toEqual([]);
+          const report = await execute(h, auth, p, {
+            strongConfirmation: p.requires.strongConfirmation!,
+          });
+          expect(report).toMatchObject({ status: 'success' });
+          expect(calls.save).toHaveLength(1);
+          expect(calls.exec).toHaveLength(1);
+          expect(calls.remove).toHaveLength(1);
+        },
+      );
+
+      it('still refuses without the category permission (FORBIDDEN, no plan)', async () => {
+        const { h, calls } = await prodHarness();
+        await allowServer(h);
+        const { auth } = await h.userWith(['QUERY.SELECT', 'SERVER.DELETE']);
+        await expect(prepare(h, auth, 'DROP TABLE FOO')).rejects.toMatchObject({
+          code: 'FORBIDDEN',
+          details: { permission: 'SERVER.DDL' },
+        });
+        expect(await h.audit('PLAN_CREATED')).toEqual([]);
+        expect(calls.save).toEqual([]);
+      });
+
+      it('still needs a SERVER.* ALLOW rule, and a DENY still wins', async () => {
+        const { h, calls } = await prodHarness();
+        const { auth } = await h.userWith(SERVER_PERMS);
+        await expect(prepare(h, auth, 'DROP TABLE FOO')).rejects.toMatchObject({
+          code: 'FORBIDDEN',
+        });
+        await allowServer(h);
+        await h.policy({ name: 'no drop foo', actions: ['SERVER.DDL'], entities: ['FOO'] });
+        await expect(prepare(h, auth, 'DROP TABLE FOO')).rejects.toMatchObject({
+          code: 'FORBIDDEN',
+        });
+        expect(await h.audit('PLAN_CREATED')).toEqual([]);
+        expect(calls.save).toEqual([]);
+      });
+
+      it('still requires a WHERE: a no-WHERE DELETE is refused (WHERE_REQUIRED)', async () => {
+        const { h, calls } = await prodHarness();
+        await allowServer(h);
+        const { auth } = await h.userWith(SERVER_PERMS);
+        await expect(prepare(h, auth, 'DELETE FROM TGFPAR')).rejects.toMatchObject({
+          code: 'WHERE_REQUIRED',
+        });
+        expect(await h.audit('PLAN_CREATED')).toEqual([]);
+        expect(calls.save).toEqual([]);
+      });
+
+      it('still fails closed on a q-quote (SERVER_SQL_OUT_OF_SCOPE, no plan)', async () => {
+        const { h, calls } = await prodHarness();
+        await allowServer(h);
+        const { auth } = await h.userWith(SERVER_PERMS);
+        await expect(
+          prepare(h, auth, "DELETE FROM TGFPAR WHERE NOMEPARC = q'[X]'"),
+        ).rejects.toMatchObject({ code: 'SERVER_SQL_OUT_OF_SCOPE' });
+        expect(await h.audit('PLAN_CREATED')).toEqual([]);
+        expect(calls.save).toEqual([]);
+      });
+
+      it('plans a production DELETE through the API too (no dispatch at preview)', async () => {
         // The app's own route reads the switches from config, not from the harness option.
         const h = await setup({
           ...PROD_ENV,
@@ -3452,18 +3527,13 @@ describe('MutationService server-side route (Executa Banco)', () => {
           url: '/api/query/preview',
           payload: { sql: 'DELETE FROM TGFPAR WHERE CODPARC = 999' },
         });
-        expect(res.statusCode, res.body).toBe(403);
-        expect(res.json()).toMatchObject({ error: { code: 'SERVER_SQL_OUT_OF_SCOPE' } });
-        expect(await h.audit('PLAN_CREATED')).toEqual([]);
+        expect(res.statusCode, res.body).toBe(200);
+        expect(await h.audit('PLAN_CREATED')).toHaveLength(1);
         expect(writeCalls(h.mock)).toEqual([]);
       });
 
       it('lets a server-side UPDATE (subquery) through: plan, strong confirmation, dispatch', async () => {
-        const { client, calls } = fakeServerClient();
-        const h = await setup(PROD_ENV, {
-          serverSql: SERVER_PROD,
-          wrapConnections: serverConnections(client),
-        });
+        const { h, calls } = await prodHarness();
         await allowServer(h);
         const { auth } = await h.userWith(SERVER_PERMS);
         const p = await prepare(h, auth, SERVER_UPDATE);
@@ -3478,14 +3548,6 @@ describe('MutationService server-side route (Executa Banco)', () => {
         expect(calls.save).toHaveLength(1);
         expect(calls.exec).toHaveLength(1);
         expect(calls.remove).toHaveLength(1);
-      });
-
-      it('leaves HOMOLOGATION unrestricted: the same DELETE still plans', async () => {
-        const h = await setup({}, { serverSql: SERVER_ON });
-        await allowServer(h);
-        const { auth } = await h.userWith(SERVER_PERMS);
-        const p = await prepare(h, auth, 'DELETE FROM TGFPAR WHERE CODPARC = 999');
-        expect(p.capability).toMatchObject({ route: 'SERVER_SQL', action: 'SERVER.DELETE' });
       });
     });
 

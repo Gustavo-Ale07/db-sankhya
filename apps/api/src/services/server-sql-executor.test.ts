@@ -214,9 +214,10 @@ describe('ServerSqlExecutor', () => {
     expect(f.saves).toHaveLength(0);
   });
 
-  describe('production phase scope (phase 1: UPDATE only)', () => {
-    const PROD_OUT_OF_SCOPE: Array<{ category: ServerSqlCategory; sql: string }> = [
+  describe('production scope (phase 2: every category)', () => {
+    const PROD_CASES: Array<{ category: ServerSqlCategory; sql: string }> = [
       { category: 'DELETE', sql: 'DELETE FROM TGFCAB WHERE NUNOTA = 1' },
+      { category: 'DDL', sql: 'CREATE TABLE AD_X (ID NUMBER)' },
       { category: 'DDL', sql: 'DROP TABLE AD_X' },
       { category: 'DDL', sql: 'TRUNCATE TABLE AD_X' },
       { category: 'DDL', sql: 'ALTER TABLE AD_X ADD (C NUMBER)' },
@@ -229,28 +230,29 @@ describe('ServerSqlExecutor', () => {
       { category: 'PLSQL', sql: 'BEGIN NULL; END;' },
     ];
 
-    it.each(PROD_OUT_OF_SCOPE)(
-      'refuses $sql in PRODUCTION before any gateway call (SERVER_SQL_OUT_OF_SCOPE)',
-      async ({ category, sql }) => {
-        const f = fakeClient();
-        const executor = new ServerSqlExecutor({ client: f.client });
-        const err = await executor
-          .dispatch({ category, sql, block: BLOCK, simulated: false, environment: 'PRODUCTION' })
-          .catch((e: unknown) => e);
-        expect(isAppError(err) && err.code).toBe('SERVER_SQL_OUT_OF_SCOPE');
-        expect(f.saves).toHaveLength(0);
-        expect(f.actions).toHaveLength(0);
-        expect(f.removes).toHaveLength(0);
-      },
-    );
+    it.each(PROD_CASES)('dispatches $sql in PRODUCTION', async ({ category, sql }) => {
+      const f = fakeClient();
+      const executor = new ServerSqlExecutor({ client: f.client });
+      const out = await executor.dispatch({
+        category,
+        sql,
+        block: BLOCK,
+        simulated: false,
+        environment: 'PRODUCTION',
+      });
+      expect(out.status).toBe('EXECUTED');
+      expect(f.saves).toHaveLength(1);
+      expect(f.actions).toHaveLength(1);
+      expect(f.removes).toHaveLength(1);
+    });
 
-    it('decides from the statement, not the category: a DELETE labelled DML_RAW is still refused', async () => {
+    it('still refuses an unreadable leading verb (q-quote) in PRODUCTION before any gateway call', async () => {
       const f = fakeClient();
       const executor = new ServerSqlExecutor({ client: f.client });
       const err = await executor
         .dispatch({
-          category: 'DML_RAW',
-          sql: 'DELETE FROM TGFCAB WHERE NUNOTA = 1',
+          category: 'DELETE',
+          sql: "DELETE FROM TGFCAB WHERE OBS = q'[X]'",
           block: BLOCK,
           simulated: false,
           environment: 'PRODUCTION',
@@ -258,6 +260,7 @@ describe('ServerSqlExecutor', () => {
         .catch((e: unknown) => e);
       expect(isAppError(err) && err.code).toBe('SERVER_SQL_OUT_OF_SCOPE');
       expect(f.saves).toHaveLength(0);
+      expect(f.actions).toHaveLength(0);
     });
 
     it('lets an UPDATE with a subquery run in PRODUCTION', async () => {

@@ -805,8 +805,9 @@ export class MutationService {
     } catch (e) {
       throw refuse('AUTHORIZE', e as AppError);
     }
-    // Production phase scope (phase 1: UPDATE only), decided from the statement's own leading verb
-    // rather than `category`, so no production plan is ever created for an out-of-scope statement.
+    // Production scope (phase 2: every routed verb; an unreadable one fails closed), decided from
+    // the statement's own leading verb rather than `category`, so no production plan is ever
+    // created for an out-of-scope statement.
     // Re-checked on re-authorization (this same path) and again by the executor right before the
     // dispatch.
     try {

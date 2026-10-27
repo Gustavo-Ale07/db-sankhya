@@ -133,10 +133,15 @@ Ordem de verificação, tudo fail-closed:
 2. `GLOBAL_WRITE_ENABLED` e `WRITE_TO_SANKHYA` → `READ_ONLY_MODE` (mesmos switches gerais).
 3. **Ambiente:** só HOMOLOGAÇÃO/SANDBOX. PRODUÇÃO exige opt-in separado
    (`SERVER_SQL_PRODUCTION_OPT_IN`) **e** `SAFE_MODE` desligado; caso contrário
-   `SERVER_SQL_PRODUCTION_BLOCKED`. Mesmo com o opt-in, PRODUÇÃO fase 1 só aceita `UPDATE`
-   (inclusive com subconsulta/expressão): `DELETE`, DDL (`DROP`/`TRUNCATE`/…), `MERGE`,
-   `INSERT`/`INSERT…SELECT`, DCL e PL/SQL são recusados com `SERVER_SQL_OUT_OF_SCOPE` (403).
-   A decisão vem do verbo real do statement (não da categoria) e é checada na preparação, na
+   `SERVER_SQL_PRODUCTION_BLOCKED`. **Fase 2 (27/10/2026):** com o opt-in, PRODUÇÃO aceita
+   a rota completa — DDL, `DELETE`, DML_RAW (`MERGE`, `INSERT`/`INSERT…SELECT`, `UPDATE` com
+   subconsulta), DCL e PL/SQL —, cada uma ainda sujeita a todas as proteções desta lista
+   (RBAC `SERVER.<categoria>`, ALLOW deny-wins, `WHERE` obrigatório, confirmação forte,
+   entidade de controle bloqueada como alvo, política de leitura das fontes, um statement por
+   payload). A fase 1 (até `ed56ff4`) aceitava só `UPDATE`. O gate de escopo continua: em
+   PRODUÇÃO, um statement cujo verbo inicial não pode ser lido com certeza (q-quote, sem
+   palavra-chave, verbo sem rota) é recusado com `SERVER_SQL_OUT_OF_SCOPE` (403). A decisão
+   vem do verbo real do statement (não da categoria) e é checada na preparação, na
    reautorização e de novo no `ServerSqlExecutor.dispatch`, antes de qualquer chamada ao
    gateway. HOMOLOGAÇÃO/SANDBOX não têm essa restrição.
 4. **RBAC:** a permissão `SERVER.<categoria>` precisa estar concedida, senão `FORBIDDEN`.

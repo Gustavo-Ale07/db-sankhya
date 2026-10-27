@@ -65,9 +65,11 @@ describe('assertServerSqlAllowed', () => {
   });
 });
 
-describe('assertServerSqlEnvironmentScope (phase-1 production scope)', () => {
-  // These statements all share the server-side route but are NOT in the phase-1 production scope.
-  const outOfScope = [
+describe('assertServerSqlEnvironmentScope (phase-2 production scope)', () => {
+  // Every category the server-side route classifies is in the phase-2 production scope.
+  const inScope = [
+    'UPDATE TGFCAB SET V = 1 WHERE NUNOTA = 1',
+    'UPDATE TGFCAB SET V = (SELECT MAX(X) FROM TMP) WHERE NUNOTA IN (SELECT NUNOTA FROM TMP)',
     'DELETE FROM TGFCAB WHERE NUNOTA = 1',
     'DROP TABLE AD_X',
     'TRUNCATE TABLE AD_X',
@@ -78,29 +80,27 @@ describe('assertServerSqlEnvironmentScope (phase-1 production scope)', () => {
     'INSERT INTO TGFCAB (NUNOTA) SELECT NUNOTA FROM TMP',
     'GRANT SELECT ON TGFCAB TO SOMEUSER',
     'BEGIN NULL; END;',
+    '  delete from tgfcab where nunota = 1  ',
   ];
 
-  it('never restricts HOMOLOGATION or SANDBOX (full category set still gated elsewhere)', () => {
-    for (const env of ['HOMOLOGATION', 'SANDBOX'] as const) {
-      for (const sql of ['UPDATE TGFCAB SET V = 1 WHERE NUNOTA = 1', ...outOfScope]) {
+  it('allows every routed category in every environment (RBAC/policy/switches gate them)', () => {
+    for (const env of ['PRODUCTION', 'HOMOLOGATION', 'SANDBOX'] as const) {
+      for (const sql of inScope) {
         expect(() => assertServerSqlEnvironmentScope(sql, env), `${env}: ${sql}`).not.toThrow();
       }
     }
   });
 
-  it('allows an UPDATE against PRODUCTION, including subquery / expression UPDATEs', () => {
+  it('fails closed on an unreadable or unrouted leading verb against PRODUCTION', () => {
     for (const sql of [
-      'UPDATE TGFCAB SET V = 1 WHERE NUNOTA = 1',
-      'UPDATE TGFCAB SET V = V + 1 WHERE NUNOTA = 1',
-      'UPDATE TGFCAB SET V = (SELECT MAX(X) FROM TMP) WHERE NUNOTA IN (SELECT NUNOTA FROM TMP)',
-      '  update tgfcab set v = 1 where nunota = 1  ',
+      "q'[UPDATE X SET Y=1]'",
+      "DELETE FROM X WHERE Y = q'[a]'",
+      '',
+      '-- just a comment',
+      "'a string'",
+      'SELECT 1 FROM DUAL',
+      'WITH A AS (SELECT 1 FROM DUAL) SELECT * FROM A',
     ]) {
-      expect(() => assertServerSqlEnvironmentScope(sql, 'PRODUCTION'), sql).not.toThrow();
-    }
-  });
-
-  it('refuses every non-UPDATE statement against PRODUCTION with SERVER_SQL_OUT_OF_SCOPE', () => {
-    for (const sql of outOfScope) {
       expect(
         codeOf(() => assertServerSqlEnvironmentScope(sql, 'PRODUCTION')),
         sql,
@@ -108,17 +108,12 @@ describe('assertServerSqlEnvironmentScope (phase-1 production scope)', () => {
     }
   });
 
-  it('fails closed on an unreadable leading verb (q-quote / no keyword) against PRODUCTION', () => {
-    for (const sql of ["q'[UPDATE X SET Y=1]'", '', '-- just a comment', "'a string'"]) {
-      expect(
-        codeOf(() => assertServerSqlEnvironmentScope(sql, 'PRODUCTION')),
-        sql,
-      ).toBe('SERVER_SQL_OUT_OF_SCOPE');
+  it('SERVER_SQL_PRODUCTION_VERBS covers exactly the verbs the route classifies', () => {
+    for (const verb of SERVER_SQL_PRODUCTION_VERBS) {
+      expect(classifyServerSql(`${verb} X`).category, verb).not.toBe('UNSUPPORTED');
     }
-  });
-
-  it('SERVER_SQL_PRODUCTION_VERBS is exactly {UPDATE} in phase 1', () => {
-    expect([...SERVER_SQL_PRODUCTION_VERBS].sort()).toEqual(['UPDATE']);
+    expect(SERVER_SQL_PRODUCTION_VERBS.has('SELECT')).toBe(false);
+    expect(SERVER_SQL_PRODUCTION_VERBS.has('WITH')).toBe(false);
   });
 });
 

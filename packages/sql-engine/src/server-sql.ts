@@ -186,22 +186,13 @@ export function assertServerSqlAllowed(gate: ServerSqlGate, environment: ServerE
 }
 
 /**
- * The leading statement verbs the server-side ("Executa Banco") route may run against PRODUCTION in
- * the current rollout phase. Phase 1 is UPDATE only — including an UPDATE with a subquery or an
- * expression the gateway cannot run directly. Every other statement that shares this route and its
- * SERVER.* permission (a generic DELETE, any DDL, MERGE, INSERT / INSERT…SELECT, DCL, a PL/SQL
- * block) stays OUT OF SCOPE in production until a later phase opens it explicitly. Widening the
- * phase means adding a verb here together with its own review — never by relaxing the gate below.
- */
-export const SERVER_SQL_PRODUCTION_VERBS: ReadonlySet<string> = new Set(['UPDATE']);
-
-/**
- * PRODUCTION phase-scope gate for the server-side route, enforced in ADDITION to the SERVER.*
+ * PRODUCTION scope gate for the server-side route, enforced in ADDITION to the SERVER.*
  * permission, the policy engine and `assertServerSqlAllowed`. In PRODUCTION only a statement whose
- * leading verb is in {@link SERVER_SQL_PRODUCTION_VERBS} (phase 1: UPDATE) may run; anything else is
- * refused with `SERVER_SQL_OUT_OF_SCOPE` BEFORE it is dispatched. HOMOLOGATION / SANDBOX are not
- * restricted here (the switches, RBAC and policy still apply) — the gate is specifically about what
- * the first production rollout may touch, not about weakening the other controls.
+ * leading verb is in {@link SERVER_SQL_PRODUCTION_VERBS} may run; anything else is refused with
+ * `SERVER_SQL_OUT_OF_SCOPE` BEFORE it is dispatched. HOMOLOGATION / SANDBOX are not restricted here
+ * (the switches, RBAC and policy still apply). Phase 1 limited production to UPDATE; phase 2 opens
+ * every verb the route classifies, so what this gate still refuses in production is a statement
+ * whose leading verb cannot be read with certainty (q-quote, no keyword, unknown verb).
  *
  * Fail closed and verb-based, so it cannot be bypassed by a mis-classification (it does not trust
  * the caller's category) nor by a `;`-smuggled second statement (the leading verb is still read
@@ -212,13 +203,13 @@ export const SERVER_SQL_PRODUCTION_VERBS: ReadonlySet<string> = new Set(['UPDATE
 export function assertServerSqlEnvironmentScope(sql: string, environment: ServerEnvironment): void {
   if (environment !== 'PRODUCTION') return;
   // A q-quote desyncs the ansi tokenizer, so the leading verb cannot be fully trusted → fail closed
-  // (out of scope). Phase-1 UPDATEs do not need a q-quote; one can be rephrased without it.
+  // (out of scope). A statement can be rephrased without the q-quote.
   const verb = containsQuoteLiteral(sql) ? undefined : leadingWord(sql);
   if (verb === undefined || !SERVER_SQL_PRODUCTION_VERBS.has(verb)) {
     throw new AppError(
       'SERVER_SQL_OUT_OF_SCOPE',
-      'Only an UPDATE may run on the server-side route against PRODUCTION in this phase; this statement is out of scope.',
-      { environment, phase: 'phase-1-update-only', ...(verb ? { verb } : {}) },
+      'This statement is out of scope for the server-side route against PRODUCTION: its leading verb cannot be read with certainty or has no server-side route.',
+      { environment, phase: 'phase-2-all-categories', ...(verb ? { verb } : {}) },
     );
   }
 }
@@ -247,6 +238,15 @@ const LEADING: Record<string, ServerSqlCategory> = {
   EXEC: 'PLSQL',
   EXECUTE: 'PLSQL',
 };
+
+/**
+ * The leading statement verbs the server-side ("Executa Banco") route may run against PRODUCTION.
+ * Phase 1 was UPDATE only; phase 2 opens every verb the route classifies (DDL, DELETE, DML_RAW,
+ * DCL, PL/SQL). Each statement still needs its SERVER.<category> permission, an ALLOW policy
+ * (deny wins), a WHERE where required, the strong confirmation and the switches — this set only
+ * decides which verbs the production scope gate does not refuse outright.
+ */
+export const SERVER_SQL_PRODUCTION_VERBS: ReadonlySet<string> = new Set(Object.keys(LEADING));
 
 /** First significant word token (skips whitespace and comments). */
 function leadingWord(sql: string): string | undefined {

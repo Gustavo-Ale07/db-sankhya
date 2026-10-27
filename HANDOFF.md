@@ -1,5 +1,13 @@
 # HANDOFF — Rodada 2 (Prompt v2/v2.1) + Rodada 3 (ações nativas), 22/10/2026
 
+## Estado em 27/10/2026 — fase 2: rota server-side completa liberada em produção
+
+- **Código:** o gate de escopo de produção (`assertServerSqlEnvironmentScope`) deixou de restringir PRODUÇÃO a `UPDATE`. `SERVER_SQL_PRODUCTION_VERBS` passou a ser todo verbo que a rota classifica (DDL, `DELETE`, DML_RAW, DCL, PL/SQL). O gate continua na preparação, na reautorização e no `ServerSqlExecutor.dispatch`, e ainda recusa em PRODUÇÃO (`SERVER_SQL_OUT_OF_SCOPE`) um statement com verbo ilegível (q-quote, sem palavra-chave) ou sem rota.
+- **Proteções intactas:** RBAC `SERVER.<categoria>`, política ALLOW deny-wins, `WHERE` obrigatório, confirmação forte em PRODUÇÃO, entidade de controle (`AD_MANIPULADADOS`) bloqueada como alvo, política de leitura das fontes, fail-closed de q-quote, um statement por payload, `SERVER_SQL_ENABLED` + `SERVER_SQL_PRODUCTION_OPT_IN` + `SAFE_MODE=false`.
+- **Decisão do responsável:** seguir sem esperar o chamado da AutorizacaoApi; o contrato do `executeJava` (ação `98`, módulo `mge`, `refreshType=NONE`, envelope) será provado pelo primeiro teste do usuário na UI: `CREATE TABLE AD_DBX_TESTE (ID NUMBER)` seguido de `DROP TABLE AD_DBX_TESTE`, cada um por prévia → confirmação. Conferir `EXECUTED`, `cleanup=DELETED` na auditoria e a tabela aparecendo/sumindo no dicionário.
+- **Env alvo na VPS:** o mesmo de 26/10 mais `SERVER_SQL_ENABLED=true` e `SERVER_SQL_PRODUCTION_OPT_IN=true`.
+- **Rollback:** `SERVER_SQL_ENABLED=false` no `.env` + voltar a imagem anterior (tag de rollback) + `docker compose up -d` do `app`.
+
 ## Estado em 26/10/2026 — em produção, escrita UPDATE validada
 
 - **Deploy:** `ed56ff4` (branch `backup/rodada-2-2026-10-21`) em produção na VPS, `/var/www/db-sankhya`, imagem `db-sankhya:latest`; commit confirmado via `/api/meta`. `main` e `migration` intocados.
