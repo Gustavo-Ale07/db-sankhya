@@ -36,6 +36,18 @@ Quando `SERVER_SQL_ENABLED=false`, a última linha **não** se aplica: o stateme
 nos caminhos existentes e `parseWrite` recusa o que o gateway não sabe salvar
 (`SQL_UNSUPPORTED`/`SQL_PARSE_ERROR`). Nenhuma prévia é criada e nada é gravado.
 
+**Editor (`POST /api/query`), correção de 27/10/2026:** com `SERVER_SQL_ENABLED=true`, o
+`/api/query` usa a mesma decisão de elegibilidade da prévia (`serverSqlEligible`) e
+responde a um statement elegível com o ponteiro para `/api/query/preview`, em vez de
+mandá-lo ao gate de leitura. Isso cobre o que o parser PG/T-SQL deixa como `UNKNOWN`
+(DDL com tipos Oracle como `NUMBER`/`VARCHAR2`, `MERGE`, `GRANT`, `BEGIN ... END`), que
+antes era recusado como `SQL_FORBIDDEN` ("keyword CREATE is not allowed in a read"). A
+UI segue o ponteiro e abre o diálogo com o rótulo EXECUÇÃO DIRETA. DDL sobre tabela
+`AD_*` também passou a ser elegível (antes só o `CREATE` escapava, por ser `UNKNOWN`; o
+`DROP TABLE AD_X` era recusado); a entidade de controle (`AD_MANIPULADADOS`) continua
+bloqueada como alvo, e o gerador de artefatos `AD_*` (`/api/ddl`) não mudou. Com
+`SERVER_SQL_ENABLED=false` o `/api/query` responde exatamente como antes.
+
 ## Categorias (`SERVER.*`)
 
 Cada statement elegível recebe uma categoria, que é a permissão exigida:

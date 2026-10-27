@@ -1,5 +1,12 @@
 # HANDOFF — Rodada 2 (Prompt v2/v2.1) + Rodada 3 (ações nativas), 22/10/2026
 
+## Estado em 27/10/2026 (tarde) — correção: o editor agora leva DDL Oracle/MERGE/GRANT/PL-SQL à prévia
+
+- **Bug:** pela UI, `CREATE TABLE AD_DBX_TESTE (ID NUMBER)` voltava `SQL_FORBIDDEN` ("keyword CREATE is not allowed in a read"). O parser PG/T-SQL classifica DDL com tipo Oracle, `MERGE`, `GRANT` e PL/SQL como `UNKNOWN`; o `/api/query` mandava `UNKNOWN` ao gate de leitura. Além disso, `serverSqlEligible` excluía DDL sobre `AD_*`, então `DROP TABLE AD_DBX_TESTE` (reconhecido como `DROP_TABLE`) seria recusado na prévia.
+- **Correção:** com `SERVER_SQL_ENABLED=true`, o `/api/query` usa `serverSqlEligible` (a mesma regra da prévia) e devolve o ponteiro para `/api/query/preview`; a UI já segue o ponteiro (não classifica SQL) e mostra EXECUÇÃO DIRETA. DDL `AD_*` passou a ser elegível; `AD_MANIPULADADOS` segue bloqueada como alvo; `/api/ddl` inalterado. Desligado, comportamento idêntico (provado rodando o teste "off" contra o código anterior).
+- **Testes novos (`mutations.int.test.ts`, "/api/query routing (the editor path)"):** em PRODUÇÃO com SERVER_SQL + opt-in, `CREATE TABLE AD_DBX_TESTE (ID NUMBER)`, `DROP TABLE AD_DBX_TESTE`, `DELETE` genérico, `MERGE`, `GRANT` e `BEGIN NULL; END;` fazem ponteiro → prévia `SERVER.<cat>` com confirmação forte → execute despacha (save/ação/remove, cliente fake); `SELECT` continua leitura; `DROP TABLE AD_MANIPULADADOS` recusado; desligado, as mesmas respostas de antes. Contra o código anterior, 5 dos 6 casos "ligado" falhavam (reproduzindo o bug).
+- **Prova real:** continua com o usuário, pela UI (`CREATE`/`DROP AD_DBX_TESTE`, prévia → confirmação).
+
 ## Estado em 27/10/2026 — fase 2: rota server-side completa liberada em produção
 
 - **Código:** o gate de escopo de produção (`assertServerSqlEnvironmentScope`) deixou de restringir PRODUÇÃO a `UPDATE`. `SERVER_SQL_PRODUCTION_VERBS` passou a ser todo verbo que a rota classifica (DDL, `DELETE`, DML_RAW, DCL, PL/SQL). O gate continua na preparação, na reautorização e no `ServerSqlExecutor.dispatch`, e ainda recusa em PRODUÇÃO (`SERVER_SQL_OUT_OF_SCOPE`) um statement com verbo ilegível (q-quote, sem palavra-chave) ou sem rota.

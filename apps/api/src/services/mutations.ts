@@ -277,9 +277,6 @@ const SERVER_PERMISSION: Record<ServerCategory, CapabilityAction> = {
   PLSQL: 'SERVER.PLSQL',
 };
 
-/** Custom-table prefix: custom (AD_*) DDL is a generated artifact, not a server-side execution. */
-const CUSTOM_TABLE = /^AD_/i;
-
 const SCRATCH_TABLE = /^tmp_/i;
 const IDENT = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 /** Every primary-key column has a value (a null key could match or create any row). */
@@ -2692,11 +2689,13 @@ function serverCategoryOf(sql: string): ServerCategory | null {
 /**
  * Which statements the gateway cannot run and so route server-side, and which stay on their
  * existing path. SELECT never routes; a scratch (`tmp_`) write or DDL stays local; a gateway-
- * savable INSERT/UPDATE shape (`stmt` present) stays on the save service; custom (`AD_*`) DDL
- * stays a generated artifact. Everything else — a generic DELETE, a raw/expression DML shape, a
- * native DDL, a DCL or PL/SQL statement — is eligible for the server-side route.
+ * savable INSERT/UPDATE shape (`stmt` present) stays on the save service. Everything else — a
+ * generic DELETE, a raw/expression DML shape, a DDL (custom `AD_*` tables included, whether or not
+ * the PG/T-SQL parser recognised it), a DCL or PL/SQL statement — is eligible for the server-side
+ * route. The control entity is still refused as a target by `resolveServerSql`. `/api/query` uses
+ * this same decision to point such statements at the preview instead of the read gate.
  */
-function serverSqlEligible(c: Classified, sql: string): ServerCategory | null {
+export function serverSqlEligible(c: Classified, sql: string): ServerCategory | null {
   switch (c.kind) {
     case 'SELECT':
       return null;
@@ -2710,7 +2709,7 @@ function serverSqlEligible(c: Classified, sql: string): ServerCategory | null {
     case 'CREATE_TABLE':
     case 'ALTER_TABLE':
     case 'DROP_TABLE':
-      if (SCRATCH_TABLE.test(c.table) || CUSTOM_TABLE.test(c.table)) return null;
+      if (SCRATCH_TABLE.test(c.table)) return null;
       return serverCategoryOf(sql);
     case 'UNKNOWN':
       return serverCategoryOf(sql);

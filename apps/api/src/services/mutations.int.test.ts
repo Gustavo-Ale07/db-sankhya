@@ -3551,6 +3551,139 @@ describe('MutationService server-side route (Executa Banco)', () => {
       });
     });
 
+    describe('/api/query routing (the editor path)', () => {
+      // What the editor sends: Oracle-syntax DDL the PG/T-SQL parser leaves UNKNOWN, a DROP of a
+      // custom table, a generic DELETE, MERGE, GRANT and PL/SQL.
+      const ROUTED: Array<{ cat: ServerCategory; sql: string }> = [
+        { cat: 'DDL', sql: 'CREATE TABLE AD_DBX_TESTE (ID NUMBER)' },
+        { cat: 'DDL', sql: 'DROP TABLE AD_DBX_TESTE' },
+        { cat: 'DELETE', sql: 'DELETE FROM TGFPAR WHERE CODPARC = 999' },
+        {
+          cat: 'DML_RAW',
+          sql: "MERGE INTO TGFPAR T USING DUAL ON (T.CODPARC = 1) WHEN MATCHED THEN UPDATE SET T.NOMEPARC = 'X'",
+        },
+        { cat: 'DCL', sql: 'GRANT SELECT ON TGFPAR TO SOMEROLE' },
+        { cat: 'PLSQL', sql: 'BEGIN NULL; END;' },
+      ];
+      const SERVER_ENV = {
+        ...WRITES,
+        SANKHYA_ENVIRONMENT: 'PRODUCTION',
+        SERVER_SQL_ENABLED: 'true',
+        SERVER_SQL_PRODUCTION_OPT_IN: 'true',
+      };
+      /** The app's own routes, with the gateway boundary swapped for the recording fake. */
+      const httpHarness = async (env: Record<string, string>) => {
+        const { client, calls } = fakeServerClient();
+        const h = await setup(env);
+        const real = h.app.services.connections;
+        real.getRuntime = serverConnections(client)(real).getRuntime;
+        return { h, calls };
+      };
+      const query = (h: Harness, cookie: string, sql: string) =>
+        h.call(cookie, { method: 'POST', url: '/api/query', payload: { sql } });
+
+      it.each(ROUTED)(
+        'with SERVER_SQL on, /api/query points $sql at the preview and it dispatches as SERVER.$cat',
+        async ({ cat, sql }) => {
+          const { h, calls } = await httpHarness(SERVER_ENV);
+          await allowServer(h);
+          const { cookie } = await h.userWith(SERVER_PERMS);
+
+          // Not the read gate: a pointer to the preview, nothing planned or dispatched.
+          const pointed = await query(h, cookie, sql);
+          expect(pointed.statusCode, pointed.body).toBe(400);
+          expect(pointed.json().error).toMatchObject({
+            code: 'SQL_UNSUPPORTED',
+            details: { preview: '/api/query/preview' },
+          });
+          expect(await h.audit('PLAN_CREATED')).toEqual([]);
+          expect(calls.save).toEqual([]);
+
+          const planned = await h.call(cookie, {
+            method: 'POST',
+            url: '/api/query/preview',
+            payload: { sql },
+          });
+          expect(planned.statusCode, planned.body).toBe(200);
+          const plan = planned.json() as {
+            planId: string;
+            token: string;
+            capability: { route: string; action: string };
+            requires: { strongConfirmation: string | null };
+          };
+          expect(plan.capability).toMatchObject({ route: 'SERVER_SQL', action: `SERVER.${cat}` });
+          expect(plan.requires.strongConfirmation).toEqual(expect.any(String));
+          expect(calls.save).toEqual([]);
+
+          const ran = await h.call(cookie, {
+            method: 'POST',
+            url: '/api/query/execute',
+            payload: {
+              planId: plan.planId,
+              token: plan.token,
+              idempotencyKey: randomUUID(),
+              strongConfirmation: plan.requires.strongConfirmation,
+            },
+          });
+          expect(ran.statusCode, ran.body).toBe(200);
+          expect(ran.json()).toMatchObject({ status: 'success' });
+          expect(calls.save).toHaveLength(1);
+          expect(calls.exec).toHaveLength(1);
+          expect(calls.remove).toHaveLength(1);
+          expect(writeCalls(h.mock)).toEqual([]);
+        },
+      );
+
+      it('with SERVER_SQL on, a SELECT still runs as a read', async () => {
+        const h = await setup(SERVER_ENV);
+        const { cookie } = await h.userWith(SERVER_PERMS);
+        const res = await query(h, cookie, 'SELECT CODPARC FROM TGFPAR WHERE CODPARC = 1');
+        expect(res.statusCode, res.body).toBe(200);
+        expect(res.json().rows).toHaveLength(1);
+      });
+
+      it('with SERVER_SQL on, the control entity is still refused at the preview', async () => {
+        const { h, calls } = await httpHarness(SERVER_ENV);
+        await allowServer(h);
+        const { cookie } = await h.userWith(SERVER_PERMS);
+        const res = await h.call(cookie, {
+          method: 'POST',
+          url: '/api/query/preview',
+          payload: { sql: 'DROP TABLE AD_MANIPULADADOS' },
+        });
+        expect(res.statusCode, res.body).not.toBe(200);
+        expect(await h.audit('PLAN_CREATED')).toEqual([]);
+        expect(calls.save).toEqual([]);
+      });
+
+      it('with SERVER_SQL off, the same statements are refused exactly as before', async () => {
+        // The real gateway mock, so the read gate is the one that answers.
+        const h = await setup({ ...WRITES, SANKHYA_ENVIRONMENT: 'PRODUCTION' });
+        await allowServer(h);
+        const { cookie } = await h.userWith(SERVER_PERMS);
+        const codes: Record<string, string | undefined> = {};
+        for (const { sql } of ROUTED) {
+          const res = await query(h, cookie, sql);
+          expect(res.statusCode, sql).not.toBe(200);
+          const error = res.json().error as { code: string; details?: { preview?: string } };
+          codes[sql] = `${error.code}${error.details?.preview ? ' -> preview' : ''}`;
+        }
+        expect(codes).toEqual({
+          // UNKNOWN to the parser: the read gate refuses it.
+          'CREATE TABLE AD_DBX_TESTE (ID NUMBER)': 'SQL_FORBIDDEN',
+          // Recognised DDL outside the scratch area: a plain refusal, no pointer.
+          'DROP TABLE AD_DBX_TESTE': 'SQL_UNSUPPORTED',
+          // A DELETE was always pointed at the preview (which plans it on the save route).
+          'DELETE FROM TGFPAR WHERE CODPARC = 999': 'SQL_UNSUPPORTED -> preview',
+          [ROUTED[3]!.sql]: 'SQL_FORBIDDEN',
+          'GRANT SELECT ON TGFPAR TO SOMEROLE': 'SQL_FORBIDDEN',
+          'BEGIN NULL; END;': 'SQL_FORBIDDEN',
+        });
+        expect(await h.audit('PLAN_CREATED')).toEqual([]);
+        expect(writeCalls(h.mock)).toEqual([]);
+      });
+    });
+
     it('keeps the WHERE protection: a no-WHERE DELETE is refused (WHERE_REQUIRED)', async () => {
       const h = await setup({}, { serverSql: SERVER_ON });
       await allowServer(h);

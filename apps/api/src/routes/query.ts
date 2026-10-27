@@ -11,7 +11,7 @@ import { dropEphemeral, isScratchName, planScratchRead } from '../services/hybri
 import type { HybridPart, ScratchRead } from '../services/hybrid';
 import { materialize } from '../services/materialize';
 import { ApprovalsService } from '../services/approvals';
-import { MutationService } from '../services/mutations';
+import { MutationService, serverSqlEligible } from '../services/mutations';
 import type { SankhyaCopier, SankhyaCopy } from '../services/mutations';
 import type { ScratchWorkspace } from '../services/scratch';
 import { PlansService } from '../services/plans';
@@ -191,7 +191,12 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
     // Sankhya read, refused there unless it is a plain SELECT.
     const classified = classifyStatement(body.sql);
     const mutation = mutationKind(classified);
-    if (mutation === null) {
+    // With the server-side route on, a statement it would run (DDL — Oracle syntax included, which
+    // the PG/T-SQL parser leaves UNKNOWN —, a generic DELETE, MERGE, INSERT…SELECT, an expression
+    // UPDATE, DCL, PL/SQL) is pointed at the preview, decided by the same rule the preview uses.
+    // Off, nothing changes: such a statement stays on the read gate or the plain refusal.
+    const serverCategory = config.serverSqlEnabled ? serverSqlEligible(classified, body.sql) : null;
+    if (mutation === null && serverCategory === null) {
       // A SELECT that names a tmp_ table runs in the caller's scratch: alone, or (hybrid) with
       // its Sankhya parts copied in first. tmp_ names never reach the Sankhya catalog.
       if (classified.kind === 'SELECT' && classified.tables.some(isScratchName)) {
@@ -203,6 +208,7 @@ export async function queryRoutes(app: FastifyInstance): Promise<void> {
     // INSERT / UPDATE / DELETE and DDL of tmp_ tables get a pointer to the preview; nothing is
     // planned or sent here, so the first Ctrl+Enter can never write.
     const previewable =
+      serverCategory !== null ||
       classified.kind === 'INSERT' ||
       classified.kind === 'UPDATE' ||
       classified.kind === 'DELETE' ||
