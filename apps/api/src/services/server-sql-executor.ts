@@ -24,7 +24,7 @@
  * change: the executor behaves identically either way (the mock transport answers the same calls),
  * but every result and audit record states which it was.
  */
-import { AppError, isAppError, type Environment } from '@dbx/shared';
+import { AppError, isAppError, redact, type Environment } from '@dbx/shared';
 import { assertServerSqlEnvironmentScope, type ServerSqlCategory } from '@dbx/sql-engine';
 import type { SankhyaClient } from '@dbx/sankhya-client';
 
@@ -96,20 +96,41 @@ export interface ServerSqlExecutorDeps {
   logger?: { error(obj: Record<string, unknown>, msg: string): void };
 }
 
+/** A generated numeric key: a positive integer, as a string or a safe number. */
+const PLAUSIBLE_KEY = /^[1-9]\d{0,17}$/;
+
 /**
- * Pulls the new record's key out of a DatasetSP.save result. An insert answers the generated pk
- * in `results`; the exact shape is gateway-defined, so this takes the first scalar it finds and
- * refuses (fails closed) when it finds none — the action must never fire against an unknown record.
+ * Pulls the new record's key out of a DatasetSP.save result. The gateway answers one row per saved
+ * record holding the values of the requested `fields`, in that order (the generated key included
+ * when it is requested). The key is read from its own column's position — never "the first value",
+ * which on 27/10/2026 was the TEXTO block and fired the action against a bogus key. Fails closed
+ * (null) unless there is exactly one row whose key cell is a plausible generated key: the action
+ * must never fire against an unknown record.
  */
-export function extractRecordId(results: unknown[][]): string | null {
-  for (const row of results) {
-    if (!Array.isArray(row)) continue;
-    for (const cell of row) {
-      if (typeof cell === 'string' && cell.trim() !== '') return cell.trim();
-      if (typeof cell === 'number' && Number.isFinite(cell)) return String(cell);
-    }
-  }
-  return null;
+export function extractRecordId(
+  results: unknown[][],
+  fields: readonly string[],
+  keyField: string,
+): string | null {
+  const index = fields.indexOf(keyField);
+  if (index < 0 || results.length !== 1) return null;
+  const row = results[0];
+  if (!Array.isArray(row) || row.length !== fields.length) return null;
+  const cell: unknown = row[index];
+  const text =
+    typeof cell === 'number' && Number.isSafeInteger(cell)
+      ? String(cell)
+      : typeof cell === 'string'
+        ? cell.trim()
+        : '';
+  return PLAUSIBLE_KEY.test(text) ? text : null;
+}
+
+/** The gateway's own error text, pattern-redacted, for the server log (never credentials). */
+function gatewayMessage(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  const scrubbed = redact(raw);
+  return typeof scrubbed === 'string' ? scrubbed.slice(0, 2000) : '';
 }
 
 export class ServerSqlExecutor {
@@ -140,17 +161,25 @@ export class ServerSqlExecutor {
     const { signal } = input;
 
     // 1. CREATE the dedicated record (always an INSERT: no pk, so no existing record is touched).
-    const saved = await this.deps.client.save(
-      {
-        entityName,
-        fields: [textField],
-        records: [{ values: { [textField]: input.block } }],
-      },
-      signal,
-    );
-    const recordId = extractRecordId(saved.results);
+    // The key is requested without a value so the gateway generates it and echoes it back.
+    const fields = [keyField, textField];
+    let saved: Awaited<ReturnType<ServerSqlClient['save']>>;
+    try {
+      saved = await this.deps.client.save(
+        { entityName, fields, records: [{ values: { [textField]: input.block } }] },
+        signal,
+      );
+    } catch (err) {
+      this.logFailure('save', err);
+      throw err;
+    }
+    const recordId = extractRecordId(saved.results, fields, keyField);
     if (recordId === null) {
       // We created a record we cannot identify: do not fire the action against an unknown key.
+      this.deps.logger?.error(
+        { step: 'save', entityName, resultShape: saved.results.map((r) => r.length) },
+        'The save answered no identifiable key; the server-side action was not fired',
+      );
       throw new AppError(
         'SANKHYA_BAD_RESPONSE',
         'The gateway did not return the id of the dedicated record; the action was not fired.',
@@ -169,6 +198,7 @@ export class ServerSqlExecutor {
       if (res.statusMessage !== undefined) action.statusMessage = res.statusMessage;
       if (res.transactionId !== undefined) action.transactionId = res.transactionId;
     } catch (err) {
+      this.logFailure('executeJava', err, recordId);
       // The action may or may not have run: clean up the record we control, then surface the error.
       await this.cleanup(recordId, signal);
       throw err;
@@ -203,10 +233,24 @@ export class ServerSqlExecutor {
     } catch (err) {
       const code = isAppError(err) ? err.code : 'INTERNAL_ERROR';
       this.deps.logger?.error(
-        { entityName, recordId, errorCode: code },
+        { entityName, recordId, errorCode: code, gatewayMessage: gatewayMessage(err) },
         'The dedicated server-side record could not be cleaned up (orphaned)',
       );
       return { ok: false, code };
     }
+  }
+
+  /** Logs a failed gateway step with the gateway's own (redacted) message; never throws. */
+  private logFailure(step: 'save' | 'executeJava', err: unknown, recordId?: string): void {
+    this.deps.logger?.error(
+      {
+        step,
+        entityName: this.config.entityName,
+        ...(recordId !== undefined ? { recordId } : {}),
+        errorCode: isAppError(err) ? err.code : 'INTERNAL_ERROR',
+        gatewayMessage: gatewayMessage(err),
+      },
+      `The server-side ${step} call failed`,
+    );
   }
 }

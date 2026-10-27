@@ -16,6 +16,14 @@ import {
 } from './server-sql-executor';
 import type { ServerSqlCategory } from '@dbx/sql-engine';
 
+/**
+ * What DatasetSP.save answers for one inserted record: the saved values of the requested fields,
+ * in request order, as strings — the generated ID (here 5001) included when it is requested.
+ */
+const echoSave = (input: SaveInput, id = '5001'): SaveResult => ({
+  results: [input.fields.map((f) => (f === 'ID' ? id : String(input.records[0]!.values[f] ?? '')))],
+});
+
 /** Programmable fake of the three client calls a dispatch uses; records every request. */
 function fakeClient(
   overrides: {
@@ -32,9 +40,7 @@ function fakeClient(
   const client: ServerSqlClient = {
     save: vi.fn((input: SaveInput) => {
       saves.push(input);
-      return Promise.resolve(
-        overrides.save?.(input) ?? ({ results: [['5001']] } satisfies SaveResult),
-      );
+      return Promise.resolve(overrides.save?.(input) ?? echoSave(input));
     }),
     executeJava: vi.fn((input: ExecuteJavaInput) => {
       actions.push(input);
@@ -56,16 +62,39 @@ function fakeClient(
 const BLOCK = "BEGIN\nEXECUTE IMMEDIATE q'[ALTER TABLE AD_X MODIFY (NOME VARCHAR2(120))]';\nEND;";
 
 describe('extractRecordId', () => {
-  it('takes the first scalar of the save result', () => {
-    expect(extractRecordId([['5001']])).toBe('5001');
-    expect(extractRecordId([[7]])).toBe('7');
-    expect(extractRecordId([[null, '  42 ']])).toBe('42');
+  const FIELDS = ['ID', 'TEXTO'];
+
+  it('reads the key from its own column, not the first value', () => {
+    expect(extractRecordId([['5001', BLOCK]], FIELDS, 'ID')).toBe('5001');
+    expect(extractRecordId([[7, BLOCK]], FIELDS, 'ID')).toBe('7');
+    expect(extractRecordId([['  42 ', BLOCK]], FIELDS, 'ID')).toBe('42');
+    // TEXTO before ID (the 27/10/2026 bug): still the numeric ID, never the block.
+    expect(extractRecordId([[BLOCK, '5001']], ['TEXTO', 'ID'], 'ID')).toBe('5001');
   });
 
-  it('returns null when there is no scalar to use', () => {
-    expect(extractRecordId([])).toBeNull();
-    expect(extractRecordId([[null]])).toBeNull();
-    expect(extractRecordId([['']])).toBeNull();
+  it('returns null when the key column is not identifiable or not a plausible key', () => {
+    // The production answer of 27/10/2026: only TEXTO was requested, so no ID came back.
+    expect(extractRecordId([[BLOCK]], ['TEXTO'], 'ID')).toBeNull();
+    expect(extractRecordId([], FIELDS, 'ID')).toBeNull();
+    expect(extractRecordId([[null, BLOCK]], FIELDS, 'ID')).toBeNull();
+    expect(extractRecordId([['', BLOCK]], FIELDS, 'ID')).toBeNull();
+    expect(extractRecordId([[BLOCK, BLOCK]], FIELDS, 'ID')).toBeNull();
+    expect(extractRecordId([['0', BLOCK]], FIELDS, 'ID')).toBeNull();
+    expect(extractRecordId([['-3', BLOCK]], FIELDS, 'ID')).toBeNull();
+    expect(extractRecordId([['1.5', BLOCK]], FIELDS, 'ID')).toBeNull();
+    expect(extractRecordId([[1.5, BLOCK]], FIELDS, 'ID')).toBeNull();
+    // A row that does not match the requested fields, or more than one row.
+    expect(extractRecordId([['5001']], FIELDS, 'ID')).toBeNull();
+    expect(
+      extractRecordId(
+        [
+          ['5001', BLOCK],
+          ['5002', BLOCK],
+        ],
+        FIELDS,
+        'ID',
+      ),
+    ).toBeNull();
   });
 });
 
@@ -81,11 +110,12 @@ describe('ServerSqlExecutor', () => {
       environment: 'HOMOLOGATION',
     });
 
-    // 1. INSERT into AD_MANIPULADADOS: the block in TEXTO, and NO pk (never overwrites a record).
+    // 1. INSERT into AD_MANIPULADADOS: the block in TEXTO, ID requested without a value (the
+    // gateway generates and echoes it), and NO pk (never overwrites a record).
     expect(f.saves).toEqual([
       {
         entityName: 'AD_MANIPULADADOS',
-        fields: ['TEXTO'],
+        fields: ['ID', 'TEXTO'],
         records: [{ values: { TEXTO: BLOCK } }],
       },
     ]);
@@ -138,6 +168,85 @@ describe('ServerSqlExecutor', () => {
     expect(isAppError(err) && err.code).toBe('SANKHYA_BAD_RESPONSE');
     expect(f.actions).toHaveLength(0);
     expect(f.removes).toHaveLength(0);
+  });
+
+  it('does not fire the action when the save echoes only the TEXTO block (the 27/10/2026 answer)', async () => {
+    const log = vi.fn();
+    const f = fakeClient({ save: (input) => ({ results: [[input.records[0]!.values.TEXTO]] }) });
+    const executor = new ServerSqlExecutor({ client: f.client, logger: { error: log } });
+    const err = await executor
+      .dispatch({
+        category: 'DDL',
+        sql: 'CREATE TABLE AD_DBX_TESTE (ID NUMBER)',
+        block: BLOCK,
+        simulated: false,
+        environment: 'PRODUCTION',
+      })
+      .catch((e: unknown) => e);
+    expect(isAppError(err) && err.code).toBe('SANKHYA_BAD_RESPONSE');
+    expect(f.actions).toHaveLength(0);
+    expect(f.removes).toHaveLength(0);
+    expect(log).toHaveBeenCalledOnce();
+  });
+
+  it('logs the gateway message when the save fails (redacted, no credentials)', async () => {
+    const log = vi.fn();
+    const f = fakeClient({
+      save: () => {
+        throw new AppError(
+          'SANKHYA_API_ERROR',
+          'ORA-01400: cannot insert NULL into ("X"."AD_MANIPULADADOS"."ID")',
+        );
+      },
+    });
+    const executor = new ServerSqlExecutor({ client: f.client, logger: { error: log } });
+    const err = await executor
+      .dispatch({
+        category: 'DDL',
+        sql: 'CREATE TABLE AD_DBX_TESTE (ID NUMBER)',
+        block: BLOCK,
+        simulated: false,
+        environment: 'PRODUCTION',
+      })
+      .catch((e: unknown) => e);
+    expect(isAppError(err) && err.code).toBe('SANKHYA_API_ERROR');
+    expect(log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        step: 'save',
+        errorCode: 'SANKHYA_API_ERROR',
+        gatewayMessage: expect.stringContaining('ORA-01400'),
+      }),
+      expect.any(String),
+    );
+    expect(f.actions).toHaveLength(0);
+  });
+
+  it('logs the action failure with its gateway message, then cleans up on the same ID', async () => {
+    const log = vi.fn();
+    const f = fakeClient({
+      executeJava: () => {
+        throw new AppError('SANKHYA_API_ERROR', 'Registro nao encontrado');
+      },
+    });
+    const executor = new ServerSqlExecutor({ client: f.client, logger: { error: log } });
+    await executor
+      .dispatch({
+        category: 'DDL',
+        sql: 'DROP TABLE AD_DBX_TESTE',
+        block: BLOCK,
+        simulated: false,
+        environment: 'PRODUCTION',
+      })
+      .catch(() => undefined);
+    expect(log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        step: 'executeJava',
+        recordId: '5001',
+        gatewayMessage: 'Registro nao encontrado',
+      }),
+      expect.any(String),
+    );
+    expect(f.removes).toEqual([{ entityName: 'AD_MANIPULADADOS', pks: [{ ID: '5001' }] }]);
   });
 
   it('cleans up the record even when the action call fails, then surfaces the error', async () => {

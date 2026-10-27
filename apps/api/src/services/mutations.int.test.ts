@@ -3260,7 +3260,12 @@ function fakeServerClient(options: FakeServerOptions = {}): {
   const client: ServerSqlClient = {
     save(input: SaveInput): Promise<SaveResult> {
       calls.save.push(input);
-      return Promise.resolve({ results: recordId ? [[recordId]] : [] });
+      // Like the gateway: one row with the saved values of the requested fields, in request order
+      // (the generated ID only when it is requested).
+      const row = input.fields.map((f) =>
+        f === 'ID' ? recordId : String(input.records[0]?.values[f] ?? ''),
+      );
+      return Promise.resolve({ results: recordId ? [row] : [] });
     },
     executeJava(input: ExecuteJavaInput): Promise<ExecuteJavaResult> {
       calls.exec.push(input);
@@ -3628,8 +3633,12 @@ describe('MutationService server-side route (Executa Banco)', () => {
           expect(ran.statusCode, ran.body).toBe(200);
           expect(ran.json()).toMatchObject({ status: 'success' });
           expect(calls.save).toHaveLength(1);
-          expect(calls.exec).toHaveLength(1);
-          expect(calls.remove).toHaveLength(1);
+          expect(calls.save[0]!.fields).toEqual(['ID', 'TEXTO']);
+          // The action and the cleanup run on the generated ID, never on the TEXTO block.
+          expect(calls.exec).toEqual([
+            { actionId: '98', entityName: 'AD_MANIPULADADOS', pk: { ID: '7001' } },
+          ]);
+          expect(calls.remove).toEqual([{ entityName: 'AD_MANIPULADADOS', pks: [{ ID: '7001' }] }]);
           expect(writeCalls(h.mock)).toEqual([]);
         },
       );
@@ -3874,7 +3883,10 @@ describe('MutationService server-side route (Executa Banco)', () => {
 
       // create the dedicated record (always an INSERT) -> fire action 98 -> clean it up.
       expect(calls.save).toHaveLength(1);
-      expect(calls.save[0]).toMatchObject({ entityName: 'AD_MANIPULADADOS', fields: ['TEXTO'] });
+      expect(calls.save[0]).toMatchObject({
+        entityName: 'AD_MANIPULADADOS',
+        fields: ['ID', 'TEXTO'],
+      });
       expect(calls.exec).toHaveLength(1);
       expect(calls.exec[0]).toMatchObject({
         actionId: '98',

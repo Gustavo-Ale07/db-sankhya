@@ -75,6 +75,13 @@ legitimamente tem vários comandos, e `SERVER.PLSQL` já autoriza um bloco arbit
   `98` apontando para a PK desse registro e, no fim, **apaga** o registro de controle.
   Nunca sobrescreve um registro existente (ex.: o ID 46 da consultoria): o registro é
   criado e controlado por esta ferramenta e removido ao final.
+- **ID do registro de controle (correção de 27/10/2026):** o `DatasetSP.save` devolve, por
+  registro, os valores dos `fields` pedidos, na mesma ordem. O save pedia só `TEXTO`, então o
+  retorno não trazia o `ID` e o código usava o bloco como chave (ação 98 e limpeza falharam,
+  deixando um órfão). Agora o save pede `fields: ['ID', 'TEXTO']` com valor só em `TEXTO`
+  (continua um INSERT, ID gerado pela Sankhya) e o ID é lido da posição da coluna `ID`; se não
+  vier um inteiro positivo, a ação 98 não é disparada (`SANKHYA_BAD_RESPONSE`). Falhas de
+  save/ação/limpeza logam `gatewayMessage` (texto da Sankhya, redigido).
 - **PENDENTE de confirmação na base real:** que `AD_MANIPULADADOS` exista na homologação
   com o campo `TEXTO`, que a ação `98` esteja publicada e que o usuário de integração
   tenha permissão de `save`/`executeJava`/`removeRecords`. Isso só se prova executando na

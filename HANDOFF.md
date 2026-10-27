@@ -1,5 +1,12 @@
 # HANDOFF — Rodada 2 (Prompt v2/v2.1) + Rodada 3 (ações nativas), 22/10/2026
 
+## Estado em 27/10/2026 (noite, 2) — correção: ID do registro de controle da rota server-side
+
+- **Incidente (13:28:42Z, requestId `d627cf00-…`, planId `0f1b00e8-…`):** `CREATE TABLE AD_DBX_TESTE (ID NUMBER)` pela UI. O `DatasetSP.save` na `AD_MANIPULADADOS` funcionou, mas o save pedia só `fields: ['TEXTO']`, e o gateway devolve os valores dos campos pedidos: o retorno não trazia o `ID`. `extractRecordId` pegava "o primeiro texto" (o bloco PL/SQL) como chave; a ação 98 e o `removeRecords` foram chamados com `ID = <bloco>` e falharam (`SANKHYA_API_ERROR`). A resposta crua não foi logada (`LOG_LEVEL=info`, sem corpo).
+- **Órfão provável:** um registro na `AD_MANIPULADADOS` com o TEXTO do `CREATE TABLE AD_DBX_TESTE`. Não removido por código (entidade de controle é alvo reservado); fica com o usuário.
+- **Correção:** o save pede `fields: ['ID', 'TEXTO']` com valor só em `TEXTO` (continua INSERT sem pk; ID gerado pela Sankhya). `extractRecordId(results, fields, keyField)` lê a posição da coluna `ID`, exige exatamente uma linha do tamanho de `fields` e um inteiro positivo; senão `SANKHYA_BAD_RESPONSE` sem disparar a ação. Falhas de save/ação/limpeza logam `step`, `errorCode` e `gatewayMessage` (texto da Sankhya, redigido).
+- **Ainda não provado na base real:** que o gateway ecoa o `ID` gerado quando ele está em `fields`. Se não ecoar, a rota para com `SANKHYA_BAD_RESPONSE` antes da ação 98 (e o novo log mostra o formato do retorno).
+
 ## Estado em 27/10/2026 (noite) — tela de Políticas oferece as ações SERVER.\*
 
 - **Problema:** a edição de política (`PoliciesPage.tsx`) tinha uma lista fixa de ações sem `SERVER.DDL/DELETE/DML_RAW/DCL/PLSQL`, então não dava para conceder a rota server-side pela UI. O backend já as aceitava (`validatePolicyRule` valida contra `PERMISSIONS`; a rota admin não tem allowlist própria).
